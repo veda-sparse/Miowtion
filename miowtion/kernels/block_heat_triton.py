@@ -9,11 +9,17 @@ layer on long clips) only to reduce them to one value per 128x128 block.
 This kernel computes each block's QK^T in registers and writes a single
 fp32 heat value, so the cost is the QK^T FLOPs alone.
 
-Numerics mirror the reference: scores are rounded to bf16 before the max,
-the scale is applied after the max, invalid keys are -inf and invalid query
-rows contribute nothing. Accumulation order differs from cuBLAS, so parity
-with the reference is to tolerance, not bitwise (see
-tests/gpu/test_heat_triton.py).
+Numerics mirror the reference: scores are rounded to bf16 before the max
+(done once on each row max, which is identical because rounding is
+monotonic), the scale is applied after the max, invalid keys are -inf and
+invalid query rows contribute nothing. Accumulation order differs from
+cuBLAS, so parity with the reference is to tolerance, not bitwise (see
+tests/gpu/test_kernels_gpu.py).
+
+Launch parameters were tuned on RTX 4090 (d=128, 56 heads, 38k tokens):
+4 warps and 16 key tiles per program run QK^T at ~169 TFLOPS, 0.47x the time
+of FA4's dense forward (which does twice the FLOPs); 8 warps, software
+pipelining (num_stages > 1) and 64-wide key sub-tiles were all slower.
 """
 
 from __future__ import annotations
@@ -28,6 +34,10 @@ from miowtion.veda import tiling
 _TILE = tiling.TILE_SIZE
 # Key tiles handled by one program; each program loads its query tile once.
 _KEY_TILES_PER_PROGRAM = 16
+_NUM_WARPS = 4
+# No software pipelining of the key-tile loop (Triton's default of 3 stages
+# is ~20% slower here).
+_NUM_STAGES = 1
 
 
 @functools.cache
@@ -62,22 +72,22 @@ def _kernel():
         dims = tl.arange(0, HEAD_DIM)
         q = tl.load(q_ptr + rows[:, None] * stride_qn + h * stride_qh
                     + dims[None, :])
-        lse = tl.load(lse_ptr + rows * stride_ln + h * stride_lh)
         row_ok = tl.load(valid_ptr + rows) != 0
-        for i in range(TILES_PER_PROGRAM):
-            j = group * TILES_PER_PROGRAM + i
-            if j < n_tiles:
-                cols = j * TILE + tl.arange(0, TILE)
-                k = tl.load(k_ptr + cols[:, None] * stride_kn + h * stride_kh
-                            + dims[None, :])
-                col_ok = tl.load(valid_ptr + cols) != 0
-                s = tl.dot(q, tl.trans(k)).to(tl.bfloat16).to(tl.float32)
-                s = tl.where(col_ok[None, :], s, float('-inf'))
-                row_best = tl.max(s, axis=1) * scale - lse
-                row_best = tl.where(row_ok, row_best, float('-inf'))
-                best = tl.max(row_best, axis=0)
-                tl.store(out_ptr + h * stride_oh + r * stride_or + j,
-                         tl.exp(best))
+        lse = tl.load(lse_ptr + rows * stride_ln + h * stride_lh)
+        # An infinite lse turns an invalid row's term into exp(-inf) = 0.
+        lse = tl.where(row_ok, lse, float('inf'))
+        start = group * TILES_PER_PROGRAM
+        for j in range(start, tl.minimum(start + TILES_PER_PROGRAM, n_tiles)):
+            cols = j * TILE + tl.arange(0, TILE)
+            k = tl.load(k_ptr + cols[:, None] * stride_kn + h * stride_kh
+                        + dims[None, :])
+            col_ok = tl.load(valid_ptr + cols) != 0
+            s = tl.dot(q, tl.trans(k))
+            s = tl.where(col_ok[None, :], s, float('-inf'))
+            row_max = tl.max(s, axis=1).to(tl.bfloat16).to(tl.float32)
+            best = tl.max(row_max * scale - lse, axis=0)
+            tl.store(out_ptr + h * stride_oh + r * stride_or + j,
+                     tl.exp(best))
 
     return heat_kernel
 
@@ -98,5 +108,6 @@ def teacher_heat(q: torch.Tensor, k: torch.Tensor, lse: torch.Tensor,
         q.stride(0), q.stride(1), k.stride(0), k.stride(1), lse.stride(0),
         lse.stride(1), out.stride(0), out.stride(1), n_tiles,
         1.0 / math.sqrt(q.shape[-1]), HEAD_DIM=q.shape[-1], TILE=_TILE,
-        TILES_PER_PROGRAM=_KEY_TILES_PER_PROGRAM, num_warps=8)
+        TILES_PER_PROGRAM=_KEY_TILES_PER_PROGRAM, num_warps=_NUM_WARPS,
+        num_stages=_NUM_STAGES)
     return out

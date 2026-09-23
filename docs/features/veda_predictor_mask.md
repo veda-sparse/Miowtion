@@ -32,7 +32,9 @@
 - 每层只对抽样的视频 query tile 做监督（KL 是对 query tile 的平均，所以抽样是无偏的）；比例
   `teacher_q_tiles` **按每个 clip 的 tile 数分别换算**。
 - CUDA 上用融合 Triton kernel（`miowtion/kernels/block_heat_triton.py`），只做 QKᵀ 的计算量，不把 [H', rows, N]
-  的分数写回显存；CPU 上用分块的 torch 参考实现。
+  的分数写回显存；CPU 上用分块的 torch 参考实现。bf16 舍入只对每行的块内最大值做一次（舍入单调，
+  结果与逐元素舍入后取 max 逐位相同）。启动参数在 4090 上调过：4 warps、每个 program 16 个 key
+  tile、不做软件流水（num_stages=1）。
 - seer KL：student logits 在空列上填 −inf 后做 log-softmax；teacher 热力图按行归一化；
   只在 tgt>0 的位置累加；先在有效行上平均，再在头上平均。
 - recall：预测集合与 oracle 集合（同样规则下对热力图做 top-k）的交集比例，只统计 video→video
@@ -47,8 +49,14 @@ KL 在最优点为 0、recall 为 1、TeacherCollector 输出与稠密逐位一�
 ## 踩坑记录
 - **Bresenham 的浮点误差**：`2.3−2` 得到 `0.29999999999999982`，`floor(400×frac)` 少算 1 个，
   平均值与预算的差达到 1/n。对策：frac 按 12 位小数取整。
+- **Triton 默认的 num_stages=3 让热力图 kernel 慢约 20%**：key tile 循环被软件流水后反而变慢
+  （150 ms vs 123 ms）。启动时显式传 `num_stages=1`。
 - **只有对角的预算**：tile 很少或预算很低时，去掉对角后两个集合都为空，recall 会被算成 0，
   这是错的。现在返回 NaN。
 
 ## 验证记录
-- 2026-09-23，macOS CPU：unit 全部通过。Triton 热力图 kernel 待 GPU 对拍。
+- 2026-09-23，macOS CPU：unit 全部通过。
+- 2026-09-23，RTX 4090：热力图 kernel 与 torch 参考一致（tests/gpu）。16:9 5.17 s（297 个 tile、
+  56 头、d=128）：全部 query tile 123 ms（169 TFLOPS），同一数据上 FA4 稠密前向 263 ms
+  （158 TFLOPS），即 0.47 倍 FA4 耗时（计算量是 FA4 的一半）；16 个 query tile 6.7 ms。
+  调参前为 170 ms / 9.5 ms（8 warps、每个元素先舍入再取 max），调参前后输出逐位相同。

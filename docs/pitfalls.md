@@ -19,6 +19,7 @@
 | 平均保留数比预算少 1/n | `2.3−2 = 0.29999…` 使 `floor(n·frac)` 少算一个 | frac 按 12 位小数取整 | [predictor_mask](features/veda_predictor_mask.md) |
 | recall 被错算为 0 | 预算里只有对角块，去掉对角后两个集合都为空 | 返回 NaN，日志用 nanmean 汇总 | [predictor_mask](features/veda_predictor_mask.md) |
 | 搜索中 partial tile 的块分数被污染 | pad 槽 gather 到了第 0 行的 q | softmax 之后先清零 pad 行 | [tile_search](features/tile_search.md) |
+| Triton 热力图 kernel 慢约 20% | 默认 num_stages=3，key tile 循环被软件流水后反而变慢 | 启动时传 `num_stages=1` | [predictor_mask](features/veda_predictor_mask.md) |
 | oracle 的 kernel 路径与参考路径的 rel-MSE 相差最多 88% | 子集行的 `kernel_indices` 用行数 R 当全局列起点 | 起点取 `layout.n_video_tiles`；单测对拍子集与全量 | [tile_search](features/tile_search.md) |
 
 ## Kernel
