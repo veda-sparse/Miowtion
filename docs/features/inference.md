@@ -34,7 +34,8 @@ CUDA_VISIBLE_DEVICES=0 torchrun --nproc_per_node 1 scripts/generate.py \
     --checkpoint runs/stage1_turbo8_4090/ckpt/step_0000050 \
     --out-dir artifacts/generate/search5s_0000
 ```
-prompt 先用 `scripts/encode_samples.py` 编码进样本缓存。
+prompt 先用 `scripts/encode_samples.py` 编码进样本缓存。`--sample-id` / `--geometry` 可以给多个
+（模型只加载一次，每个样本一个子目录，另有汇总的 `summary.json`）。
 
 ## 测试
 `tests/unit/test_infer_decode.py`：视频 latent 的反归一化是编码的逆（恒等统计量时逐位相等）、
@@ -43,6 +44,10 @@ prompt 先用 `scripts/encode_samples.py` 编码进样本缓存。
 ## 踩坑记录
 - 发布版视频 VAE 的代码依赖 diffusers；t2va 编码用不到 VAE，所以第一次解码时才暴露（已加入
   `encode` extra）。
+- **mp4 里的音频只有 2.2 s（视频 5.17 s）**：`write_mp4` 用了输出选项 `-frames:v N`；ffmpeg 4.4
+  写满 N 帧视频就结束整个输出，而原始视频从管道进来比音频编码快得多，音频被截在当时的位置。稠密和
+  稀疏都受影响，本机较新的 ffmpeg 不出现。去掉 `-frames:v`（管道 EOF 自然结束），单测用满尺寸
+  噪声帧检查两条音轨的时长（在 4.4 上修复前失败、修复后通过）。
 - 第 0 步包含 FA4 / Triton kernel 的编译（Veda 第 0 步 22.1 s，之后每步 15.0 s），计时和加速比
   必须按 warmup 之后的步折算。
 

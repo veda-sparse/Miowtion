@@ -1,5 +1,8 @@
 """Tests for miowtion.infer.decode (latent layout and helpers)."""
 
+import shutil
+import subprocess
+
 import numpy as np
 import pytest
 import torch
@@ -55,3 +58,28 @@ def test_title_and_side_by_side_layout():
     assert both.shape == (3, titled.shape[1], 2 * 96 + 8, 3)
     assert np.array_equal(both[:, :, :96], titled)
     assert np.array_equal(both[:, :, -96:], titled)
+
+
+@pytest.mark.skipif(shutil.which('ffmpeg') is None
+                    or shutil.which('ffprobe') is None, reason='needs ffmpeg')
+def test_mp4_keeps_the_full_audio(tmp_path):
+    fps, seconds, rate = 24, 2.0, 32000
+    # Full-size frames: the truncation shows once video outpaces audio.
+    frames = np.random.default_rng(0).integers(
+        0, 256, (int(fps * seconds), 768, 1344, 3), dtype=np.uint8)
+    wave = torch.sin(torch.linspace(0, 2000, int(rate * seconds)))
+    path = str(tmp_path / 'a.mp4')
+    decode.write_mp4(path, frames, [(torch.stack([wave, wave]) * 0.5, 'x'),
+                                    (torch.stack([wave, wave]) * 0.2, 'y')],
+                     rate, fps)
+    out = subprocess.run(
+        ['ffprobe', '-v', 'error', '-show_entries', 'stream=codec_type,'
+         'duration', '-of', 'csv=p=0', path], capture_output=True,
+        text=True, check=True).stdout.split()
+    durations = {}
+    for line in out:
+        kind, value = line.split(',')
+        durations.setdefault(kind, []).append(float(value))
+    assert abs(durations['video'][0] - seconds) < 0.05
+    assert len(durations['audio']) == 2
+    assert all(abs(d - seconds) < 0.1 for d in durations['audio'])

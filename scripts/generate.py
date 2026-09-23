@@ -52,8 +52,10 @@ def main():
     parser.add_argument('--num-steps', type=int, default=8)
     parser.add_argument('--adapter', default=None, help='few-step LoRA')
     parser.add_argument('--sample-cache', required=True)
-    parser.add_argument('--sample-id', required=True)
-    parser.add_argument('--geometry', required=True, help="e.g. '16:9@37'")
+    parser.add_argument('--sample-id', nargs='+', required=True,
+                        help='one or more samples (the model loads once)')
+    parser.add_argument('--geometry', nargs='+', required=True,
+                        help="e.g. '16:9@37'; one per sample, or one for all")
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--attention', nargs='+', default=['dense'],
                         choices=pipeline.ATTENTION_MODES)
@@ -66,7 +68,9 @@ def main():
     parser.add_argument('--offload-blocks', type=int, default=40)
     parser.add_argument('--prefetch', type=int, default=1)
     parser.add_argument('--mlp-chunk-rows', type=int, default=8192)
-    parser.add_argument('--out-dir', required=True)
+    parser.add_argument('--out-dir', required=True,
+                        help='output directory; with several samples, one '
+                        'subdirectory per sample')
     parser.add_argument('--decode-only', action='store_true',
                         help='decode <mode>_latents.pt of an earlier run')
     args = parser.parse_args()
@@ -74,67 +78,94 @@ def main():
     env = parallel.init_distributed()
     cache = data.SampleCache(args.sample_cache)
     by_id = {s.id: s for s in cache.samples}
-    if args.sample_id not in by_id:
-        raise KeyError(f'{args.sample_id} not in {args.sample_cache}')
-    sample = by_id[args.sample_id]
-    geometry = data.parse_geometry(args.geometry)
-    if sample.latent_t not in (None, geometry.latent_t):
-        raise ValueError(f'{sample.id} was written for latent_t '
-                         f'{sample.latent_t}, geometry has {geometry.latent_t}')
-    os.makedirs(args.out_dir, exist_ok=True)
-    if args.decode_only:
-        results = {mode: pipeline.Generated(**torch.load(
-            os.path.join(args.out_dir, f'{mode}_latents.pt')))
-                   for mode in args.attention}
-        if env.is_main:
-            _decode_and_compare(args, sample, geometry, results, env)
-        return
+    if len(args.geometry) not in (1, len(args.sample_id)):
+        raise ValueError('give one geometry, or one per sample')
+    jobs = []
+    for i, sample_id in enumerate(args.sample_id):
+        if sample_id not in by_id:
+            raise KeyError(f'{sample_id} not in {args.sample_cache}')
+        sample = by_id[sample_id]
+        geometry = data.parse_geometry(args.geometry[
+            i if len(args.geometry) > 1 else 0])
+        if sample.latent_t not in (None, geometry.latent_t):
+            raise ValueError(f'{sample.id} was written for latent_t '
+                             f'{sample.latent_t}, geometry has '
+                             f'{geometry.latent_t}')
+        out_dir = (args.out_dir if len(args.sample_id) == 1 else
+                   os.path.join(args.out_dir, f'{sample.id}_{geometry.name}'))
+        os.makedirs(out_dir, exist_ok=True)
+        jobs.append((sample, geometry, out_dir))
 
+    if args.decode_only:
+        results = [{mode: pipeline.Generated(**torch.load(
+            os.path.join(out_dir, f'{mode}_latents.pt')))
+                    for mode in args.attention} for _, _, out_dir in jobs]
+    else:
+        results = _denoise_all(args, env, cache, jobs)
+    if env.is_main:
+        decoder = decode.Decoder(os.path.join(args.root, args.variant),
+                                 env.device)
+        summaries = [_decode_and_compare(args, sample, geometry, result,
+                                         decoder, out_dir)
+                     for (sample, geometry, out_dir), result
+                     in zip(jobs, results)]
+        if len(jobs) > 1:
+            with open(os.path.join(args.out_dir, 'summary.json'), 'w') as f:
+                json.dump(summaries, f, indent=1)
+
+
+def _denoise_all(args, env, cache, jobs) -> list[dict]:
+    """Denoises every (sample, geometry) in every mode; saves latents."""
     tch = teacher.build_teacher(
         args.root, args.variant, args.schedule, args.num_steps, args.adapter,
-        env, visual_conditions=sample.task != 't2va',
+        env, visual_conditions=any(s.task != 't2va' for s, _, _ in jobs),
         audio_references=args.variant == 'Ref2VA',
         offload_blocks=args.offload_blocks, prefetch=args.prefetch,
         mlp_chunk_rows=args.mlp_chunk_rows)
-    plan = predictor = veda_config = None
+    plans = predictor = veda_config = None
     if 'veda' in args.attention:
         if not (args.plan_dir and args.checkpoint):
             raise ValueError('veda needs --plan-dir and --checkpoint')
-        plan = veda_plan.PlanTable.load_dir(args.plan_dir).select(geometry)
+        plans = veda_plan.PlanTable.load_dir(args.plan_dir)
         cfg = tch.model.config
         predictor = pipeline.load_predictor(
             args.checkpoint, cfg.num_layers, cfg.num_heads, cfg.head_dim,
             env.device)
         veda_config = veda_attention.VedaConfig(
             target_budget=veda_mask.Budget(ratio=args.keep_ratio))
-        progress.log(f'veda: plan {plan.geometry}, predictor '
+        progress.log(f'veda: plans {args.plan_dir}, predictor '
                      f'{args.checkpoint}, keep {args.keep_ratio}, dense '
                      f'steps {args.dense_steps}')
-
-    results = {}
-    for mode in args.attention:
-        results[mode] = pipeline.generate(
-            tch.model, tch.schedule, tch.tables, cache, sample, geometry,
-            args.seed, env.device, mode, plan, predictor, veda_config,
-            args.dense_steps)
-        progress.log(f'{mode}: denoised in {results[mode].seconds:.1f} s, '
-                     f'attention {sum(results[mode].attention_seconds):.1f} s '
-                     f'({results[mode].sparse_calls} sparse / '
-                     f'{results[mode].dense_calls} dense attention calls)')
-        if env.is_main:
-            torch.save(dataclasses.asdict(results[mode]),
-                       os.path.join(args.out_dir, f'{mode}_latents.pt'))
+    all_results = []
+    for index, (sample, geometry, out_dir) in enumerate(jobs):
+        plan = plans.select(geometry) if plans is not None else None
+        progress.log(f'[{index + 1}/{len(jobs)}] {sample.id} on '
+                     f'{geometry.name}' + (f' (plan {plan.geometry})'
+                                           if plan else ''))
+        results = {}
+        for mode in args.attention:
+            results[mode] = pipeline.generate(
+                tch.model, tch.schedule, tch.tables, cache, sample, geometry,
+                args.seed, env.device, mode, plan, predictor, veda_config,
+                args.dense_steps)
+            progress.log(f'{mode}: denoised in {results[mode].seconds:.1f} '
+                         f's, attention '
+                         f'{sum(results[mode].attention_seconds):.1f} s '
+                         f'({results[mode].sparse_calls} sparse / '
+                         f'{results[mode].dense_calls} dense attention calls)')
+            if env.is_main:
+                torch.save(dataclasses.asdict(results[mode]),
+                           os.path.join(out_dir, f'{mode}_latents.pt'))
+        all_results.append(results)
     del tch, predictor
     gc.collect()
     torch.cuda.empty_cache()
-    if env.is_main:
-        _decode_and_compare(args, sample, geometry, results, env)
+    return all_results
 
 
-def _decode_and_compare(args, sample, geometry, results, env):
+def _decode_and_compare(args, sample, geometry, results, decoder,
+                        out_dir) -> dict:
     """Decodes every mode, writes the videos, timing and comparison."""
-    decoder = decode.Decoder(os.path.join(args.root, args.variant),
-                             env.device)
     frames = {}
     summary = {'sample': sample.id, 'geometry': geometry.name,
                'seed': args.seed, 'schedule': args.schedule,
@@ -145,7 +176,7 @@ def _decode_and_compare(args, sample, geometry, results, env):
     for mode, result in results.items():
         frames[mode] = decoder.video(result.video_rows, geometry)
         waveforms[mode] = decoder.audio(result.audio_rows)
-        path = os.path.join(args.out_dir, f'{mode}.mp4')
+        path = os.path.join(out_dir, f'{mode}.mp4')
         decode.write_mp4(path, frames[mode],
                          [(waveforms[mode], _title(mode, args.keep_ratio))],
                          decoder.sample_rate)
@@ -178,7 +209,7 @@ def _decode_and_compare(args, sample, geometry, results, env):
         side = decode.side_by_side([
             decode.add_title(frames[m], _title(m, args.keep_ratio))
             for m in ('dense', 'veda')])
-        path = os.path.join(args.out_dir, 'dense_vs_veda.mp4')
+        path = os.path.join(out_dir, 'dense_vs_veda.mp4')
         decode.write_mp4(path, side, [
             (waveforms[m], _title(m, args.keep_ratio))
             for m in ('dense', 'veda')], decoder.sample_rate)
@@ -192,8 +223,9 @@ def _decode_and_compare(args, sample, geometry, results, env):
                      f'{summary["speedup"]["attention"]:.2f}x; PSNR veda vs '
                      f'dense {psnr.mean():.2f} dB (min {psnr.min():.2f}); '
                      f'side by side: {path}')
-    with open(os.path.join(args.out_dir, 'summary.json'), 'w') as f:
+    with open(os.path.join(out_dir, 'summary.json'), 'w') as f:
         json.dump(summary, f, indent=1)
+    return summary
 
 
 if __name__ == '__main__':

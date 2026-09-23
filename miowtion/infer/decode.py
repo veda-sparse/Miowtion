@@ -125,7 +125,7 @@ def write_mp4(path: str, frames: np.ndarray,
         sample_rate: Audio sample rate.
         fps: Video frame rate.
     """
-    num_frames, height, width, _ = frames.shape
+    _, height, width, _ = frames.shape
     with tempfile.TemporaryDirectory() as tmp:
         cmd = ['ffmpeg', '-y', '-loglevel', 'error', '-f', 'rawvideo',
                '-pix_fmt', 'rgb24', '-s', f'{width}x{height}', '-r', str(fps),
@@ -137,8 +137,9 @@ def write_mp4(path: str, frames: np.ndarray,
             cmd += ['-i', wav_path]
             maps += ['-map', f'{i + 1}:a', f'-metadata:s:a:{i}',
                      f'title={title}']
-        cmd += maps + ['-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-crf',
-                       '16', '-frames:v', str(num_frames)]
+        # No -frames:v: it ends the whole output as soon as the video frames
+        # are written, cutting the audio short (the pipe ends at EOF anyway).
+        cmd += maps + ['-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-crf', '16']
         if audio_tracks:
             cmd += ['-c:a', 'aac', '-b:a', '192k']
         cmd.append(path)
