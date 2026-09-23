@@ -1,5 +1,6 @@
 """Tests for miowtion.veda.heatmap and miowtion.veda.attention."""
 
+import pytest
 import torch
 
 from miowtion.h3 import attention as h3_attention
@@ -142,3 +143,39 @@ def test_sparse_student_with_global_tiles():
         sparse = veda_attention.SparseStudent(
             sparse_clip, plan, pred, allow_reference_kernel=True)(q, k, v, 0)
     assert (sparse - dense).abs().max() > 1e-3
+
+
+def test_teacher_collector_head_chunks_match_whole_groups(monkeypatch):
+    from miowtion.h3 import geometry
+    from miowtion.h3 import layout as h3_layout
+    from miowtion.veda import plan as veda_plan
+    geo = geometry.Geometry('16:9', 512, 256, 39, 12, 16, 32, 20)
+    lay = h3_layout.pack(torch.ones(30, dtype=torch.long), geo)
+    q, k, v = _qkv(lay.seq_len, heads=4)
+    plan = veda_plan.TilePlan(geo.name, geo.video_grid,
+                              [tiling.TileShape(4, 4, 8),
+                               tiling.TileShape(2, 8, 8)],
+                              [[0, 1, 1, 0]])
+    config = veda_attention.VedaConfig(
+        target_budget=veda_mask.Budget(ratio=0.3), teacher_q_tiles=0.5,
+        recall_every=1)
+
+    def run():
+        torch.manual_seed(0)
+        pred = veda_predictor.TileScorePredictor(1, 4, 32)
+        clip = veda_attention.ClipTiling(lay, config, torch.device('cpu'))
+        collector = veda_attention.TeacherCollector(
+            clip, plan, pred, torch.Generator().manual_seed(0),
+            grad_scale=1.0, dense_backend='math')
+        with torch.no_grad():
+            out = collector(q, k, v, 0)
+        return out, collector.stats.kl[0], [p.grad.clone()
+                                            for p in pred.parameters()]
+
+    whole = run()
+    monkeypatch.setattr(veda_attention, '_COLLECT_BYTES', 1)  # 1 head/chunk
+    chunked = run()
+    assert torch.equal(chunked[0], whole[0])
+    assert chunked[1] == pytest.approx(whole[1], rel=1e-6)
+    for a, b in zip(chunked[2], whole[2]):
+        torch.testing.assert_close(a, b, rtol=1e-5, atol=1e-12)

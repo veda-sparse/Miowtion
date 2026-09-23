@@ -99,6 +99,12 @@ class ClipTiling:
         return max(1, min(n_video, count))
 
 
+# Bound on one tile-ordered q or k copy in TeacherCollector (heads are
+# processed in chunks under it), and the bytes of one bf16 head_dim-128 row.
+_COLLECT_BYTES = 512 * 2**20
+_HEAD_DIM_BYTES = 128 * 2
+
+
 def _fused(x: torch.Tensor) -> bool:
     return x.is_cuda and tile_gather_triton.available()
 
@@ -179,25 +185,36 @@ class TeacherCollector:
         layer_kl = 0.0
         for group in self.plan.head_groups(layer_index, self.clip.device):
             tile_layout = self.clip.get(group.shape)
-            q_tiles, feats_q = _gather_and_pool(q, tile_layout, group.heads)
-            k_tiles, feats_k = _gather_and_pool(k, tile_layout, group.heads)
             rows = self._sample_rows(tile_layout)
-            heat = heatmap.teacher_heat(
-                q_tiles, k_tiles, _gather_lse(lse, tile_layout, group.heads),
-                tile_layout, rows)
-            weight = group.heads.numel() / self._num_heads
-            with torch.enable_grad():
-                logits = self.predictor.layers[layer_index](
-                    feats_q[:, rows], feats_k, group.heads)
-                kl = heatmap.seer_kl(logits, heat, tile_layout)
-                (kl * (weight * self.grad_scale)).backward()
-            layer_kl += weight * kl.item()
-            if layer_index % self.clip.config.recall_every == 0:
-                self.stats.recall.append(heatmap.mask_recall(
-                    logits.detach(), heat, tile_layout,
-                    self.clip.blocks(tile_layout), rows).item())
+            # Heads are independent, so a group is processed in chunks of
+            # heads: the tile-ordered q / k copies of a whole group (1.5 GB
+            # each at 103k tokens) would not fit next to the trunk.
+            for heads in group.heads.split(self._chunk_heads(tile_layout)):
+                q_tiles, feats_q = _gather_and_pool(q, tile_layout, heads)
+                k_tiles, feats_k = _gather_and_pool(k, tile_layout, heads)
+                heat = heatmap.teacher_heat(
+                    q_tiles, k_tiles, _gather_lse(lse, tile_layout, heads),
+                    tile_layout, rows)
+                del q_tiles, k_tiles
+                weight = heads.numel() / self._num_heads
+                with torch.enable_grad():
+                    logits = self.predictor.layers[layer_index](
+                        feats_q[:, rows], feats_k, heads)
+                    kl = heatmap.seer_kl(logits, heat, tile_layout)
+                    (kl * (weight * self.grad_scale)).backward()
+                layer_kl += weight * kl.item()
+                if layer_index % self.clip.config.recall_every == 0:
+                    self.stats.recall.append(heatmap.mask_recall(
+                        logits.detach(), heat, tile_layout,
+                        self.clip.blocks(tile_layout), rows).item())
         self.stats.kl.append(layer_kl)
         return out
+
+    @staticmethod
+    def _chunk_heads(tile_layout: tiling.TileLayout) -> int:
+        """Heads per chunk so one tile-ordered copy stays under the bound."""
+        per_head = tile_layout.num_slots * _HEAD_DIM_BYTES
+        return max(1, _COLLECT_BYTES // per_head)
 
 
 class SparseStudent:

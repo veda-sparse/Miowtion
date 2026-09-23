@@ -42,6 +42,7 @@
 | 生成的 mp4 在 ~2 s 后没有声音 | ffmpeg 4.4 的 `-frames:v` 在视频帧写满时结束整个输出，截断音频 | 不用 `-frames:v`，靠管道 EOF 结束；单测检查音轨时长 | [inference](features/inference.md) |
 | `SparseStudent` 报张量行数不匹配（330 vs 336） | 把包含全局行的 logits 交给只要视频行的 `select_video_blocks` | 只取视频行；CPU 测试用带全局 tile 的布局 | [training](features/training.md) |
 | 长 clip（78k+ token）在 `apply_rope` 处 OOM | eager RoPE 链的每一步都是整张 [S, H, D] 临时张量 | 按行分块（逐位相同）；训练 offload 40 个 block | [h3_model](features/h3_model.md) |
+| 16:9 14.4 s（103k token）训练在 TeacherCollector 里 OOM | 整个头组的 tile 顺序 q / k 副本各 1.5 GB | 按头分块（≤ 512 MiB），梯度不变 | [predictor_mask](features/veda_predictor_mask.md) |
 | 单卡 offload 时预取无效，每个 block 停 ~59 ms | FSDP2 在 world size 1 时 `unshard()` 直接返回，H2D 拷贝在计算流上同步做 | 单进程用 `BlockStreamer`（独立 copy stream + non_blocking + event） | [training](features/training.md) |
 | 预取的拷贝仍然没有和计算重叠 | 显存太满，allocator 反复 mapping 失败并同步 | 少放常驻 block，给预取留余量 | [training](features/training.md) |
 | "FSDP parameters should be materialized on CPU" | 开 CPU offload 但参数物化在 GPU 上 | offload 的 block 用 `to_empty(device='cpu')` | [training](features/training.md) |
