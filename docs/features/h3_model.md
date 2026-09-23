@@ -44,6 +44,7 @@ VAE 代码、`model_index.json` 的 sigma 位移）直接复用，不重写。
 - 数值走固定的 eager 算子链：逐元素运算全部在 bf16 中进行，RMSNorm 用 fp32 累加；fp32 孤岛
   （patch 投影、时间嵌入、输出头）保持 fp32。改变算子顺序就是改变教师。
 - 时间嵌入 cos 在前、sin 在后；RoPE 只旋转前 96 维（t/h/w 各 16 个频率），cos/sin 先转 bf16。
+  超过 16384 行时 RoPE 按行分块计算（逐元素运算，逐位相同），只为限制长 clip 的临时显存。
 - `AttentionFn(q, k, v, layer_index)`：稠密教师、TeacherCollector、SparseStudent、OracleScorer
   都实现这个接口。
 - 冻结 trunk 时可以用 AdaLN 表（`miowtion/train/adaln.py`）替代 50 个 `adaln_proj`（共 13B 参数），
@@ -69,6 +70,9 @@ VAE 代码、`model_index.json` 的 sigma 位移）直接复用，不重写。
   确定性、pad 不泄漏、AdaLN 预计算逐位一致。
 
 ## 踩坑记录
+- **长 clip 在 RoPE 处 OOM**：eager 的 RoPE 链（乘积、rotate_half 的 cat、最后的 cat）每一步都是整张
+  [S, 56, 128] 的临时张量，78k token 时约 4 GB，训练在 4:3 14.4 s 上 OOM。按行分块后临时显存有界，
+  结果逐位不变。
 - 浮点恒等式不能直接在测试里用：`a+b−a` 在浮点下不等于 `b`，逐位测试应当直接复算期望值。
 
 ## 验证记录

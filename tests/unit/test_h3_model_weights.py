@@ -147,3 +147,14 @@ def test_precomputed_adaln_is_bitwise_equal():
         ref = m(clip, video, audio, state)
         cached = m(clip, video, audio, state, adaln_table=table)
     assert torch.equal(ref[0], cached[0]) and torch.equal(ref[1], cached[1])
+
+
+def test_chunked_rope_is_bitwise_identical(monkeypatch):
+    from miowtion.h3 import model as h3_model
+    gen = torch.Generator().manual_seed(0)
+    x = torch.randn(1000, 3, 128, generator=gen).to(torch.bfloat16)
+    cos = torch.randn(1000, 1, 96, generator=gen).to(torch.bfloat16)
+    sin = torch.randn(1000, 1, 96, generator=gen).to(torch.bfloat16)
+    whole = h3_model.apply_rope(x, cos, sin)
+    monkeypatch.setattr(h3_model, '_ROPE_CHUNK_ROWS', 128)
+    assert torch.equal(h3_model.apply_rope(x, cos, sin), whole)

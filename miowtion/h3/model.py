@@ -61,6 +61,13 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
     return torch.cat((-x2, x1), dim=-1)
 
 
+# Rows per RoPE chunk. The op chain is elementwise, so chunking over rows
+# is bitwise identical, but it bounds the full-size temporaries (products,
+# rotate_half, cat: ~4 GB for 100k rows x 56 heads) that otherwise set the
+# peak memory of long clips.
+_ROPE_CHUNK_ROWS = 16384
+
+
 def apply_rope(x: torch.Tensor, cos: torch.Tensor,
                sin: torch.Tensor) -> torch.Tensor:
     """Rotates the leading rope_dim channels of every head.
@@ -71,8 +78,18 @@ def apply_rope(x: torch.Tensor, cos: torch.Tensor,
         sin: [S, 1, rope_dim] bf16.
     """
     rope_dim = cos.shape[-1]
-    x_rot, x_pass = x[..., :rope_dim], x[..., rope_dim:]
-    return torch.cat((x_rot * cos + _rotate_half(x_rot) * sin, x_pass), -1)
+    if x.shape[0] <= _ROPE_CHUNK_ROWS:
+        x_rot, x_pass = x[..., :rope_dim], x[..., rope_dim:]
+        return torch.cat((x_rot * cos + _rotate_half(x_rot) * sin, x_pass),
+                         -1)
+    out = torch.empty_like(x)
+    for start in range(0, x.shape[0], _ROPE_CHUNK_ROWS):
+        rows = slice(start, start + _ROPE_CHUNK_ROWS)
+        x_rot = x[rows, :, :rope_dim]
+        out[rows, :, :rope_dim] = (x_rot * cos[rows]
+                                   + _rotate_half(x_rot) * sin[rows])
+        out[rows, :, rope_dim:] = x[rows, :, rope_dim:]
+    return out
 
 
 class Rope(nn.Module):
