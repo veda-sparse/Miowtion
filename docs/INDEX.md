@@ -5,12 +5,12 @@
 
 | 文档 | 内容 | 状态 |
 |---|---|---|
-| [features/h3_model.md](features/h3_model.md) | H3 DiT 训练侧实现：请求几何、打包布局、调度、噪声、模型、权重加载 | CPU 测试通过；GPU 待验证 |
+| [features/h3_model.md](features/h3_model.md) | H3 DiT 训练侧实现：请求几何、打包布局、调度、噪声、模型、权重加载 | 真实权重前向已验证；视频可视化检查待做 |
 | [features/veda_tiling.md](features/veda_tiling.md) | tile 排列（按头动态 tile 形状 + 按 tile 变长）、方案表 | CPU 测试通过 |
 | [features/veda_predictor_mask.md](features/veda_predictor_mask.md) | 打分器、预算与掩码规则、教师热力图、KL、recall | CPU 测试通过 |
 | [features/veda_kernel.md](features/veda_kernel.md) | FA4 CuTe 块稀疏整合、架构支持、测速结果 | SM89 不支持（已实测）；SM90/100 待验证 |
-| [features/tile_search.md](features/tile_search.md) | oracle 评分、投票、每层 ≤2 种形状、搜索驱动 | CPU 测试通过；GPU 待验证 |
-| [features/training.md](features/training.md) | FSDP2 训练框架：阶段 1/2、AdaLN 表、数据、checkpoint | CPU 端到端测试通过；GPU 待验证 |
+| [features/tile_search.md](features/tile_search.md) | oracle 评分、投票、每层 ≤2 种形状、搜索驱动 | 真实权重上 50 步 / 8 步搜索已跑通 |
+| [features/training.md](features/training.md) | FSDP2 训练框架：阶段 1/2、少步 LoRA 教师、AdaLN 表、数据、checkpoint | 阶段 1 已在 2×4090 真实权重上跑通；阶段 2 待 GPU 验证 |
 | [features/prompt_expansion.md](features/prompt_expansion.md) | prompt 扩写：短 prompt → H3 T2VA 结构化 prompt（DeepSeek；system prompt 由 H3 skill 拼成；校验 + repair 重试） | CPU 测试通过；10 条冒烟通过 |
 | [dependencies.md](dependencies.md) | 外部依赖、锁定版本、依赖的内部接口 | 当前 |
 | [pitfalls.md](pitfalls.md) | 踩坑总表 | 持续更新 |

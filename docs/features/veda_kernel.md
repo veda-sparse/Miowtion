@@ -68,6 +68,8 @@ flash-attn-4 4.0.0b32 @ d15f153：
   门槛。待办：把补丁作为锁定依赖合入（fork 或运行期 patch，按 AGENTS.md 第 3 节处理），
   并让 `fa4.available()` 在打了补丁的版本上放行 SM89。
 - H100 / B200：待测（正确性对拍 + 效率 ≥ 0.75 的门槛）。
+- `tests/gpu/test_kernels_gpu.py`（2026-09-23，RTX 4090）：FA4 稠密的 LSE 与 fp32 参考一致、
+  Triton 热力图与 torch 参考一致；FA4 块稀疏对拍在 SM89 上按架构白名单跳过。
 
 ## 待办
 - **FP8 sparse**（用户要求，方案待定）：块稀疏 + FP8（或 INT8 QK / FP8 PV，参考 SageAttention /
