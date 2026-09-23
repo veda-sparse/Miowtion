@@ -108,6 +108,14 @@
   `all_gather_copy_in_stream`。
 - 复制参数手动 all-reduce 时，缺失的梯度必须补零，否则各 rank 缓冲区长度不一致，通信挂起。
 - DTensor 的 `full_tensor()` 必须在所有 rank 上调用，之后才能提前 return 让 rank 0 单独写盘。
+- **FSDP2 在 world size 1 时预取完全不起作用**：`unshard()` 在单卡时直接返回，H2D 拷贝在
+  `wait_for_unshard()` 里、在计算流上、在 block 开始时才做，offload 的 block 每个都停 ~59 ms
+  （4090 上 16 s 的一步里有 2.4 s）。单进程改用 `parallel.BlockStreamer`：offload 的 block 不交给
+  FSDP，参数放 pinned host 内存，前向 pre-hook 在独立的 copy stream 上用 non_blocking 拷贝预取下一
+  个 block，计算流只等自己 block 的 event；`record_stream` 防止显存被提前复用。输出与 FSDP 路径
+  逐位相同。
+- 显存太满时 caching allocator 反复 "memory mapping failed" 并重试（会同步），预取的重叠就被抵消了
+  （稠密推理 40 个 block offload 时只快了 0.3 s）。常驻 block 要给预取的拷贝留出余量。
 - **`SparseStudent` 把全部 tile 的 logits 交给了只接受视频 query 行的 `select_video_blocks`**：
   有文本等全局 tile 时两者行数不同（330 vs 336），第一次在 GPU 上跑稀疏推理时报错。原来没有任何
   测试覆盖 `SparseStudent`。现在只取视频行，新增的 CPU 测试用带全局 tile 的真实打包布局，并检查全

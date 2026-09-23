@@ -40,6 +40,8 @@
 | 现象 | 原因 | 对策 | 链接 |
 |---|---|---|---|
 | `SparseStudent` 报张量行数不匹配（330 vs 336） | 把包含全局行的 logits 交给只要视频行的 `select_video_blocks` | 只取视频行；CPU 测试用带全局 tile 的布局 | [training](features/training.md) |
+| 单卡 offload 时预取无效，每个 block 停 ~59 ms | FSDP2 在 world size 1 时 `unshard()` 直接返回，H2D 拷贝在计算流上同步做 | 单进程用 `BlockStreamer`（独立 copy stream + non_blocking + event） | [training](features/training.md) |
+| 预取的拷贝仍然没有和计算重叠 | 显存太满，allocator 反复 mapping 失败并同步 | 少放常驻 block，给预取留余量 | [training](features/training.md) |
 | "FSDP parameters should be materialized on CPU" | 开 CPU offload 但参数物化在 GPU 上 | offload 的 block 用 `to_empty(device='cpu')` | [training](features/training.md) |
 | `FSDPCommContext has no all_gather_copy_in_stream` | 没有 FSDP root，跨 block 预取找不到通信流 | 根模块也 `fully_shard`，复制参数放进 `ignored_params` | [training](features/training.md) |
 | 手动 all-reduce 挂起 | 某些 rank 缺梯度，拼出的缓冲区长度不一致 | 缺失的梯度补零 | [training](features/training.md) |

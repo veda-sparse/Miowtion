@@ -18,11 +18,13 @@ from __future__ import annotations
 
 import dataclasses
 import datetime
+import functools
 import os
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 
 import torch
 import torch.distributed as dist
+from torch import nn
 from torch.distributed import device_mesh as dm
 from torch.distributed.fsdp import CPUOffloadPolicy
 from torch.distributed.fsdp import MixedPrecisionPolicy
@@ -121,6 +123,84 @@ def shard_trunk(model: h3_model.H3DiT, mesh: dm.DeviceMesh,
             block.set_modules_to_forward_prefetch(ahead)
 
 
+class BlockStreamer:
+    """Streams CPU-offloaded blocks to the GPU ahead of use (one process).
+
+    FSDP2 skips its all-gather path at world size 1: its prefetch does
+    nothing and an offloaded block is copied to the GPU on the compute
+    stream when the block starts (2.4 s of a 16 s denoising step on RTX
+    4090). Single-process runs therefore keep offloaded blocks as plain
+    modules with parameters in pinned host memory. A forward pre-hook on
+    block i waits for the copy event of its own weights, then issues
+    non-blocking copies of the next `prefetch` offloaded blocks on a
+    dedicated stream (wrapping around to the next forward), so copies
+    overlap compute. Device copies are released after the block's forward;
+    record_stream keeps the allocator from reusing them before the compute
+    stream is done.
+
+    Offloaded blocks must be frozen: their device copies are temporary.
+    """
+
+    def __init__(self, blocks: Sequence[nn.Module], offload: set[int],
+                 device: torch.device, prefetch: int = 1):
+        if prefetch < 1:
+            raise ValueError(f'prefetch must be >= 1, got {prefetch}')
+        self.device = device
+        self.prefetch = prefetch
+        self.order = sorted(offload)
+        self.stream = torch.cuda.Stream(device)
+        self.params = {i: list(blocks[i].parameters()) for i in self.order}
+        self._inflight: dict[int, tuple[torch.cuda.Event,
+                                        list[torch.Tensor]]] = {}
+        self._host: dict[int, list[torch.Tensor]] = {}
+        for i in self.order:
+            for p in self.params[i]:
+                if p.device.type != 'cpu':
+                    raise ValueError(f'block {i} is not on the host')
+                if not p.data.is_pinned():
+                    p.data = p.data.pin_memory()
+            blocks[i].register_forward_pre_hook(
+                functools.partial(self._before, i))
+            blocks[i].register_forward_hook(functools.partial(self._after, i))
+
+    def _fetch(self, index: int) -> None:
+        if index in self._inflight:
+            return
+        with torch.cuda.stream(self.stream):
+            copies = [p.data.to(self.device, non_blocking=True)
+                      for p in self.params[index]]
+            event = torch.cuda.Event()
+            event.record(self.stream)
+        self._inflight[index] = (event, copies)
+
+    def _following(self, index: int) -> list[int]:
+        k = self.order.index(index)
+        count = min(self.prefetch, len(self.order) - 1)
+        return [self.order[(k + d) % len(self.order)]
+                for d in range(1, count + 1)]
+
+    def _before(self, index: int, module: nn.Module, args) -> None:
+        del module, args
+        params = self.params[index]
+        if torch.is_grad_enabled() and any(p.requires_grad for p in params):
+            raise RuntimeError(f'offloaded block {index} must be frozen')
+        self._fetch(index)
+        event, copies = self._inflight.pop(index)
+        stream = torch.cuda.current_stream(self.device)
+        stream.wait_event(event)
+        self._host[index] = [p.data for p in params]
+        for p, copy in zip(params, copies):
+            copy.record_stream(stream)
+            p.data = copy
+        for following in self._following(index):
+            self._fetch(following)
+
+    def _after(self, index: int, module: nn.Module, args, output) -> None:
+        del module, args, output
+        for p, host in zip(self.params[index], self._host.pop(index)):
+            p.data = host
+
+
 def build_model(transformer_dir: str, env: DistEnv, drop_adaln: bool,
                 offload_blocks: int = 0, prefetch: int = 1,
                 mlp_chunk_rows: int | None = None,
@@ -155,12 +235,15 @@ def build_model(transformer_dir: str, env: DistEnv, drop_adaln: bool,
     progress.log(f'build DiT: {config.num_layers} layers, world '
                  f'{env.world_size}, offload {len(offload)} blocks, prefetch '
                  f'{prefetch}, drop_adaln={drop_adaln}')
-    if env.mesh is not None:
+    # FSDP only across several ranks; a single process streams offloaded
+    # blocks itself (see BlockStreamer).
+    use_fsdp = env.mesh is not None and env.world_size > 1
+    if use_fsdp:
         shard_trunk(model, env.mesh, offload, prefetch)
-    elif offload:
-        raise ValueError('block offloading needs the FSDP (torchrun) path')
-    # Offloaded FSDP parameters must be materialized on the host; everything
-    # else lives on the device.
+    elif offload and env.device.type != 'cuda':
+        raise ValueError('block offloading needs a CUDA device')
+    # Offloaded parameters are materialized on the host; everything else
+    # lives on the device.
     for name, child in model.named_children():
         if name != 'blocks':
             child.to_empty(device=env.device)
@@ -174,6 +257,9 @@ def build_model(transformer_dir: str, env: DistEnv, drop_adaln: bool,
         h3_weights.load_dit_weights(model, transformer_dir,
                                     skip_prefixes=skip)
     model.set_mlp_chunk_rows(mlp_chunk_rows)
+    if offload and not use_fsdp:
+        model.block_streamer = BlockStreamer(model.blocks, offload,
+                                             env.device, prefetch)
     return model
 
 
