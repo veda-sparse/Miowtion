@@ -1,0 +1,24 @@
+# Tile search with the 8-step Turbo teacher on 1:1 / 4:3 / 16:9 at 5.17 /
+# 10.1 / 14.4 s (latent_t 37 / 72 / 102) on RTX 4090s. Each process loads the
+# model once and runs its geometries from short to long sequences; split the
+# list over processes with search_tiles.py --geometries. 9:16 plans are the
+# H<->W mirror of the 16:9 ones (scripts/build_plan.py --mirror-out).
+run_name: search_turbo8_multigeo_4090
+checkpoint_root: weights/MiniMax-H3
+sample_cache: artifacts/samples/search_2x3
+geometries: ['1:1@37', '4:3@37', '16:9@37', '1:1@72', '4:3@72', '16:9@72',
+             '1:1@102', '4:3@102', '16:9@102']
+variant: FL2VA
+tasks: [t2va]
+num_clips: 2
+steps: [0, 2, 4, 6]
+schedule: turbo
+num_steps: 8
+teacher_adapter: weights/turbo_lora/minimax_h3_turbo_v4_step600_ema.safetensors
+candidates: ['8x4x4', '2x8x8', '4x4x8', '4x8x4', '8x8x2', '8x2x8']
+keep_ratio: 0.1
+query_tiles: 16
+out_dir: runs
+offload_blocks: 40
+prefetch: 1
+mlp_chunk_rows: 8192

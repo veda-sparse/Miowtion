@@ -333,8 +333,10 @@ class SearchConfig:
         checkpoint_root: Checkpoint root containing FL2VA/ and Ref2VA/.
         variant: 'FL2VA' or 'Ref2VA'.
         sample_cache: Encoded prompts to score (test split excluded).
-        geometry: One geometry spec, e.g. '16:9@37'.
-        num_clips: Prompts to score (spread over ranks).
+        geometries: Geometry specs scored one after another with the model
+            loaded once, e.g. ['1:1@37', '16:9@102']. Each uses the cached
+            samples whose latent_t (and aspect, if set) match.
+        num_clips: Prompts to score per geometry (spread over ranks).
         steps: Denoising steps to score, e.g. [0, 12, 25, 40] of 49.
         schedule / num_steps: 'base' + 49 or 'turbo' + 4 / 8 (few-step
             teacher, see miowtion.train.teacher).
@@ -350,7 +352,7 @@ class SearchConfig:
     run_name: str
     checkpoint_root: str
     sample_cache: str
-    geometry: str
+    geometries: list[str]
     variant: str = 'FL2VA'
     tasks: list[str] = dataclasses.field(default_factory=lambda: ['t2va'])
     num_clips: int = 6
@@ -416,7 +418,11 @@ def score_clip(model, cache, sample, geometry, schedule, steps: Sequence[int],
 
 
 def run_search(config: SearchConfig) -> None:
-    """Scores `num_clips` prompts on one geometry (all ranks in lockstep)."""
+    """Scores `num_clips` prompts per geometry (all ranks in lockstep).
+
+    Clip rounds whose score files are already complete on every rank are
+    skipped, so an interrupted run resumes where it stopped.
+    """
     from miowtion.train import data  # pylint: disable=import-outside-toplevel
     from miowtion.train import parallel  # pylint: disable=import-outside-toplevel
     from miowtion.train import teacher  # pylint: disable=import-outside-toplevel
@@ -433,11 +439,31 @@ def run_search(config: SearchConfig) -> None:
     model, schedule, tables = (teacher_.model, teacher_.schedule,
                                teacher_.tables)
     model.dense_backend = config.dense_backend
-    geometry = data.parse_geometry(config.geometry)
+    geometries = [data.parse_geometry(s) for s in config.geometries]
     candidates = [tiling.TileShape.parse(s) for s in config.candidates]
     veda_config = veda_attention.VedaConfig(
         target_budget=veda_mask.Budget(ratio=config.keep_ratio))
     cache = data.SampleCache(config.sample_cache)
+    progress.log(f'tile search over {len(geometries)} geometries: '
+                 f'{[g.name for g in geometries]}')
+    for geometry in geometries:
+        _search_geometry(config, geometry, model, schedule, tables, cache,
+                         candidates, veda_config, env)
+
+
+def _all_ranks(flag: bool, env) -> bool:
+    """True iff `flag` is true on every rank."""
+    if not env.distributed:
+        return flag
+    value = torch.tensor([int(flag)], device=env.device)
+    torch.distributed.all_reduce(value, op=torch.distributed.ReduceOp.MIN)
+    return bool(value.item())
+
+
+def _search_geometry(config: SearchConfig, geometry, model, schedule, tables,
+                     cache, candidates: Sequence[tiling.TileShape],
+                     veda_config: veda_attention.VedaConfig, env) -> None:
+    """Scores `config.num_clips` cached samples on one geometry."""
     samples = [s for s in cache.select('train', config.tasks)
                if s.aspect in (None, geometry.aspect)
                and s.latent_t in (None, geometry.latent_t)][:config.num_clips]
@@ -451,13 +477,22 @@ def run_search(config: SearchConfig) -> None:
                  f'{len(samples)} clips over {env.world_size} ranks, steps '
                  f'{config.steps}, candidates {config.candidates}, keep '
                  f'{config.keep_ratio}, output {out_dir}')
-    clips = progress.Progress('tile search: clip rounds', per_rank)
+    clips = progress.Progress(f'tile search {geometry.name}: clip rounds',
+                              per_rank)
     for i in range(per_rank):
         index = i * env.world_size + env.rank
         # Ranks without a clip re-score clip 0 to stay in lockstep with the
         # sharded forwards of the others, and discard the result.
         sample = samples[index] if index < len(samples) else samples[0]
         path = os.path.join(out_dir, f'{sample.id}.json')
+        # Skipping must be collective: a rank that skipped alone would leave
+        # the others waiting in the sharded forward.
+        done = index >= len(samples) or os.path.exists(path + '.done')
+        if _all_ranks(done, env):
+            progress.log(f'{geometry.name}: clip round {i} already scored, '
+                         'skipped')
+            clips.update()
+            continue
         entries = score_clip(model, cache, sample, geometry, schedule,
                              config.steps, candidates, veda_config,
                              config.query_tiles, config.seed + index,

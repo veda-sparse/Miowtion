@@ -1,9 +1,11 @@
 """Tile plans: which tile shape every (layer, head) uses on one geometry.
 
 A plan is produced by the tile search (search.py) for one target geometry
-and is timestep independent. Every geometry has its own plan: a portrait
-plan is searched on the portrait grid and is never re-transposed. Training
-and search must pick plans with the same rule (`PlanTable.select`).
+and is timestep independent. Every geometry has its own plan, either
+searched on its own grid or, by explicit choice, derived from the searched
+plan of the H<->W mirrored aspect (`TilePlan.mirrored`, e.g. 9:16 from 16:9;
+recorded in the provenance). Training and search must pick plans with the
+same rule (`PlanTable.select`).
 
 The keep ratio a plan was searched with is recorded for provenance only;
 training always uses its own runtime budget.
@@ -110,6 +112,28 @@ class TilePlan:
         return cls(geometry.name, geometry.video_grid, [shape],
                    [[0] * num_heads for _ in range(num_layers)],
                    {'source': 'uniform'})
+
+    def mirrored(self) -> TilePlan:
+        """The plan of the H<->W mirrored geometry, e.g. 9x16_t37 from 16x9_t37.
+
+        Shapes and grid are transposed and the plan takes the mirrored
+        geometry's name, so `PlanTable.select` matches it exactly.
+
+        Raises:
+            ValueError: If the mirrored geometry's grid is not the transpose
+                of this plan's grid (canvas rounding differs).
+        """
+        aspect, latent_t = self.geometry.split('_t')
+        w, h = aspect.split('x')
+        mirror = h3_geometry.geometry_from_latent_t(f'{h}:{w}', int(latent_t))
+        t, grid_h, grid_w = self.grid
+        if tuple(mirror.video_grid) != (t, grid_w, grid_h):
+            raise ValueError(f'{mirror.name} grid {mirror.video_grid} is not '
+                             f'the transpose of {self.geometry} {self.grid}')
+        return TilePlan(mirror.name, (t, grid_w, grid_h),
+                        [s.transposed() for s in self.shapes],
+                        [list(r) for r in self.head_shape],
+                        {**self.provenance, 'mirrored_from': self.geometry})
 
     def transposed(self) -> TilePlan:
         """H<->W mirrored plan (fallback only, see PlanTable.select)."""

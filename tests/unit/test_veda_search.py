@@ -1,10 +1,14 @@
 """Tests for miowtion.veda.search."""
 
+import pathlib
+
 import pytest
 import torch
+import yaml
 
 from miowtion.h3 import geometry
 from miowtion.h3 import layout as h3_layout
+from miowtion.train import data
 from miowtion.veda import attention as veda_attention
 from miowtion.veda import mask as veda_mask
 from miowtion.veda import search
@@ -110,3 +114,17 @@ def test_entries_require_completion_marker(tmp_path):
     (tmp_path / 'scores.json.done').unlink()
     with pytest.raises(FileNotFoundError):
         search.load_entries([path])
+
+
+def test_search_configs_parse():
+    root = pathlib.Path(__file__).resolve().parents[2] / 'configs'
+    paths = sorted(root.glob('search_*.yaml'))
+    assert paths
+    for path in paths:
+        raw = yaml.safe_load(path.read_text())
+        config = search.SearchConfig(**raw)
+        assert config.geometries, path
+        for spec in config.geometries:
+            data.parse_geometry(spec)
+        for shape in config.candidates:
+            tiling.TileShape.parse(shape)

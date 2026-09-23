@@ -27,10 +27,22 @@
   与稠密输出对应行比较。块分数与参考路径的 fp32 概率块最大值等价（exp 单调、lse 是精确的）。
   其他情况走 `oracle_rel_mse_reference`（逐头 fp32，CPU 单测用）。
 
+- 一次运行可以搜多个几何（`geometries`），模型只加载一次；每个几何使用 latent_t（以及 aspect，
+  如果样本里有）匹配的缓存样本。多组 GPU 可以用 `--geometries` 各搜一部分，写到同一个 run 目录，
+  再统一 `build_plan`。某一轮的结果文件在所有 rank 上都已完成时跳过该轮（集体决定，避免 FSDP 的
+  前向错步），中断后重跑即可续上。
+- 9:16 等镜像宽高比不单独搜索：`build_plan.py --mirror-out` 由 16:9 的方案生成（见 veda_tiling.md
+  的 `TilePlan.mirrored`）。
+
 ## 用法
 ```bash
-torchrun --nproc_per_node 4 scripts/search_tiles.py --config configs/search_16x9_t37.yaml
-python scripts/build_plan.py --scores runs/<run>/scores/16x9_t37 --out plans/16x9_t37.json
+# 两组进程各搜一部分几何（例如 GPU 0,1 一组 FSDP，GPU 3 单卡）
+CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node 2 --master_port 29614 scripts/search_tiles.py \
+    --config configs/search_turbo8_multigeo_4090.yaml --geometries 16:9@37 16:9@72 4:3@102 16:9@102
+CUDA_VISIBLE_DEVICES=3 torchrun --nproc_per_node 1 --master_port 29613 scripts/search_tiles.py \
+    --config configs/search_turbo8_multigeo_4090.yaml --geometries 1:1@37 4:3@37 1:1@72 4:3@72 1:1@102
+python scripts/build_plan.py --scores runs/<run>/scores/16x9_t37 --out plans/16x9_t37.json \
+    --mirror-out plans/9x16_t37.json
 ```
 
 ## 测试

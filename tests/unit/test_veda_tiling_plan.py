@@ -116,3 +116,22 @@ def test_plan_table_selection():
     assert pick('9:16', 102).geometry == '9x16_t37'  # never re-transposed
     with pytest.raises(KeyError):
         pick('4:3', 37)
+
+
+def test_mirrored_plan_is_the_transposed_geometry():
+    geo = geometry.geometry_from_latent_t('16:9', 37)
+    plan = veda_plan.TilePlan(geo.name, geo.video_grid,
+                              [tiling.TileShape(4, 8, 4),
+                               tiling.TileShape(8, 2, 8)],
+                              [[0, 1, 1], [1, 1, 0]], {'plan_mse': 0.05})
+    mirror = plan.mirrored()
+    portrait = geometry.geometry_from_latent_t('9:16', 37)
+    assert mirror.geometry == portrait.name == '9x16_t37'
+    assert mirror.grid == portrait.video_grid == (37, 42, 24)
+    assert mirror.shapes == [tiling.TileShape(4, 4, 8),
+                             tiling.TileShape(8, 8, 2)]
+    assert mirror.head_shape == plan.head_shape
+    assert mirror.provenance == {'plan_mse': 0.05,
+                                 'mirrored_from': '16x9_t37'}
+    table = veda_plan.PlanTable([plan, mirror])
+    assert table.select(portrait) is mirror

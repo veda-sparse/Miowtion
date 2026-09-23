@@ -2,7 +2,7 @@
 run_name: search_turbo8_4090
 checkpoint_root: weights/MiniMax-H3
 sample_cache: artifacts/samples/moviegen_smoke10
-geometry: '16:9@37'
+geometries: ['16:9@37']
 variant: FL2VA
 tasks: [t2va]
 num_clips: 2
