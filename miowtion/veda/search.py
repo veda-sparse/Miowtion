@@ -35,21 +35,27 @@ import torch
 
 from miowtion.h3 import attention as h3_attention
 from miowtion.h3 import layout as h3_layout
+from miowtion.kernels import block_heat_triton
+from miowtion.kernels import fa4
+from miowtion.utils import progress
 from miowtion.veda import attention as veda_attention
 from miowtion.veda import mask as veda_mask
 from miowtion.veda import plan as veda_plan
 from miowtion.veda import tiling
-from miowtion.utils import progress
 
 _TILE = tiling.TILE_SIZE
 
 
-@torch.no_grad()
 def oracle_rel_mse(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
                    tile_layout: tiling.TileLayout,
-                   blocks: list[veda_mask.ColumnBlock],
-                   rows: torch.Tensor) -> torch.Tensor:
-    """Oracle relative MSE of one head group, computed head by head.
+                   blocks: list[veda_mask.ColumnBlock], rows: torch.Tensor,
+                   dense_out: torch.Tensor | None = None,
+                   lse: torch.Tensor | None = None) -> torch.Tensor:
+    """Oracle relative MSE per head of one head group.
+
+    Uses the kernel path (block heat kernel for the oracle mask, FA4 block
+    sparsity for the sparse output of the sampled rows) when `dense_out` and
+    `lse` are given and the kernels are available; else the fp32 reference.
 
     Args:
         q: [S, H', D] bf16 packed queries of the heads to score.
@@ -58,10 +64,51 @@ def oracle_rel_mse(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
         tile_layout: Candidate permutation.
         blocks: Column blocks (budgets).
         rows: [R] int64 sampled video query tiles.
+        dense_out: [S, H', D] dense attention output of these heads.
+        lse: [S, H'] fp32 dense log-sum-exp of these heads.
 
     Returns:
         [H'] fp32 relative MSE per head.
     """
+    if (dense_out is not None and lse is not None and q.is_cuda
+            and fa4.available(q.device) and block_heat_triton.available()):
+        return _oracle_rel_mse_kernels(q, k, v, dense_out, lse, tile_layout,
+                                       blocks, rows)
+    return oracle_rel_mse_reference(q, k, v, tile_layout, blocks, rows)
+
+
+@torch.no_grad()
+def _oracle_rel_mse_kernels(q, k, v, dense_out, lse, tile_layout, blocks,
+                            rows):
+    """All heads at once; never materializes [rows, N] probabilities."""
+    q_t, k_t, v_t = (tiling.gather_tiles(t, tile_layout, None)
+                     for t in (q, k, v))
+    lse_t = lse.index_select(0, tile_layout.gather_index)
+    if tile_layout.pad_slots.numel():
+        lse_t.index_fill_(0, tile_layout.pad_slots, 0.0)
+    heat = block_heat_triton.teacher_heat(q_t, k_t, lse_t.contiguous(),
+                                          tile_layout, rows)
+    selection = veda_mask.select_video_blocks(heat, tile_layout, blocks, rows)
+    indices = veda_mask.kernel_indices(selection, tile_layout,
+                                       global_rows=False)
+    slots = (rows[:, None] * _TILE + torch.arange(
+        _TILE, device=q.device)[None]).view(-1)
+    o_sparse = fa4.block_sparse_attention(q_t.index_select(0, slots), k_t,
+                                          v_t, indices, tile_layout)
+    o_dense = dense_out.index_select(
+        0, tile_layout.gather_index.index_select(0, slots))
+    valid = tile_layout.slot_valid.bool().index_select(0, slots)
+    diff = (o_sparse.float() - o_dense.float()).square().sum(-1)[valid]
+    norm = o_dense.float().square().sum(-1)[valid]
+    return diff.sum(0) / norm.sum(0).clamp(min=torch.finfo(torch.float32).tiny)
+
+
+@torch.no_grad()
+def oracle_rel_mse_reference(q: torch.Tensor, k: torch.Tensor,
+                             v: torch.Tensor, tile_layout: tiling.TileLayout,
+                             blocks: list[veda_mask.ColumnBlock],
+                             rows: torch.Tensor) -> torch.Tensor:
+    """fp32 reference of oracle_rel_mse, head by head (see module doc)."""
     heads, head_dim = q.shape[1], q.shape[2]
     scale = 1.0 / math.sqrt(head_dim)
     valid = tile_layout.slot_valid.bool()
@@ -126,8 +173,9 @@ class OracleScorer:
             self.progress = progress.Progress(
                 f'  scoring {len(self.candidates)} shapes x {q.shape[1]} '
                 'heads: layers', total=_num_layers_hint(self), every=5)
-        out = h3_attention.dense_attention(q, k, v, self.layout.used,
-                                           backend=self.dense_backend)[0]
+        out, lse = h3_attention.dense_attention(
+            q, k, v, self.layout.used, return_lse=True,
+            backend=self.dense_backend)
         table = torch.empty(len(self.candidates), q.shape[1],
                             dtype=torch.float32)
         for ci, shape in enumerate(self.candidates):
@@ -137,8 +185,8 @@ class OracleScorer:
             rows = torch.randperm(tile_layout.n_video_tiles, generator=gen)
             rows = rows[:count].sort().values.to(q.device)
             table[ci] = oracle_rel_mse(q, k, v, tile_layout,
-                                       self.clip.blocks(tile_layout),
-                                       rows).cpu()
+                                       self.clip.blocks(tile_layout), rows,
+                                       dense_out=out, lse=lse).cpu()
         self.scores[layer_index] = table
         best = [str(self.candidates[i]) for i in
                 table.mean(1).argsort()[:1].tolist()]

@@ -23,7 +23,8 @@
 7. 条件 span 切 tile 时，列分为参考块和目标块，**各自独立 top-k、各自预算**；对角只在所属块内强制。
 - `ratio ≥ 1` 表示整块保留；也支持绝对 tile 数（`Budget(tiles=k)`）。
 - `kernel_indices`：full（valid_count=128）与 partial 两个左对齐列表，全局列放在最前面；各行的
-  实际长度由 cnt 给出。
+  实际长度由 cnt 给出。`global_rows=False` 只给出所选 R 个 query 行的列表（oracle 评分只跑抽样行）；
+  全局列的起点永远是 `layout.n_video_tiles`，与所选行数无关。
 
 ## 教师热力图与损失（`miowtion/veda/heatmap.py`）
 - `heat[i,j] = max_{r∈i, c∈j} exp(q_r·k_c/√D − lse_r)`。LSE 直接取自稠密教师 flash attention 的

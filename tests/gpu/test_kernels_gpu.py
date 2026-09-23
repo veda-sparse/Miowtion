@@ -9,6 +9,7 @@ from miowtion.kernels import fa4
 from miowtion.kernels import reference
 from miowtion.veda import heatmap
 from miowtion.veda import mask as veda_mask
+from miowtion.veda import search
 from miowtion.veda import tiling
 
 pytestmark = pytest.mark.gpu
@@ -72,3 +73,19 @@ def test_fa4_block_sparse_matches_reference():
     real = lay.slot_valid.bool()
     torch.testing.assert_close(out[real].float(), ref[real].float(),
                                rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.skipif(not (fa4.available() and block_heat_triton.available()),
+                    reason='needs FA4 block sparsity and triton')
+def test_oracle_kernel_path_matches_reference():
+    lay = _layout(grid=(8, 12, 20))
+    q, k, v = _qkv(lay.seq_len)
+    out, lse = h3_attention.dense_attention(q, k, v, lay.used,
+                                            return_lse=True)
+    blocks = veda_mask.column_blocks(lay, veda_mask.Budget(ratio=0.3))
+    rows = torch.tensor([0, 3, 7, lay.n_video_tiles - 1], device='cuda')
+    fused = search.oracle_rel_mse(q, k, v, lay, blocks, rows,
+                                  dense_out=out, lse=lse)
+    ref = search.oracle_rel_mse_reference(q, k, v, lay, blocks, rows)
+    assert (ref > 1e-4).all()  # the sparse mask actually drops mass
+    torch.testing.assert_close(fused, ref, rtol=1e-2, atol=1e-4)

@@ -154,3 +154,24 @@ def test_kernel_indices_match_dense_mask():
     assert not (rebuilt_full & rebuilt_part).any()
     assert torch.equal(rebuilt_full | rebuilt_part, mask)
     assert torch.equal(rebuilt_full, mask & lay.full_tile)
+
+
+def test_kernel_indices_for_a_row_subset():
+    lay = _layout(target_grid=(16, 8, 16))
+    blocks = veda_mask.column_blocks(lay, veda_mask.Budget(ratio=0.3))
+    scores = torch.randn(2, lay.n_tiles, lay.n_tiles)
+    full = veda_mask.select_video_blocks(scores[:, :lay.n_video_tiles], lay,
+                                         blocks)
+    rows = torch.tensor([1, 5, lay.n_video_tiles - 1])
+    sub = veda_mask.select_video_blocks(scores[:, rows], lay, blocks, rows)
+    all_idx = veda_mask.kernel_indices(full, lay)
+    sub_idx = veda_mask.kernel_indices(sub, lay, global_rows=False)
+    n_global = lay.n_tiles - lay.n_video_tiles
+    kept = sub.keep.sum(-1)
+    assert torch.equal((sub_idx.full_cnt + sub_idx.partial_cnt)[0],
+                       kept + n_global)
+    for field in ('full_cnt', 'partial_cnt'):
+        assert torch.equal(getattr(sub_idx, field)[0],
+                           getattr(all_idx, field)[0][:, rows])
+    with pytest.raises(ValueError):
+        veda_mask.kernel_indices(sub, lay)

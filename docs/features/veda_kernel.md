@@ -82,9 +82,9 @@ flash-attn-4 4.0.0b32 @ d15f153：
 - 2026-09-23 RTX 4090：见上表。结论：上游 FA4 在 SM89 上不支持块稀疏；我们的补丁达到效率门槛，
   已作为 vendored 模块合入（`miowtion/kernels/fa4_sm8x`）。
 - H100 / B200：待测（正确性对拍 + 效率 ≥ 0.75 的门槛）。
-- `tests/gpu/test_kernels_gpu.py`（2026-09-23，RTX 4090，通过 `fa4_sm8x.install()`）：3 passed。
+- `tests/gpu/test_kernels_gpu.py`（2026-09-23，RTX 4090，通过 `fa4_sm8x.install()`）：4 passed。
   FA4 稠密的 LSE 与 fp32 参考一致；Triton 热力图与 torch 参考一致；FA4 块稀疏（含 partial tile）
-  与 fp32 参考一致。
+  与 fp32 参考一致；oracle 的 kernel 路径与参考路径一致（见 tile_search.md）。
 
 ## 待办
 - **FP8 sparse**（用户要求，方案待定）：块稀疏 + FP8（或 INT8 QK / FP8 PV，参考 SageAttention /

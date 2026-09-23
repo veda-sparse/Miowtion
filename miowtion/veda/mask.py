@@ -223,16 +223,29 @@ def _pack_left(entries: torch.Tensor, member: torch.Tensor
 
 
 @torch.no_grad()
-def kernel_indices(selection: Selection,
-                   layout: tiling.TileLayout) -> KernelIndices:
-    """Converts a selection into full/partial index lists for the kernel."""
-    heads, n_video, _ = selection.index.shape
-    n, device = layout.n_tiles, selection.index.device
-    all_cols = torch.arange(n, device=device)
+def kernel_indices(selection: Selection, layout: tiling.TileLayout,
+                   global_rows: bool = True) -> KernelIndices:
+    """Converts a selection into full/partial index lists for the kernel.
+
+    Args:
+        selection: Video query tiles' selected key tiles (all n_video tiles,
+            or a subset of R query tiles).
+        layout: Tile layout.
+        global_rows: Append the dense lists of the global query tiles (the
+            full-sequence case). False yields lists for the selection's rows
+            only, e.g. to run sampled query tiles.
+    """
+    heads, num_rows, _ = selection.index.shape
+    n, n_video = layout.n_tiles, layout.n_video_tiles
+    if global_rows and num_rows != n_video:
+        raise ValueError('global_rows needs a selection of all video rows')
+    all_cols = torch.arange(n, device=selection.index.device)
+    # The global columns start after the layout's video tiles, whatever the
+    # number of selected rows.
     global_cols = all_cols[n_video:]
 
     # Video query rows: global columns first, then the selected video tiles.
-    entries = torch.cat([global_cols.expand(heads, n_video, -1),
+    entries = torch.cat([global_cols.expand(heads, num_rows, -1),
                          selection.index], -1)
     is_full = layout.full_tile[entries]
     is_part = layout.kv_ok[entries] & ~is_full
@@ -241,6 +254,12 @@ def kernel_indices(selection: Selection,
                           selection.keep], -1)
     v_full_idx, v_full_cnt = _pack_left(entries, selected & is_full)
     v_part_idx, v_part_cnt = _pack_left(entries, selected & is_part)
+    if not global_rows:
+        return KernelIndices(
+            full_cnt=v_full_cnt[None].to(torch.int32),
+            full_idx=v_full_idx[None].to(torch.int32).contiguous(),
+            partial_cnt=v_part_cnt[None].to(torch.int32),
+            partial_idx=v_part_idx[None].to(torch.int32).contiguous())
 
     # Global query rows see every non-empty tile.
     g_rows = n - n_video
