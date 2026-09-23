@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="assets/miowtion-logo.svg" width="160" alt="Miowtion logo">
+
 # Miowtion
 
 **Block-sparse attention training for [MiniMax-H3](https://github.com/MiniMax-AI/MiniMax-H3) audio-video DiTs.**
