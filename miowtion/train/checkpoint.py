@@ -86,10 +86,24 @@ class CheckpointManager:
     """Writes checkpoints locally and mirrors them to persistent storage."""
 
     def __init__(self, local_dir: str, persistent_dir: str | None,
-                 env: parallel.DistEnv):
+                 env: parallel.DistEnv, keep_last: int | None = None):
+        """Initializes the manager.
+
+        Args:
+            local_dir: Directory of step_* checkpoints.
+            persistent_dir: Optional mirror (never pruned).
+            env: Distributed environment.
+            keep_last: Keep only this many newest local checkpoints (older
+                complete ones are deleted after each successful save); None
+                keeps all. A checkpoint is several GB, so long runs on small
+                disks need this.
+        """
+        if keep_last is not None and keep_last < 1:
+            raise ValueError(f'keep_last must be >= 1, got {keep_last}')
         self.local_dir = local_dir
         self.persistent_dir = persistent_dir
         self.env = env
+        self.keep_last = keep_last
         self._copy_thread: threading.Thread | None = None
 
     def save(self, step: int, named_params: Sequence[tuple[str, nn.Parameter]],
@@ -132,6 +146,19 @@ class CheckpointManager:
         with open(os.path.join(directory, _MARKER), 'w') as f:
             json.dump({'step': step, 'bytes': os.path.getsize(path)}, f)
         self._start_copy(directory)
+        self._prune()
+
+    def _prune(self) -> None:
+        """Deletes complete local checkpoints beyond the newest keep_last."""
+        if self.keep_last is None:
+            return
+        complete = sorted(
+            d for d in os.listdir(self.local_dir)
+            if d.startswith('step_')
+            and os.path.exists(os.path.join(self.local_dir, d, _MARKER)))
+        for name in complete[:-self.keep_last]:
+            # The persistent mirror copies from the newest directory only.
+            shutil.rmtree(os.path.join(self.local_dir, name))
 
     def _start_copy(self, directory: str) -> None:
         if not self.persistent_dir:

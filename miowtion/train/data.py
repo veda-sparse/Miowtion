@@ -241,27 +241,57 @@ def parse_geometry(spec: str) -> h3_geometry.Geometry:
     return h3_geometry.geometry_from_latent_t(aspect, int(value))
 
 
-class GeometrySampler:
-    """Uniform geometry choice shared by all ranks.
+GEOMETRY_SAMPLING_MODES = ('uniform', 'cycle')
 
-    The generator has no rank term: every rank must draw the same geometry,
+
+class GeometrySampler:
+    """Geometry choice shared by all ranks.
+
+    'uniform' draws every trajectory's geometry independently. 'cycle' visits
+    each geometry once per round in a shuffled order, so every geometry is
+    covered after len(specs) trajectories (balanced mixing; smoke tests use it
+    to reach all geometries quickly).
+
+    Nothing depends on the rank: every rank must draw the same geometry,
     otherwise ranks run different sequence lengths and fall out of step.
     """
 
-    def __init__(self, specs: Sequence[str], seed: int):
+    def __init__(self, specs: Sequence[str], seed: int,
+                 mode: str = 'uniform'):
+        if mode not in GEOMETRY_SAMPLING_MODES:
+            raise ValueError(f'geometry sampling must be one of '
+                             f'{GEOMETRY_SAMPLING_MODES}, got {mode!r}')
         self.geometries = [parse_geometry(s) for s in specs]
+        self.mode = mode
+        self.seed = seed
         self.generator = torch.Generator().manual_seed(seed)
+        self.draws = 0
 
     def next(self) -> h3_geometry.Geometry:
-        index = torch.randint(len(self.geometries), (1,),
-                              generator=self.generator).item()
-        return self.geometries[index]
+        if self.mode == 'uniform':
+            index = torch.randint(len(self.geometries), (1,),
+                                  generator=self.generator).item()
+            return self.geometries[index]
+        # The order of a round depends only on (seed, round), so the draw
+        # count alone is the resumable state.
+        count = len(self.geometries)
+        round_index, position = divmod(self.draws, count)
+        order = torch.randperm(count, generator=torch.Generator().manual_seed(
+            self.seed * 7919 + round_index))
+        self.draws += 1
+        return self.geometries[order[position].item()]
 
     def state(self) -> torch.Tensor:
-        return self.generator.get_state()
+        """Resumable state (generator state, or the cycle's draw count)."""
+        if self.mode == 'uniform':
+            return self.generator.get_state()
+        return torch.tensor([self.draws], dtype=torch.int64)
 
     def load_state(self, state: torch.Tensor) -> None:
-        self.generator.set_state(state)
+        if self.mode == 'uniform':
+            self.generator.set_state(state)
+        else:
+            self.draws = int(state[0])
 
 
 class SampleSampler:

@@ -123,7 +123,7 @@ def test_stage1_trains_and_resumes(tmp_path):
         'schedule': 'base', 'num_steps': 4, 'accum': 2, 'steps': 3, 'save_every': 2,
         'warmup': 1, 'keep_ratio': 0.5, 'recall_every': 1,
         'out_dir': str(tmp_path / 'runs'), 'dense_backend': 'math',
-        'bootstrap_shape': '1x8x16',
+        'bootstrap_shape': '1x8x16', 'keep_last': 1,
     }
     path = tmp_path / 'cfg.yaml'
     path.write_text(yaml.safe_dump(cfg))
@@ -137,8 +137,15 @@ def test_stage1_trains_and_resumes(tmp_path):
     steps = [r for r in log if 'step' in r]
     assert [r['step'] for r in steps] == [1, 2, 3]
     assert all(r['kl'] > 0 for r in steps)
+    # Update diagnostics: cosine needs a previous update.
+    assert all(len(r['grad_norm_layers']) == 2 and r['update_ratio'] > 0
+               for r in steps)
+    assert 'grad_cos' not in steps[0] and -1 <= steps[1]['grad_cos'] <= 1
     latest = checkpoint.latest([str(tmp_path / 'runs' / 'tiny' / 'ckpt')])
     assert latest.endswith('step_0000003')
+    # keep_last 1: the step-2 checkpoint was pruned after step 3 was saved.
+    assert sorted(os.listdir(tmp_path / 'runs' / 'tiny' / 'ckpt')) == [
+        'step_0000003']
     # A new trainer resumes from the latest complete checkpoint.
     t2 = trainer_lib.Trainer(config)
     assert t2.step == 3
@@ -254,3 +261,49 @@ def test_teacher_adapter_is_strict(tmp_path):
     with pytest.raises(KeyError):
         teacher.build_teacher(root, 'FL2VA', 'turbo', 4, adapter_path, env,
                               visual_conditions=False, audio_references=False)
+
+
+def test_geometry_cycle_covers_all_and_resumes():
+    specs = ['1:1@37', '4:3@72', '16:9@102', '9:16@37']
+    sampler = data.GeometrySampler(specs, seed=3, mode='cycle')
+    names = [sampler.next().name for _ in range(2 * len(specs))]
+    for r in range(2):
+        assert sorted(names[r * 4:(r + 1) * 4]) == sorted(
+            data.parse_geometry(s).name for s in specs)
+    # Resuming from the state continues the same sequence.
+    fresh = data.GeometrySampler(specs, seed=3, mode='cycle')
+    [fresh.next() for _ in range(5)]
+    resumed = data.GeometrySampler(specs, seed=3, mode='cycle')
+    resumed.load_state(fresh.state())
+    assert [resumed.next().name for _ in range(6)] == [
+        fresh.next().name for _ in range(6)]
+    with pytest.raises(ValueError):
+        data.GeometrySampler(specs, seed=0, mode='round-robin')
+
+
+def test_update_monitor_and_gradient_stop():
+    from miowtion.train import monitor
+    from miowtion.veda import predictor as veda_predictor
+    pred = veda_predictor.TileScorePredictor(2, 2, 8)
+    named = [(f'predictor.{n}', p) for n, p in pred.named_parameters()]
+    mon = monitor.UpdateMonitor(named)
+    opt = torch.optim.SGD(pred.parameters(), lr=0.1)
+    for p in pred.parameters():
+        p.grad = torch.ones_like(p)
+    first = mon.before_step()
+    assert 'grad_cos' not in first and len(first['grad_norm_layers']) == 2
+    opt.step()
+    ratio = mon.after_step()['update_ratio']
+    assert ratio > 0
+    for p in pred.parameters():
+        p.grad = -torch.ones_like(p)  # opposite direction
+    second = mon.before_step()
+    assert second['grad_cos'] == pytest.approx(-1.0)
+    assert second['grad_cos_layers'] == [-1.0, -1.0]
+    # A gradient on a parameter outside the trainable set is rejected.
+    trunk = torch.nn.Linear(2, 2)
+    model = torch.nn.ModuleDict({'trunk': trunk, 'pred': pred})
+    monitor.check_gradient_stop(model, list(model.parameters()))
+    trunk.weight.grad = torch.ones_like(trunk.weight)
+    with pytest.raises(RuntimeError, match='frozen'):
+        monitor.check_gradient_stop(model, list(pred.parameters()))

@@ -33,6 +33,7 @@ from miowtion.kernels import fa4
 from miowtion.train import checkpoint
 from miowtion.train import data
 from miowtion.train import lora
+from miowtion.train import monitor as monitor_lib
 from miowtion.train import optim
 from miowtion.train import parallel
 from miowtion.train import teacher
@@ -63,6 +64,11 @@ class TrainConfig:
     schedule: str = 'base'
     num_steps: int = 49
     teacher_adapter: str | None = None
+    geometry_sampling: str = 'uniform'  # or 'cycle', see GeometrySampler
+    # Denoising steps per trajectory before the next one starts; None rolls
+    # the whole schedule. Only for smoke tests that must visit many
+    # geometries quickly (every trajectory then stays near the noise end).
+    trajectory_steps: int | None = None
     keep_ratio: float = 0.1
     ref_keep_ratio: float | None = None
     tile_conditions: bool = False
@@ -80,6 +86,7 @@ class TrainConfig:
     out_dir: str = 'runs'
     persistent_dir: str | None = None
     save_every: int = 50
+    keep_last: int | None = None  # newest local checkpoints kept
     init_from: str | None = None
     init_drop_prefixes: list[str] = dataclasses.field(default_factory=list)
     lora_rank: int = 64
@@ -90,6 +97,7 @@ class TrainConfig:
     seq_bucket: int | None = None
     dense_backend: str = 'auto'
     offload_optimizer: bool = False
+    monitor_updates: bool = True
 
     @classmethod
     def from_yaml(cls, path: str) -> TrainConfig:
@@ -111,6 +119,13 @@ class TrainConfig:
                                  f'{data.VARIANT_OF_TASK[task]} checkpoint')
         if self.stage == 2 and not self.init_from:
             raise ValueError('stage 2 must start from a stage-1 checkpoint')
+        if self.geometry_sampling not in data.GEOMETRY_SAMPLING_MODES:
+            raise ValueError(f'geometry_sampling must be one of '
+                             f'{data.GEOMETRY_SAMPLING_MODES}')
+        if self.trajectory_steps is not None and not (
+                1 <= self.trajectory_steps <= self.num_steps):
+            raise ValueError(f'trajectory_steps must be in [1, '
+                             f'{self.num_steps}], got {self.trajectory_steps}')
 
 
 class Trainer:
@@ -196,9 +211,10 @@ class Trainer:
         self.ema = checkpoint.Ema(self.opt_params, config.ema)
         self.ckpt = checkpoint.CheckpointManager(
             os.path.join(self.run_dir, 'ckpt'), config.persistent_dir,
-            self.env)
+            self.env, config.keep_last)
 
-        self.geometries = data.GeometrySampler(config.geometries, config.seed)
+        self.geometries = data.GeometrySampler(
+            config.geometries, config.seed, config.geometry_sampling)
         self.cache = data.SampleCache(config.sample_cache)
         self.samples = data.SampleSampler(
             self.cache.select('train', config.tasks), config.seed,
@@ -207,6 +223,11 @@ class Trainer:
             config.seed * 977 + self.env.rank)
         self.step = 0
         self._restore()
+        self.start_step = self.step
+        # Diagnostics are computed where the optimizer steps (host masters
+        # when offloaded), so they cost no device memory.
+        self.monitor = (monitor_lib.UpdateMonitor(self.opt_params)
+                        if config.monitor_updates else None)
         self.trajectory = None
 
     # --- setup -----------------------------------------------------------
@@ -273,7 +294,9 @@ class Trainer:
     # --- one update ------------------------------------------------------
 
     def _micro_step(self, stats: dict) -> None:
-        if self.trajectory is None or self.trajectory.done:
+        limit = self.config.trajectory_steps
+        if (self.trajectory is None or self.trajectory.done
+                or (limit is not None and self.trajectory.step >= limit)):
             self._next_trajectory()
         traj = self.trajectory
         self._micro_start = time.time()
@@ -321,6 +344,9 @@ class Trainer:
             replicated = [p for n, p in self.trainable
                           if not n.startswith('blocks.')]
             parallel.all_reduce_gradients(replicated, self.env)
+            if self.step == self.start_step:
+                monitor_lib.check_gradient_stop(
+                    self.model, [p for _, p in self.trainable])
             norms = {name: torch.nn.utils.clip_grad_norm_(
                 params, config.grad_clip).item()
                      for name, params in self.clip_groups.items()}
@@ -329,7 +355,11 @@ class Trainer:
                                               / max(1, config.warmup))
             if self.masters is not None:
                 self.masters.pull_grads()
+            diagnostics = (self.monitor.before_step()
+                           if self.monitor is not None else {})
             self.optimizer.step()
+            if self.monitor is not None:
+                diagnostics.update(self.monitor.after_step())
             self.optimizer.zero_grad(set_to_none=self.masters is None)
             for _, p in self.trainable:
                 p.grad = None
@@ -337,7 +367,7 @@ class Trainer:
                 self.masters.push_params()
             self.ema.update(self.opt_params)
             self.step += 1
-            self._log_step(stats, norms, time.time() - start)
+            self._log_step(stats, norms, time.time() - start, diagnostics)
             self._updates.update(f'kl {self._last_record["kl"]:.4f} recall '
                                  f'{self._last_record["recall"]:.3f}')
             if self.step % config.save_every == 0 or self.step == config.steps:
@@ -362,7 +392,8 @@ class Trainer:
             dist.all_reduce(t)
         return (t[0] / t[1]).item() if t[1] > 0 else float('nan')
 
-    def _log_step(self, stats: dict, norms: dict, seconds: float) -> None:
+    def _log_step(self, stats: dict, norms: dict, seconds: float,
+                  diagnostics: dict) -> None:
         record = {'step': self.step,
                   'kl': self._reduce_mean(stats['kl']),
                   'recall': self._reduce_mean(stats['recall']),
@@ -374,6 +405,7 @@ class Trainer:
                   if torch.cuda.is_available() else 0.0}
         if stats['mse']:
             record['mse'] = self._reduce_mean(stats['mse'])
+        record.update(diagnostics)
         self._last_record = record
         self._log(record)
 

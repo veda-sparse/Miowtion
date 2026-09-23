@@ -1,0 +1,32 @@
+# Mixed-geometry stage 1 on 2x RTX 4090 with the 8-step Turbo teacher:
+# 1:1 / 4:3 / 16:9 / 9:16 at 5.17 / 10.1 / 14.4 s (latent_t 37 / 72 / 102),
+# geometries cycled so each is visited equally, one plan per geometry (9:16
+# mirrored from 16:9), warm-started from the single-geometry predictor.
+# Samples: 150 prompts per latent_t (MovieGen Video Bench expansions).
+run_name: stage1_turbo8_multigeo_4090
+checkpoint_root: weights/MiniMax-H3
+sample_cache: artifacts/samples/moviegen_multigeo_train
+geometries: ['1:1@37', '4:3@37', '16:9@37', '9:16@37', '1:1@72', '4:3@72',
+             '16:9@72', '9:16@72', '1:1@102', '4:3@102', '16:9@102',
+             '9:16@102']
+geometry_sampling: cycle
+variant: FL2VA
+tasks: [t2va]
+plan_dir: runs/search_turbo8_multigeo_4090/plans
+schedule: turbo
+num_steps: 8
+teacher_adapter: weights/turbo_lora/minimax_h3_turbo_v4_step600_ema.safetensors
+init_from: runs/stage1_turbo8_4090/ckpt/step_0000050
+keep_ratio: 0.1
+teacher_q_tiles: 0.25
+accum: 2
+steps: 2000
+lr: 1.0e-3
+warmup: 20
+save_every: 10
+keep_last: 2
+out_dir: runs
+offload_blocks: 44
+prefetch: 1
+mlp_chunk_rows: 8192
+offload_optimizer: true

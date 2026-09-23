@@ -33,6 +33,10 @@
   micro-step。**轨迹始终用教师速度推进**（阶段 2 也一样）。
 - 少步教师必须在它自己的网格上推进（8 步：σ ≥ 0.632）。
 - 几何由**所有 rank 共享、不含 rank 项**的生成器抽取；样本和噪声种子按 rank 各自抽取。
+  `geometry_sampling`：`uniform`（每条轨迹独立均匀抽取，默认）或 `cycle`（每一轮按打乱的顺序把
+  每个几何各走一遍，混合更均衡；轮次顺序只由 (seed, 轮号) 决定，所以状态就是抽取次数，恢复是精确的）。
+- `trajectory_steps`（只用于冒烟测试）：每条轨迹只走前 N 步就换下一条，用来在几次 update 内走遍
+  很多几何。正式训练必须走完整条轨迹（默认 None）。
 - fl2va 样本的关键帧 latent 绑定画布宽高比；prompt 的分镜时间绑定时长（`latent_t`，由 PE 记录）。
   采样器只挑与当前几何兼容的样本。
 
@@ -51,6 +55,14 @@
   逐 block 梯度检查点。学生前向**不收集 KL**（检查点重算时会重复执行）。
 - 必须有 FA4 块稀疏 kernel（SM90/100，或打了 vendored 补丁的 SM8x）才会启动；拒绝退回参考 kernel。
 - 必须从阶段 1 的 checkpoint（EMA 权重）初始化。
+
+### 监控与梯度截断
+- 每次 update 在优化器所在的张量上（offload 时是 host master，不占显存）记录：打分器每层梯度范数、
+  本次与上次 update 梯度的余弦（每层和整体；接近 0 说明这个 batch 大小下梯度以噪声为主）、
+  优化器一步的相对更新量 ‖Δw‖/‖w‖。写在 `log.jsonl` 的 `grad_norm_layers` / `grad_cos` /
+  `grad_cos_layers` / `update_ratio`（`monitor_updates: false` 关闭）。
+- 第一次 update 时检查梯度截断：可训练集合以外的参数（冻结的 trunk）只要有 `.grad` 就报错。
+  打分器只读取 detach 过的激活（池化在 no_grad 下、融合 kernel 的输出本身不带梯度）。
 
 ### 显存与性能（大模型、小显存）
 - **AdaLN 表**（`miowtion/train/adaln.py`）：冻结 trunk 时，50 个 `adaln_proj`（13B 参数）只把
@@ -100,6 +112,21 @@
 - `tests/unit/test_train_pipeline.py`：prompt 校验（两种格式）、样本缓存读写往返、AdaLN 表与实时
   计算逐位一致、tiny DiT 上阶段 1 训练 3 步 + checkpoint + 恢复（CPU 端到端）。
 - 真实权重：`scripts/smoke_dit.py`（结果见上表，2026-09-23）。
+
+## 多几何混训（`configs/stage1_turbo8_multigeo_4090.yaml`）
+- 12 种几何：1:1 / 4:3 / 16:9 / 9:16 × 5.17 / 10.1 / 14.4 s（latent_t 37 / 72 / 102），
+  `geometry_sampling: cycle`，每种几何用自己的方案表（9:16 由 16:9 镜像），从单几何打分器热启动。
+- 样本：MovieGenVideoBench 扩写集中每个 latent_t 各 150 条（10 s 的 150 条单独扩写）；另外随机
+  留出 20 条（随机宽高比与时长）只用于最终的稠密 / 稀疏对比，不参与训练。
+- lr 1e-3（用户指定），warmup 20（lr 是参考配方的 10 倍，第一步不能把权重整个替换掉），accum 2
+  （每次 update 4 个状态），每 10 次 update 存一次，`keep_last: 2`（一个 checkpoint 4.2 GB）。
+- `teacher_q_tiles: 0.25`：热力图和打分器 logits 的开销与抽样行数成正比，14.4 s 的 clip 上全部行
+  需要约 45 s/micro-step；抽 25% 的行仍然无偏，每个头每层仍有 75 个以上的 query tile。
+- `offload_blocks: 44`：104k token 时 30 / 40 都会 OOM（先后在 RoPE、TeacherCollector、AdaLN 调制
+  处，均已分块修复），44 时峰值 20.9 GiB。多卡时 FSDP 的 copy-in 流让拷贝与计算重叠。
+- 冒烟（`configs/stage1_turbo8_multigeo_smoke_4090.yaml`，每个几何 1 步）：micro-step 1:1 t37
+  16 s、16:9 t37 31 s、1:1 t72 36 s、4:3 t72 54 s、1:1 t102 63 s、4:3 t102 81 s、16:9 / 9:16
+  t102 150 s；初始 KL 0.94–1.64，recall ≈ 0.52–0.54。
 
 ## 踩坑记录
 - CPU offload 要求被 offload 的 FSDP 参数先在 CPU 上物化，否则报 "FSDP parameters should be
