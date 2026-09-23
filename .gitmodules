@@ -1,0 +1,4 @@
+[submodule "third_party/MiniMax-H3"]
+	path = third_party/MiniMax-H3
+	url = https://github.com/MiniMax-AI/MiniMax-H3
+	shallow = true

@@ -216,3 +216,13 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# --- Miowtion ---
+.DS_Store
+runs/
+artifacts/
+.agents/
+.worktrees/
+*.safetensors
+*.pt
+!tests/fixtures/**
