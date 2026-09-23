@@ -11,7 +11,7 @@
 | [features/veda_kernel.md](features/veda_kernel.md) | FA4 CuTe 块稀疏整合（含 vendored 的 SM8x 补丁）、架构支持、测速结果 | SM89 已通过 GPU 测试；SM90/100 待验证 |
 | [features/tile_search.md](features/tile_search.md) | oracle 评分、投票、每层 ≤2 种形状、搜索驱动 | 真实权重上 50 步 / 8 步搜索已跑通 |
 | [features/training.md](features/training.md) | FSDP2 训练框架：阶段 1/2、少步 LoRA 教师、AdaLN 表、数据、checkpoint | 阶段 1 已在 2×4090 真实权重上跑通；阶段 2 待 GPU 验证 |
-| [features/prompt_expansion.md](features/prompt_expansion.md) | prompt 扩写：短 prompt → H3 T2VA 结构化 prompt（DeepSeek；system prompt 由 H3 skill 拼成；校验 + repair 重试） | CPU 测试通过；10 条冒烟通过 |
+| [features/prompt_expansion.md](features/prompt_expansion.md) | prompt 扩写：短 prompt → H3 T2VA 结构化 prompt（DeepSeek；system prompt 由 H3 skill 拼成；校验 + repair 重试） | CPU 测试通过；MovieGenVideoBench 全量 1003 条已扩写并发布到 `data/prompts/` |
 | [dependencies.md](dependencies.md) | 外部依赖、锁定版本、依赖的内部接口 | 当前 |
 | [pitfalls.md](pitfalls.md) | 踩坑总表 | 持续更新 |
 

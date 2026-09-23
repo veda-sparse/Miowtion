@@ -21,6 +21,8 @@ are supported: **FL2VA** (t2va / fl2va) and **Ref2VA** (ref2va), with the base
   per-head dynamic tile permutations, oracle tile-plan search, stage-1 predictor
   training with FSDP2 (verified on real weights on 2x RTX 4090), few-step Turbo
   LoRA teachers, and an FA4 CuTe block-sparse kernel study on SM89.
+- `2026/09/23`: Released [`data/prompts/moviegen_video_bench_h3.jsonl`](data/prompts):
+  all 1003 MovieGen Video Bench prompts expanded into structured H3 T2VA prompts.
 - `2026/09/23`: FA4 block sparsity on SM8x (verified on RTX 4090) through a
   vendored, hash-checked patch of the FA4 SM80 kernels (`miowtion/kernels/fa4_sm8x`).
 
@@ -102,7 +104,7 @@ Set up Miowtion (this repository) for training on this machine.
 
 | Step | Command | Output |
 |---|---|---|
-| 1. Prompt expansion | `DEEPSEEK_API_KEY=... python scripts/expand_prompts.py ...` | structured H3 prompts (`.jsonl`) |
+| 1. Prompt expansion | `DEEPSEEK_API_KEY=... python scripts/expand_prompts.py ...` (or use `data/prompts/`) | structured H3 prompts (`.jsonl`) |
 | 2. Offline encoding | `python scripts/encode_samples.py --root $ROOT --manifest prompts.jsonl --out $CACHE` | sample cache |
 | 3. Tile-plan search | `torchrun --nproc_per_node N scripts/search_tiles.py --config configs/search_turbo8_16x9_t37_4090.yaml` | per-clip scores |
 | 4. Build the plan | `python scripts/build_plan.py --scores $RUN/scores/16x9_t37 --out plans/16x9_t37.json` | tile plan |
@@ -152,6 +154,7 @@ miowtion/train   parallel (FSDP2), teacher, trajectory, trainer, checkpoint, lor
 scripts/         thin CLI entry points          configs/   run configs
 tests/unit       CPU tests (run before every commit)   tests/gpu   GPU tests
 docs/            knowledge base: features, pitfalls, dependencies
+data/prompts     released prompt sets (see its README for source and license)
 third_party/     pinned submodules (MiniMax-H3)
 ```
 
@@ -166,4 +169,6 @@ agents working in one tree.
 ## License
 
 MIT (see [LICENSE](LICENSE)). MiniMax-H3 weights and code are subject to their own
-licenses.
+licenses. `miowtion/kernels/fa4_sm8x` contains patched FlashAttention files under
+their BSD-3-Clause license. `data/prompts/moviegen_video_bench_h3.jsonl` contains
+the MovieGen Video Bench prompts and is licensed CC BY-NC 4.0 (non-commercial).
