@@ -217,8 +217,10 @@ class SparseStudent:
             with torch.no_grad():
                 logits = self.predictor.scores(layer_index, q_tiles, k_tiles,
                                                tile_layout, group.heads)
+                # Only video query tiles are selected; global rows are dense.
                 selection = veda_mask.select_video_blocks(
-                    logits, tile_layout, self.clip.blocks(tile_layout))
+                    logits[:, :tile_layout.n_video_tiles], tile_layout,
+                    self.clip.blocks(tile_layout))
                 block_mask = veda_mask.dense_block_mask(selection,
                                                         tile_layout)
             if self.use_fa4:

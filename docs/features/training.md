@@ -49,7 +49,7 @@
   注入，基础权重名不变）+ 输出头。
 - 冻结教师：关闭 LoRA，并把输出头换回开始时保存的快照。学生：开启 LoRA，使用 `SparseStudent` 和
   逐 block 梯度检查点。学生前向**不收集 KL**（检查点重算时会重复执行）。
-- 必须有 FA4 块稀疏 kernel（SM90/100）才会启动；拒绝退回参考 kernel。
+- 必须有 FA4 块稀疏 kernel（SM90/100，或打了 vendored 补丁的 SM8x）才会启动；拒绝退回参考 kernel。
 - 必须从阶段 1 的 checkpoint（EMA 权重）初始化。
 
 ### 显存与性能（大模型、小显存）
@@ -108,6 +108,10 @@
   `all_gather_copy_in_stream`。
 - 复制参数手动 all-reduce 时，缺失的梯度必须补零，否则各 rank 缓冲区长度不一致，通信挂起。
 - DTensor 的 `full_tensor()` 必须在所有 rank 上调用，之后才能提前 return 让 rank 0 单独写盘。
+- **`SparseStudent` 把全部 tile 的 logits 交给了只接受视频 query 行的 `select_video_blocks`**：
+  有文本等全局 tile 时两者行数不同（330 vs 336），第一次在 GPU 上跑稀疏推理时报错。原来没有任何
+  测试覆盖 `SparseStudent`。现在只取视频行，新增的 CPU 测试用带全局 tile 的真实打包布局，并检查全
+  保留预算时与稠密一致。
 
 ## 验证记录
 - 2026-09-23 macOS CPU：unit 全部通过（阶段 1 端到端 + 恢复；optimizer offload 与不 offload

@@ -39,6 +39,7 @@
 
 | 现象 | 原因 | 对策 | 链接 |
 |---|---|---|---|
+| `SparseStudent` 报张量行数不匹配（330 vs 336） | 把包含全局行的 logits 交给只要视频行的 `select_video_blocks` | 只取视频行；CPU 测试用带全局 tile 的布局 | [training](features/training.md) |
 | "FSDP parameters should be materialized on CPU" | 开 CPU offload 但参数物化在 GPU 上 | offload 的 block 用 `to_empty(device='cpu')` | [training](features/training.md) |
 | `FSDPCommContext has no all_gather_copy_in_stream` | 没有 FSDP root，跨 block 预取找不到通信流 | 根模块也 `fully_shard`，复制参数放进 `ignored_params` | [training](features/training.md) |
 | 手动 all-reduce 挂起 | 某些 rank 缺梯度，拼出的缓冲区长度不一致 | 缺失的梯度补零 | [training](features/training.md) |

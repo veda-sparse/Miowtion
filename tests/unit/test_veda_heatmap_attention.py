@@ -107,3 +107,38 @@ def test_teacher_collector_trains_only_the_predictor():
     assert len(collector.stats.kl) == 1 and len(collector.stats.recall) == 2
     assert pred.layers[0].proj_q.grad is not None
     assert pred.layers[0].proj_q.grad.abs().sum() > 0
+
+
+def test_sparse_student_with_global_tiles():
+    """Text rows give global tiles; keep-all budgets must equal dense."""
+    from miowtion.h3 import geometry
+    from miowtion.h3 import layout as h3_layout
+    from miowtion.veda import plan as veda_plan
+    geo = geometry.Geometry('16:9', 512, 256, 39, 12, 16, 32, 20)
+    lay = h3_layout.pack(torch.ones(300, dtype=torch.long), geo)
+    q, k, v = (t.float() for t in _qkv(lay.seq_len, heads=4))
+    plan = veda_plan.TilePlan(geo.name, geo.video_grid,
+                              [tiling.TileShape(4, 4, 8),
+                               tiling.TileShape(2, 8, 8)],
+                              [[0, 1, 1, 0]])
+    pred = veda_predictor.TileScorePredictor(1, 4, 32)
+    dense = h3_attention.dense_attention(q, k, v, lay.used,
+                                         backend='math')[0]
+    config = veda_attention.VedaConfig(
+        target_budget=veda_mask.Budget(ratio=1.0))
+    clip = veda_attention.ClipTiling(lay, config, torch.device('cpu'))
+    group_layout = clip.get(tiling.TileShape(4, 4, 8))
+    assert group_layout.n_tiles > group_layout.n_video_tiles  # global rows
+    student = veda_attention.SparseStudent(clip, plan, pred,
+                                           allow_reference_kernel=True)
+    with torch.no_grad():
+        out = student(q, k, v, 0)
+    torch.testing.assert_close(out, dense, rtol=1e-5, atol=1e-5)
+    # A real budget drops blocks and changes the output.
+    sparse_clip = veda_attention.ClipTiling(
+        lay, veda_attention.VedaConfig(
+            target_budget=veda_mask.Budget(ratio=0.2)), torch.device('cpu'))
+    with torch.no_grad():
+        sparse = veda_attention.SparseStudent(
+            sparse_clip, plan, pred, allow_reference_kernel=True)(q, k, v, 0)
+    assert (sparse - dense).abs().max() > 1e-3
