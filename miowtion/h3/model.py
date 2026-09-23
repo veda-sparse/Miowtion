@@ -259,10 +259,36 @@ class TokenRefiner(nn.Module):
         return self.final_norm(x)
 
 
+# Rows per chunk of the AdaLN modulation and the gated residual: both are
+# elementwise per row (bitwise identical when chunked), and unchunked they
+# materialize several [S, hidden] temporaries (1.1 GB each at 100k rows).
+_ADALN_CHUNK_ROWS = 16384
+
+
 def _modulate(x: torch.Tensor, one_plus_scale: torch.Tensor,
               shift: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
-    return x * one_plus_scale.index_select(0, index) + shift.index_select(
-        0, index)
+    if x.shape[0] <= _ADALN_CHUNK_ROWS:
+        return x * one_plus_scale.index_select(0, index) + shift.index_select(
+            0, index)
+    out = torch.empty_like(x)
+    for start in range(0, x.shape[0], _ADALN_CHUNK_ROWS):
+        rows = slice(start, start + _ADALN_CHUNK_ROWS)
+        idx = index[rows]
+        out[rows] = (x[rows] * one_plus_scale.index_select(0, idx)
+                     + shift.index_select(0, idx))
+    return out
+
+
+def _gated_residual(x: torch.Tensor, gate: torch.Tensor,
+                    index: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
+    """x + gate[index] * h, chunked over rows like _modulate."""
+    if x.shape[0] <= _ADALN_CHUNK_ROWS:
+        return x + gate.index_select(0, index) * h
+    out = torch.empty_like(x)
+    for start in range(0, x.shape[0], _ADALN_CHUNK_ROWS):
+        rows = slice(start, start + _ADALN_CHUNK_ROWS)
+        out[rows] = x[rows] + gate.index_select(0, index[rows]) * h[rows]
+    return out
 
 
 class Block(nn.Module):
@@ -291,9 +317,9 @@ class Block(nn.Module):
         h = _modulate(self.norm1(x), 1.0 + scale_msa, shift_msa, adaln_index)
         q, k, v = self.attn.qkv(h, rope)
         h = self.attn.project_out(attention_fn(q, k, v, layer_index))
-        x = x + gate_msa.index_select(0, adaln_index) * h
+        x = _gated_residual(x, gate_msa, adaln_index, h)
         h = _modulate(self.norm2(x), 1.0 + scale_mlp, shift_mlp, adaln_index)
-        return x + gate_mlp.index_select(0, adaln_index) * self.mlp(h)
+        return _gated_residual(x, gate_mlp, adaln_index, self.mlp(h))
 
 
 class FinalLayer(nn.Module):

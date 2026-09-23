@@ -158,3 +158,17 @@ def test_chunked_rope_is_bitwise_identical(monkeypatch):
     whole = h3_model.apply_rope(x, cos, sin)
     monkeypatch.setattr(h3_model, '_ROPE_CHUNK_ROWS', 128)
     assert torch.equal(h3_model.apply_rope(x, cos, sin), whole)
+
+
+def test_chunked_adaln_ops_are_bitwise_identical(monkeypatch):
+    from miowtion.h3 import model as h3_model
+    gen = torch.Generator().manual_seed(0)
+    x = torch.randn(1000, 64, generator=gen).to(torch.bfloat16)
+    h = torch.randn(1000, 64, generator=gen).to(torch.bfloat16)
+    table = torch.randn(6, 64, generator=gen).to(torch.bfloat16)
+    index = torch.randint(6, (1000,), generator=gen)
+    mod = h3_model._modulate(x, 1.0 + table, table, index)
+    res = h3_model._gated_residual(x, table, index, h)
+    monkeypatch.setattr(h3_model, '_ADALN_CHUNK_ROWS', 128)
+    assert torch.equal(h3_model._modulate(x, 1.0 + table, table, index), mod)
+    assert torch.equal(h3_model._gated_residual(x, table, index, h), res)
