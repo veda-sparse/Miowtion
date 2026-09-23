@@ -64,22 +64,26 @@ uv venv --python 3.12 --seed && source .venv/bin/activate
 
 # CPU development: unit tests only
 uv pip install -e '.[dev]' && pytest tests/unit -q
+git config core.hooksPath .githooks   # pre-commit leak checks (see AGENTS.md)
 
 # GPU machines (CUDA 12): torch + FA4 CuTe + Triton + prompt encoding
 UV_TORCH_BACKEND=cu126 uv pip install -e '.[dev,gpu,encode]' torchvision accelerate
 ```
 
 Download the weights (FL2VA fully; for Ref2VA only its DiT differs, the text
-encoder / VAEs are byte-identical and can be symlinked):
+encoder / VAEs are byte-identical and can be symlinked). Configs refer to them
+through the git-ignored `weights/` directory; if they live elsewhere, symlink
+`weights/MiniMax-H3` and `weights/turbo_lora` there instead.
 
 ```bash
+ROOT=weights/MiniMax-H3
 hf download MiniMaxAI/MiniMax-H3 --include "model_index.json" "FL2VA/*" \
     "Ref2VA/model_index.json" "Ref2VA/transformer/*" "Ref2VA/tokenizer/*" \
     "Ref2VA/processor/*" --local-dir $ROOT            # ~210 GB
 for c in text_encoder video_vae audio_vae; do ln -s ../FL2VA/$c $ROOT/Ref2VA/$c; done
 # Few-step teacher (optional): larryvrh/MiniMax-H3-Turbo-Lora
 hf download larryvrh/MiniMax-H3-Turbo-Lora minimax_h3_turbo_v4_step600_ema.safetensors \
-    --local-dir $LORA
+    --local-dir weights/turbo_lora
 ```
 
 ### Install with an AI coding agent
@@ -151,7 +155,9 @@ third_party/     pinned submodules (MiniMax-H3)
 
 Read [AGENTS.md](AGENTS.md): Google Python style, docs updated with every feature
 and pitfall, bit-exact alignment for data transforms (visual human sign-off when
-bit-exactness is impossible), and rules for multiple agents working in one tree.
+bit-exactness is impossible), no machine-local information or secrets in the
+repository (enforced by the `.githooks` leak checks), and rules for multiple
+agents working in one tree.
 
 ## License
 

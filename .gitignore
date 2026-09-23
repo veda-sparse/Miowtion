@@ -226,3 +226,4 @@ artifacts/
 *.safetensors
 *.pt
 !tests/fixtures/**
+weights/
