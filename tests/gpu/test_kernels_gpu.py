@@ -7,8 +7,10 @@ from miowtion.h3 import attention as h3_attention
 from miowtion.kernels import block_heat_triton
 from miowtion.kernels import fa4
 from miowtion.kernels import reference
+from miowtion.kernels import tile_gather_triton
 from miowtion.veda import heatmap
 from miowtion.veda import mask as veda_mask
+from miowtion.veda import predictor as veda_predictor
 from miowtion.veda import search
 from miowtion.veda import tiling
 
@@ -131,3 +133,27 @@ def test_oracle_head_chunks_do_not_change_the_result(monkeypatch):
     chunked = search.oracle_rel_mse(q, k, v, lay, blocks, rows,
                                     dense_out=out, lse=lse)
     torch.testing.assert_close(chunked, whole, rtol=1e-6, atol=0)
+
+
+@pytest.mark.skipif(not tile_gather_triton.available(), reason='needs triton')
+@pytest.mark.parametrize('heads', [None, [0, 2, 3]])
+def test_tile_gather_pool_scatter_match_torch(heads):
+    lay = _layout(grid=(8, 12, 20))  # padded grid -> partial tiles
+    assert lay.partial_tiles.numel() > 0
+    x, _, _ = _qkv(lay.seq_len)
+    idx = None if heads is None else torch.tensor(heads, device='cuda')
+    ref_tiles = tiling.gather_tiles(x, lay, idx)
+    tiles, feats = tile_gather_triton.gather_and_pool(x, lay, idx)
+    assert torch.equal(tiles, ref_tiles)
+    assert torch.equal(tile_gather_triton.gather_tiles(x, lay, idx),
+                       ref_tiles)
+    ref_feats = veda_predictor.pool_tiles(ref_tiles, lay)
+    d = x.shape[-1]
+    assert torch.equal(feats[..., d:], ref_feats[..., d:])  # max, min
+    torch.testing.assert_close(feats[..., :d], ref_feats[..., :d],
+                               rtol=1e-5, atol=1e-6)  # mean: sum order
+    out_ref = x.new_zeros(lay.seq_len + 1, *x.shape[1:])
+    out = x.new_zeros(lay.seq_len + 1, *x.shape[1:])
+    tiling.scatter_tiles_(out_ref, ref_tiles, lay, idx)
+    tile_gather_triton.scatter_tiles_(out, tiles, lay, idx)
+    assert torch.equal(out[:lay.seq_len], out_ref[:lay.seq_len])

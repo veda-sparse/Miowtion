@@ -18,6 +18,7 @@ from miowtion.h3 import attention as h3_attention
 from miowtion.h3 import layout as h3_layout
 from miowtion.kernels import fa4
 from miowtion.kernels import reference
+from miowtion.kernels import tile_gather_triton
 from miowtion.veda import heatmap
 from miowtion.veda import mask as veda_mask
 from miowtion.veda import plan as veda_plan
@@ -98,6 +99,35 @@ class ClipTiling:
         return max(1, min(n_video, count))
 
 
+def _fused(x: torch.Tensor) -> bool:
+    return x.is_cuda and tile_gather_triton.available()
+
+
+def _gather(x: torch.Tensor, tile_layout: tiling.TileLayout,
+            heads: torch.Tensor) -> torch.Tensor:
+    if _fused(x):
+        return tile_gather_triton.gather_tiles(x, tile_layout, heads)
+    return tiling.gather_tiles(x, tile_layout, heads)
+
+
+def _gather_and_pool(x: torch.Tensor, tile_layout: tiling.TileLayout,
+                     heads: torch.Tensor
+                     ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Tile-ordered rows and predictor features (one fused pass on CUDA)."""
+    if _fused(x):
+        return tile_gather_triton.gather_and_pool(x, tile_layout, heads)
+    tiles = tiling.gather_tiles(x, tile_layout, heads)
+    return tiles, veda_predictor.pool_tiles(tiles, tile_layout)
+
+
+def _scatter_(out: torch.Tensor, tiled: torch.Tensor,
+              tile_layout: tiling.TileLayout, heads: torch.Tensor) -> None:
+    if _fused(out):
+        tile_gather_triton.scatter_tiles_(out, tiled, tile_layout, heads)
+    else:
+        tiling.scatter_tiles_(out, tiled, tile_layout, heads)
+
+
 def _gather_lse(lse: torch.Tensor, tile_layout: tiling.TileLayout,
                 heads: torch.Tensor) -> torch.Tensor:
     """[S, H] LSE -> [N, H'] tile order, 0 on padding slots."""
@@ -149,14 +179,12 @@ class TeacherCollector:
         layer_kl = 0.0
         for group in self.plan.head_groups(layer_index, self.clip.device):
             tile_layout = self.clip.get(group.shape)
-            q_tiles = tiling.gather_tiles(q, tile_layout, group.heads)
-            k_tiles = tiling.gather_tiles(k, tile_layout, group.heads)
+            q_tiles, feats_q = _gather_and_pool(q, tile_layout, group.heads)
+            k_tiles, feats_k = _gather_and_pool(k, tile_layout, group.heads)
             rows = self._sample_rows(tile_layout)
             heat = heatmap.teacher_heat(
                 q_tiles, k_tiles, _gather_lse(lse, tile_layout, group.heads),
                 tile_layout, rows)
-            feats_q = veda_predictor.pool_tiles(q_tiles, tile_layout)
-            feats_k = veda_predictor.pool_tiles(k_tiles, tile_layout)
             weight = group.heads.numel() / self._num_heads
             with torch.enable_grad():
                 logits = self.predictor.layers[layer_index](
@@ -211,12 +239,12 @@ class SparseStudent:
         out = q.new_zeros(seq_len + 1, *q.shape[1:])
         for group in self.plan.head_groups(layer_index, self.clip.device):
             tile_layout = self.clip.get(group.shape)
-            q_tiles = tiling.gather_tiles(q, tile_layout, group.heads)
-            k_tiles = tiling.gather_tiles(k, tile_layout, group.heads)
-            v_tiles = tiling.gather_tiles(v, tile_layout, group.heads)
+            q_tiles, feats_q = _gather_and_pool(q, tile_layout, group.heads)
+            k_tiles, feats_k = _gather_and_pool(k, tile_layout, group.heads)
+            v_tiles = _gather(v, tile_layout, group.heads)
             with torch.no_grad():
-                logits = self.predictor.scores(layer_index, q_tiles, k_tiles,
-                                               tile_layout, group.heads)
+                logits = self.predictor.layers[layer_index](
+                    feats_q, feats_k, group.heads)
                 # Only video query tiles are selected; global rows are dense.
                 selection = veda_mask.select_video_blocks(
                     logits[:, :tile_layout.n_video_tiles], tile_layout,
@@ -230,7 +258,7 @@ class SparseStudent:
                 o_tiles = reference.block_sparse_attention(
                     q_tiles, k_tiles, v_tiles, block_mask,
                     tile_layout.valid_count)
-            tiling.scatter_tiles_(out, o_tiles, tile_layout, group.heads)
+            _scatter_(out, o_tiles, tile_layout, group.heads)
         out = out[:seq_len]
         if used < seq_len:
             out[used:] = 0

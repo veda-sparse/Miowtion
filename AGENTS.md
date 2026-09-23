@@ -134,7 +134,8 @@ miowtion/            全部库代码（可被 import 的逻辑只能放这里）
                      search
   kernels/           kernel：fa4（FA4 CuTe 唯一入口）/ fa4_sm8x（vendored 的 SM8x 块稀疏
                      补丁 + patches/ + LICENSE）/ block_heat_triton（教师热力图与 oracle
-                     掩码的块分数）/ reference（参考实现）/ bench（测速）
+                     掩码的块分数）/ tile_gather_triton（tile 排列的 gather / 池化 /
+                     scatter）/ reference（参考实现）/ bench（测速）
   train/             训练：parallel（FSDP2/HSDP）/ teacher / trajectory / trainer /
                      checkpoint / data / lora / optim / encode / prompt_expansion
   infer/             推理：pipeline（稠密 / Veda 去噪）/ decode（VAE 解码、mp4）

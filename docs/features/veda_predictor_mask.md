@@ -35,6 +35,11 @@
   的分数写回显存；CPU 上用分块的 torch 参考实现。bf16 舍入只对每行的块内最大值做一次（舍入单调，
   结果与逐元素舍入后取 max 逐位相同）。启动参数在 4090 上调过：4 warps、每个 program 16 个 key
   tile、不做软件流水（num_stages=1）。
+- q / k 的 gather 与池化在 CUDA 上用一个融合 Triton kernel（`kernels/tile_gather_triton.py`）：每个
+  (tile, head) 一个 program，按排列读一次 128 行，同时写出 tile 顺序的行和 mean / max / min 特征；
+  v 的 gather 和输出的 scatter 也有对应 kernel。gather / scatter / max / min 与 torch 逐位相同，
+  mean 的 fp32 求和顺序不同（容差）。训练（TeacherCollector）和推理（SparseStudent）用同一个
+  kernel。4090 上 14 个头的一组：gather + 池化 1.30 → 0.34 ms。
 - seer KL：student logits 在空列上填 −inf 后做 log-softmax；teacher 热力图按行归一化；
   只在 tgt>0 的位置累加；先在有效行上平均，再在头上平均。
 - recall：预测集合与 oracle 集合（同样规则下对热力图做 top-k）的交集比例，只统计 video→video
