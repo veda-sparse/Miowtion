@@ -29,6 +29,7 @@ from collections.abc import Callable
 import torch
 import torch.nn.functional as F
 
+from miowtion.kernels import fa4
 from miowtion.veda import tiling
 
 _TILE = tiling.TILE_SIZE
@@ -131,8 +132,7 @@ class _Fa4Dense(_Backend):
     name, sparse = 'fa4_dense', False
 
     def __init__(self, q, k, v):
-        from flash_attn.cute import interface  # pylint: disable=import-outside-toplevel
-        self.fn = interface.flash_attn_func
+        self.fn = fa4.interface().flash_attn_func
         self.q, self.k, self.v = q[None], k[None], v[None]
 
     def run(self, meta):
@@ -144,9 +144,8 @@ class _Fa4Sparse(_Backend):
     name = 'fa4_block_sparse'
 
     def __init__(self, q, k, v):
-        from flash_attn.cute import block_sparsity  # pylint: disable=import-outside-toplevel
-        from flash_attn.cute import interface  # pylint: disable=import-outside-toplevel
-        self.bs, self.fn = block_sparsity, interface.flash_attn_func
+        _, _, block_sparsity, iface, _ = fa4._modules()  # pylint: disable=protected-access
+        self.bs, self.fn = block_sparsity, iface.flash_attn_func
         self.q, self.k, self.v = q[None], k[None], v[None]
 
     def prepare(self, mask):

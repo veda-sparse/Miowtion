@@ -4,12 +4,12 @@ import pytest
 import torch
 
 from miowtion.h3 import attention as h3_attention
+from miowtion.kernels import block_heat_triton
+from miowtion.kernels import fa4
+from miowtion.kernels import reference
 from miowtion.veda import heatmap
 from miowtion.veda import mask as veda_mask
 from miowtion.veda import tiling
-from miowtion.veda.kernels import fa4
-from miowtion.veda.kernels import heat_triton
-from miowtion.veda.kernels import reference
 
 pytestmark = pytest.mark.gpu
 
@@ -38,7 +38,7 @@ def test_dense_lse_matches_math():
     assert (out[2000:] == 0).all() and (lse[2000:] == 0).all()
 
 
-@pytest.mark.skipif(not heat_triton.available(), reason='needs triton')
+@pytest.mark.skipif(not block_heat_triton.available(), reason='needs triton')
 def test_heat_triton_matches_reference():
     lay = _layout()
     q, k, v = _qkv(lay.seq_len)
@@ -48,7 +48,7 @@ def test_heat_triton_matches_reference():
     lse_t = lse[lay.gather_index][:, heads].contiguous()
     lse_t[lay.pad_slots] = 0
     rows = torch.arange(0, lay.n_tiles, 3, device='cuda')
-    fused = heat_triton.teacher_heat(qt, kt, lse_t, lay, rows)
+    fused = block_heat_triton.teacher_heat(qt, kt, lse_t, lay, rows)
     ref = heatmap.teacher_heat_reference(qt, kt, lse_t, lay, rows)
     torch.testing.assert_close(fused, ref, rtol=3e-2, atol=1e-5)
 

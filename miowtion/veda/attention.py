@@ -16,13 +16,13 @@ import torch
 
 from miowtion.h3 import attention as h3_attention
 from miowtion.h3 import layout as h3_layout
+from miowtion.kernels import fa4
+from miowtion.kernels import reference
 from miowtion.veda import heatmap
 from miowtion.veda import mask as veda_mask
 from miowtion.veda import plan as veda_plan
 from miowtion.veda import predictor as veda_predictor
 from miowtion.veda import tiling
-from miowtion.veda.kernels import fa4
-from miowtion.veda.kernels import reference
 
 
 @dataclasses.dataclass(frozen=True)

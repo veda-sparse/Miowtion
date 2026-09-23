@@ -78,9 +78,9 @@ def teacher_heat(q: torch.Tensor, k: torch.Tensor, lse: torch.Tensor,
                  q_tiles: torch.Tensor) -> torch.Tensor:
     """Teacher heat; the fused Triton kernel on CUDA, else the reference."""
     if q.is_cuda:
-        from miowtion.veda.kernels import heat_triton  # pylint: disable=import-outside-toplevel
-        if heat_triton.available():
-            return heat_triton.teacher_heat(q, k, lse, layout, q_tiles)
+        from miowtion.kernels import block_heat_triton  # pylint: disable=import-outside-toplevel
+        if block_heat_triton.available():
+            return block_heat_triton.teacher_heat(q, k, lse, layout, q_tiles)
     return teacher_heat_reference(q, k, lse, layout, q_tiles)
 
 

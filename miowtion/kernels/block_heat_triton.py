@@ -1,4 +1,8 @@
-"""Fused Triton kernel for the teacher block heat.
+"""Fused Triton kernel for block attention heat (teacher heat / oracle mask).
+
+heat[i, j] = max over the 128x128 block of exp(q.k / sqrt(D) - lse): the
+largest true attention probability inside a block. It supervises the
+predictor (teacher heat) and defines the oracle mask of the tile search.
 
 The torch reference materializes [H', rows, N] bf16 scores (tens of GB per
 layer on long clips) only to reduce them to one value per 128x128 block.

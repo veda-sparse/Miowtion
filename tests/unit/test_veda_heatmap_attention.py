@@ -3,12 +3,12 @@
 import torch
 
 from miowtion.h3 import attention as h3_attention
+from miowtion.kernels import reference
 from miowtion.veda import attention as veda_attention
 from miowtion.veda import heatmap
 from miowtion.veda import mask as veda_mask
 from miowtion.veda import predictor as veda_predictor
 from miowtion.veda import tiling
-from miowtion.veda.kernels import reference
 
 
 def _layout():

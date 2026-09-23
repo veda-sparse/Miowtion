@@ -5,7 +5,7 @@
 稀疏路径统一使用 FlashAttention-4（CuTe DSL）的 block sparse 接口：`mask_mod` +
 `aux_tensors` + full/partial 两个块列表。
 
-## 设计与不变量（`miowtion/veda/kernels/fa4.py`）
+## 设计与不变量（`miowtion/kernels/fa4.py`）
 - 输入是 tile 顺序的 `[N, H', D]`，加上 batch 维就是 FA4 的 `[B,S,H,D]`，无需转置。
 - `mask_mod` 是模块级单例：FA4 会对 callable 做哈希作为编译缓存的 key，每次调用都新建闭包就会
   重新计算哈希（可能还会重新编译）。它通过 `aux_tensors[0]`（int32 `[N]` 的槽位有效标记，
@@ -19,11 +19,15 @@
   - **SM100**：seqlen_q>128 时接口强制 `q_stage=2`，Q 稀疏块必须是 256 的倍数，所以 128 行的 tile
     会被拒绝。封装里用 `_force_q_stage_one` 覆盖为 q_stage=1（会检查 FA4 内部符号是否存在）。
     **这条路径尚未在 B200 上验证**，需要实测吞吐。
-  - **SM8x（4090 等）**：**不支持**，并且是静默失败，详见踩坑记录。`available()` 只对
-    SM9x/10x/11x 返回 True；在其他架构上调用会直接抛 `NotImplementedError`。
+  - **SM8x（4090 等）**：上游 FA4 **不支持**，并且是静默失败（详见踩坑记录）。我们 vendor 了补丁后
+    的四个 FA4 模块（`miowtion/kernels/fa4_sm8x`，见下文），`install()` 成功后 `available()` 才对
+    SM8x 返回 True；其他情况一律抛 `NotImplementedError`（附带 install 失败的原因），绝不静默回退。
+- 所有 FA4 的 import 都经过 `fa4._modules()`：机器上有 SM8x GPU 时先 `fa4_sm8x.install()`。
+  `flash_attn.cute` 的 `__init__` 会 import interface，所以任何地方提前 `import flash_attn.cute`
+  都会拿到未打补丁的版本；`install()` 检测到这种情况直接报错。
 - 训练阶段 2 只接受 FA4 路径；参考实现（`kernels/reference.py`）仅用于 CPU 单元测试。
 
-## 测速（`scripts/bench_sparse_attention.py`，`miowtion/veda/kernels/bench.py`）
+## 测速（`scripts/bench_sparse_attention.py`，`miowtion/kernels/bench.py`）
 随机块 pattern（每行保留 round(密度×n) 个块，对角必选），block 128，全部为 full 块。
 效率 = 稠密耗时 × 密度 / 稀疏耗时。每个 kernel 都与 fp32 参考实现对拍，以检出"静默按稠密计算"。
 
@@ -44,10 +48,21 @@ flash-attn-4 4.0.0b32 @ d15f153：
   (128,64) 块稀疏张量后不报错，输出与稠密结果一致（max err 1.8e-4，与稀疏参考相差 0.28），耗时也
   与稠密相同。对策：`fa4.available()` 按架构白名单返回，其他架构直接抛异常，绝不静默回退。
 - **SM100 的 q_stage=2**：接口按 `seqlen_q > tile_m` 自动选 q_stage=2，稀疏 Q 块粒度因此变成 256。
+- **补丁必须在第一次 import `flash_attn.cute` 之前装上**：包的 `__init__` 会 import interface，
+  interface 又 import 其他三个模块。`install()` 先用 `module_from_spec` 建出不执行 `__init__` 的包
+  对象，把 vendored 模块按依赖顺序注册进 `sys.modules`，最后才执行 `__init__`。
 
-## SM89 块稀疏：FA4 CuTe SM80 路径的补丁（subagent，2026-09-23）
-独立的 flash-attention fork（flash-attention @ d15f153，分支 `sm89-block-sparse`，
-补丁在 `patches/0001..0003`，尚未合入依赖）：
+## SM89 块稀疏：vendored 的 FA4 SM80 补丁（`miowtion/kernels/fa4_sm8x`）
+补丁系列 `patches/0001..0003` 基于 flash-attention d15f153（BSD-3-Clause，`LICENSE` 随目录
+提供），改动集中在四个模块：`block_sparsity`、`flash_fwd`、`flash_bwd`、`interface`。仓库里放的是
+打完补丁后的这四个文件（再生方法见 `fa4_sm8x/__init__.py` 的 docstring），运行期由 `install()`
+替换已安装的 FA4 中的同名模块：
+- 要求已安装的 flash-attn-4 版本恰好是 `4.0.0b32`，且其中四个原始模块的 sha256 与锁定的基线一致；
+  否则报错，不打补丁（防止把补丁套在不匹配的 FA4 上）。
+- 升级 FA4 时：在新基线上重新 `git am` 补丁、重新生成四个文件并更新哈希，重跑
+  `tests/gpu/test_kernels_gpu.py`。
+
+补丁内容：
 - 前向：`FlashAttentionForwardSm80` 新增块稀疏主循环，先 partial 后 full，均为倒序；下一个块的
   索引提前读取；下一个 K tile 在当前 tile 做 softmax+PV 时用 cp.async 预取。tile 实测选 128×32
   （kv_subtile=4，每个 SM 放 2 个 CTA）；128×128 会寄存器溢出，慢约 30 倍。
@@ -64,16 +79,20 @@ flash-attn-4 4.0.0b32 @ d15f153：
   我们的封装在需要梯度时强制要求 `block_mask` 并构造反向列表，已经规避。
 
 ## 验证记录
-- 2026-09-23 RTX 4090：见上表。结论：上游 FA4 在 SM89 上不支持块稀疏；我们的补丁已经达到效率
-  门槛。待办：把补丁作为锁定依赖合入（fork 或运行期 patch，按 AGENTS.md 第 3 节处理），
-  并让 `fa4.available()` 在打了补丁的版本上放行 SM89。
+- 2026-09-23 RTX 4090：见上表。结论：上游 FA4 在 SM89 上不支持块稀疏；我们的补丁达到效率门槛，
+  已作为 vendored 模块合入（`miowtion/kernels/fa4_sm8x`）。
 - H100 / B200：待测（正确性对拍 + 效率 ≥ 0.75 的门槛）。
-- `tests/gpu/test_kernels_gpu.py`（2026-09-23，RTX 4090）：FA4 稠密的 LSE 与 fp32 参考一致、
-  Triton 热力图与 torch 参考一致；FA4 块稀疏对拍在 SM89 上按架构白名单跳过。
+- `tests/gpu/test_kernels_gpu.py`（2026-09-23，RTX 4090，通过 `fa4_sm8x.install()`）：3 passed。
+  FA4 稠密的 LSE 与 fp32 参考一致；Triton 热力图与 torch 参考一致；FA4 块稀疏（含 partial tile）
+  与 fp32 参考一致。
 
 ## 待办
 - **FP8 sparse**（用户要求，方案待定）：块稀疏 + FP8（或 INT8 QK / FP8 PV，参考 SageAttention /
   SpargeAttn 的量化方式）。需要确定：量化粒度与 kernel 路线（FA4 CuTe FP8 目前只在 SM100 上可用）、
   以及对教师输出的误差预算和可视化验收方式。
 - SM90/SM100 上的 GPU 测试：前向/反向与参考实现对拍（只比较有效 query 行）、测速。
-- 视用户决策：在 FA4 的 SM80 CuTe kernel 中实现块稀疏迭代（前向 + 反向）。
+- 把教师热力图并进稠密 FA4 前向（一遍出 out / lse / heat）：heat 等于
+  `max_r exp(m_rj − lse_r)`，其中 m_rj 是第 r 行在 key tile j 上的分数最大值，online softmax
+  本来就会算。需要让稠密 pass 按 tile 顺序（每个头组一次）运行。4090 上全部 query tile 的 Triton
+  热力图（~212 ms/层）与稠密 attention（267 ms/层）是同一量级，合并后阶段 1 的教师 attention 预计
+  少 ~40%。

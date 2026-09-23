@@ -1,6 +1,6 @@
 """Benchmarks block-sparse attention kernels against dense attention.
 
-A new random pattern is used on every call (see miowtion.veda.kernels.bench).
+A new random pattern is used on every call (see miowtion.kernels.bench).
 Set MIOWTION_FASTVIDEO_KERNEL to FastVideo's python/fastvideo_kernel directory
 to include its Triton kernel.
 
@@ -13,7 +13,7 @@ import argparse
 
 import torch
 
-from miowtion.veda.kernels import bench
+from miowtion.kernels import bench
 
 
 def main():

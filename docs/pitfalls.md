@@ -24,7 +24,8 @@
 
 | 现象 | 原因 | 对策 | 链接 |
 |---|---|---|---|
-| FA4 在 4090 上的"块稀疏"与稠密耗时相同、结果也相同 | SM80 前向 kernel 忽略了 blocksparse_tensors | 按架构白名单启用，其他架构直接报错 | [veda_kernel](features/veda_kernel.md) |
+| FA4 在 4090 上的"块稀疏"与稠密耗时相同、结果也相同 | 上游 SM80 前向 kernel 忽略了 blocksparse_tensors | vendored 补丁（`kernels/fa4_sm8x`）装上才放行 SM8x，否则直接报错 | [veda_kernel](features/veda_kernel.md) |
+| 打了补丁的 FA4 没有生效 | `flash_attn.cute` 的 `__init__` 会 import interface，先 import 就拿到了上游版本 | 所有 FA4 import 都经过 `kernels/fa4.py`；`install()` 发现已 import 直接报错 | [veda_kernel](features/veda_kernel.md) |
 | FA4 在 SM100 上拒绝 128 行的 Q 块 | 接口在 seqlen>128 时强制 q_stage=2（256 行粒度） | 覆盖为 q_stage=1（待 B200 验证） | [veda_kernel](features/veda_kernel.md) |
 | FA4 报出看起来像掩码形状不对的错误 | `BlockSparseTensorsTorch` 的第 5 个字段是 `cu_total_m_blocks` | `block_size` 用关键字参数传 | [veda_kernel](features/veda_kernel.md) |
 | flex 每次换 pattern 都很慢 | `from_kv_blocks` 默认为反向计算转置索引（约 1.2 ms） | 只做前向时传 `compute_q_blocks=False`（约 0.01 ms） | [veda_kernel](features/veda_kernel.md) |

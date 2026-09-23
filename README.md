@@ -21,6 +21,8 @@ are supported: **FL2VA** (t2va / fl2va) and **Ref2VA** (ref2va), with the base
   per-head dynamic tile permutations, oracle tile-plan search, stage-1 predictor
   training with FSDP2 (verified on real weights on 2x RTX 4090), few-step Turbo
   LoRA teachers, and an FA4 CuTe block-sparse kernel study on SM89.
+- `2026/09/23`: FA4 block sparsity on SM8x (verified on RTX 4090) through a
+  vendored, hash-checked patch of the FA4 SM80 kernels (`miowtion/kernels/fa4_sm8x`).
 
 ## Key Features
 
@@ -39,7 +41,7 @@ are supported: **FL2VA** (t2va / fl2va) and **Ref2VA** (ref2va), with the base
     teacher block heat from the dense LSE (fused Triton kernel), seer KL, recall.
   - FA4 CuTe block-sparse integration (singleton `mask_mod`, full/partial block
     lists, transposed backward lists, architecture guard against silent dense
-    fallback).
+    fallback), on SM90 / SM100 and, through a vendored patch, on SM8x.
   - Oracle tile-plan search (relative output MSE under the best mask), majority
     vote, at most two shapes per layer.
 - **Training** (`miowtion/train`)
@@ -133,7 +135,7 @@ Block-sparse kernels on RTX 4090 (8 heads, 90% sparsity, new pattern per call):
 |---|---|---|
 | Dense (SDPA flash) | 7.25 ms | 26.9 ms |
 | Upstream FA4 block sparse | not supported on SM89 (silently dense) | — |
-| FA4 SM89 block-sparse patch (forward) | 0.70 ms, efficiency 0.97 | 2.70 ms, efficiency 1.00 |
+| FA4 + `miowtion/kernels/fa4_sm8x` (forward) | 0.70 ms, efficiency 0.97 | 2.70 ms, efficiency 1.00 |
 | FlexAttention (forward, +BlockMask) | 0.81 ms, 0.91 | 2.90 ms, 0.94 |
 | FastVideo Triton VSA | 0.99 ms, 0.74 | 3.89 ms, 0.70 |
 
@@ -143,7 +145,9 @@ Details, open items and verification records: [docs/INDEX.md](docs/INDEX.md).
 
 ```
 miowtion/h3      H3 DiT: geometry, layout, schedule, noise, model, weights
-miowtion/veda    tiling, plan, predictor, mask, heatmap, attention, search, kernels/
+miowtion/veda    tiling, plan, predictor, mask, heatmap, attention, search
+miowtion/kernels fa4 (single FA4 entry), fa4_sm8x (vendored SM8x patch),
+                 block_heat_triton, reference, bench
 miowtion/train   parallel (FSDP2), teacher, trajectory, trainer, checkpoint, lora, data, encode
 scripts/         thin CLI entry points          configs/   run configs
 tests/unit       CPU tests (run before every commit)   tests/gpu   GPU tests

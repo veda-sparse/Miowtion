@@ -30,7 +30,7 @@
   输出，是精确值。缩放放在 tile 内取最大值之后（正缩放与 max 可交换）。
 - 每层只对抽样的视频 query tile 做监督（KL 是对 query tile 的平均，所以抽样是无偏的）；比例
   `teacher_q_tiles` **按每个 clip 的 tile 数分别换算**。
-- CUDA 上用融合 Triton kernel（`kernels/heat_triton.py`），只做 QKᵀ 的计算量，不把 [H', rows, N]
+- CUDA 上用融合 Triton kernel（`miowtion/kernels/block_heat_triton.py`），只做 QKᵀ 的计算量，不把 [H', rows, N]
   的分数写回显存；CPU 上用分块的 torch 参考实现。
 - seer KL：student logits 在空列上填 −inf 后做 log-softmax；teacher 热力图按行归一化；
   只在 tgt>0 的位置累加；先在有效行上平均，再在头上平均。

@@ -6,24 +6,12 @@ exchange information with real rows, so their output is defined as zero.
 
 from __future__ import annotations
 
-import functools
 import math
 
 import torch
 import torch.nn.functional as F
 
-
-@functools.cache
-def _fa4():
-    try:
-        from flash_attn.cute import interface  # pylint: disable=import-outside-toplevel
-    except ImportError:
-        return None
-    return interface
-
-
-def fa4_available(device: torch.device) -> bool:
-    return device.type == 'cuda' and _fa4() is not None
+from miowtion.kernels import fa4
 
 
 def _math_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
@@ -60,14 +48,10 @@ def dense_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
     scale = 1.0 / math.sqrt(head_dim)
     qr, kr, vr = q[:used], k[:used], v[:used]
     if backend == 'auto':
-        backend = 'fa4' if fa4_available(q.device) else (
+        backend = 'fa4' if fa4.dense_available(q.device) else (
             'sdpa' if not return_lse or q.is_cuda else 'math')
     if backend == 'fa4':
-        out, lse = _fa4().flash_attn_func(
-            qr[None], kr[None], vr[None], softmax_scale=scale,
-            return_lse=return_lse)
-        out = out[0]
-        lse = lse[0].transpose(0, 1) if return_lse else None  # [used, H]
+        out, lse = fa4.dense_attention(qr, kr, vr, scale, return_lse)
     elif backend == 'sdpa':
         if return_lse:
             # The flash kernel returns LSE [B, H, S]; no public API does.
