@@ -77,30 +77,54 @@ def oracle_rel_mse(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
     return oracle_rel_mse_reference(q, k, v, tile_layout, blocks, rows)
 
 
+# Bound on the tile-ordered q / k / v copies the kernel path holds at once.
+# Heads are scored in chunks under it: long clips would otherwise add 3 x
+# 1.5 GB (103k tokens, 56 heads) on top of the teacher's activations.
+_ORACLE_GATHER_BYTES = 1 << 30
+
+
 @torch.no_grad()
 def _oracle_rel_mse_kernels(q, k, v, dense_out, lse, tile_layout, blocks,
                             rows):
-    """All heads at once; never materializes [rows, N] probabilities."""
-    q_t, k_t, v_t = (tiling.gather_tiles(t, tile_layout, None)
-                     for t in (q, k, v))
+    """Chunks of heads; never materializes [rows, N] probabilities.
+
+    Heads are independent throughout (heat, selection, sparse output,
+    error), so chunking does not change the result.
+    """
+    num_heads = q.shape[1]
+    per_head = 3 * tile_layout.gather_index.numel() * q.shape[-1] * (
+        q.element_size())
+    chunk = max(1, min(num_heads, _ORACLE_GATHER_BYTES // per_head))
     lse_t = lse.index_select(0, tile_layout.gather_index)
     if tile_layout.pad_slots.numel():
         lse_t.index_fill_(0, tile_layout.pad_slots, 0.0)
-    heat = block_heat_triton.teacher_heat(q_t, k_t, lse_t.contiguous(),
-                                          tile_layout, rows)
-    selection = veda_mask.select_video_blocks(heat, tile_layout, blocks, rows)
-    block_mask = veda_mask.dense_block_mask(selection, tile_layout,
-                                            global_rows=False)
     slots = (rows[:, None] * _TILE + torch.arange(
         _TILE, device=q.device)[None]).view(-1)
-    o_sparse = fa4.block_sparse_attention(q_t.index_select(0, slots), k_t,
-                                          v_t, block_mask, tile_layout)
-    o_dense = dense_out.index_select(
-        0, tile_layout.gather_index.index_select(0, slots))
+    rows_in_seq = tile_layout.gather_index.index_select(0, slots)
     valid = tile_layout.slot_valid.bool().index_select(0, slots)
-    diff = (o_sparse.float() - o_dense.float()).square().sum(-1)[valid]
-    norm = o_dense.float().square().sum(-1)[valid]
-    return diff.sum(0) / norm.sum(0).clamp(min=torch.finfo(torch.float32).tiny)
+    errors = []
+    for start in range(0, num_heads, chunk):
+        heads = torch.arange(start, min(start + chunk, num_heads),
+                             device=q.device)
+        q_t, k_t, v_t = (tiling.gather_tiles(t, tile_layout, heads)
+                         for t in (q, k, v))
+        heat = block_heat_triton.teacher_heat(
+            q_t, k_t, lse_t.index_select(1, heads).contiguous(), tile_layout,
+            rows)
+        selection = veda_mask.select_video_blocks(heat, tile_layout, blocks,
+                                                  rows)
+        block_mask = veda_mask.dense_block_mask(selection, tile_layout,
+                                                global_rows=False)
+        o_sparse = fa4.block_sparse_attention(q_t.index_select(0, slots),
+                                              k_t, v_t, block_mask,
+                                              tile_layout)
+        o_dense = dense_out.index_select(0, rows_in_seq).index_select(1,
+                                                                      heads)
+        diff = (o_sparse.float() - o_dense.float()).square().sum(-1)[valid]
+        norm = o_dense.float().square().sum(-1)[valid]
+        errors.append(diff.sum(0) / norm.sum(0).clamp(
+            min=torch.finfo(torch.float32).tiny))
+    return torch.cat(errors)
 
 
 @torch.no_grad()

@@ -25,6 +25,9 @@
   `block_heat_triton.teacher_heat`（块分数 = 块内 `exp(s·scale − lse)` 的最大值，只算 QKᵀ）→
   `select_video_blocks` → `dense_block_mask(global_rows=False)` → FA4 块稀疏只算抽样的 query tile →
   与稠密输出对应行比较。块分数与参考路径的 fp32 概率块最大值等价（exp 单调、lse 是精确的）。
+  按头分块执行，每块的 tile 顺序 q/k/v 副本不超过 `_ORACLE_GATHER_BYTES`（1 GiB）。各头互相独立，
+  分块不改变热力图、掩码和稀疏输出（逐位相同），只有最后按行求和的 fp32 顺序可能不同（相对误差
+  1e-6 以内）。
   其他情况走 `oracle_rel_mse_reference`（逐头 fp32，CPU 单测用）。
 
 - 一次运行可以搜多个几何（`geometries`），模型只加载一次；每个几何使用 latent_t（以及 aspect，
@@ -59,6 +62,9 @@ python scripts/build_plan.py --scores runs/<run>/scores/16x9_t37 --out plans/16x
   `layout.n_video_tiles`，于是抽样行的列表里混进了视频列、漏掉了真正的全局列，kernel 路径的
   rel-MSE 与参考路径相差最多 88%。现在起点取自 layout，`global_rows=True` 时还检查 R 必须等于视频
   tile 数。
+
+- **16:9 t102（103k token）在 2×4090 上 OOM**：kernel 路径一次 gather 全部 56 个头的 q/k/v
+  （3 × 1.5 GB），叠在教师前向的激活之上。现在按头分块，单块不超过 1 GiB。
 
 ## 验证记录
 - 2026-09-23，macOS CPU：unit 全部通过。

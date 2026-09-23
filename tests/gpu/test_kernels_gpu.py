@@ -112,3 +112,22 @@ def test_oracle_kernel_path_matches_reference():
     ref = search.oracle_rel_mse_reference(q, k, v, lay, blocks, rows)
     assert (ref > 1e-4).all()  # the sparse mask actually drops mass
     torch.testing.assert_close(fused, ref, rtol=1e-2, atol=1e-4)
+
+
+@pytest.mark.skipif(not (fa4.available() and block_heat_triton.available()),
+                    reason='needs FA4 block sparsity and triton')
+def test_oracle_head_chunks_do_not_change_the_result(monkeypatch):
+    """Heat, masks and sparse outputs are bitwise equal per head; only the
+    final fp32 sum over rows may accumulate in another order."""
+    lay = _layout(grid=(8, 12, 20))
+    q, k, v = _qkv(lay.seq_len)
+    out, lse = h3_attention.dense_attention(q, k, v, lay.used,
+                                            return_lse=True)
+    blocks = veda_mask.column_blocks(lay, veda_mask.Budget(ratio=0.3))
+    rows = torch.tensor([0, 3, 7, lay.n_video_tiles - 1], device='cuda')
+    whole = search.oracle_rel_mse(q, k, v, lay, blocks, rows,
+                                  dense_out=out, lse=lse)
+    monkeypatch.setattr(search, '_ORACLE_GATHER_BYTES', 1)  # 1 head/chunk
+    chunked = search.oracle_rel_mse(q, k, v, lay, blocks, rows,
+                                    dense_out=out, lse=lse)
+    torch.testing.assert_close(chunked, whole, rtol=1e-6, atol=0)
