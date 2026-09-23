@@ -25,7 +25,8 @@ gpu = [
   "flash-attn-4 @ git+https://github.com/Dao-AILab/flash-attention@d15f1531a460ba456f41b01a774f33ab2db8febf#subdirectory=flash_attn/cute",
 ]
 # Offline prompt encoding (Qwen3-VL text tower, the release's VAEs).
-encode = ["transformers>=4.57", "accelerate", "torchvision", "pillow"]
+encode = ["transformers>=4.57", "accelerate", "torchvision", "pillow",
+          "diffusers==0.32.2"]
 
 [tool.setuptools.packages.find]
 include = ["miowtion*"]
