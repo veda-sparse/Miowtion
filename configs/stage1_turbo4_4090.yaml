@@ -1,0 +1,24 @@
+# Stage 1 on the 4-step Turbo teacher (few-step LoRA merged), 2x RTX 4090.
+# v4_step600_ema is the adapter recommended for 4-8 steps; for 4 steps with
+# heavy motion the v1 line (minimax_h3_turbo_4step_ema_ckpt850) is an option.
+run_name: stage1_turbo4_4090
+checkpoint_root: weights/MiniMax-H3
+sample_cache: artifacts/samples/moviegen_smoke10
+geometries: ['16:9@37']
+variant: FL2VA
+tasks: [t2va]
+plan_dir: runs/search_turbo4_4090/plans
+schedule: turbo
+num_steps: 4
+teacher_adapter: weights/turbo_lora/minimax_h3_turbo_v4_step600_ema.safetensors
+keep_ratio: 0.1
+teacher_q_tiles: 1.0
+accum: 2
+steps: 400
+warmup: 10
+save_every: 25
+out_dir: runs
+offload_blocks: 30
+prefetch: 1
+mlp_chunk_rows: 8192
+offload_optimizer: true

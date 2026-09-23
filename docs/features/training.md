@@ -1,0 +1,125 @@
+# 训练框架（FSDP2）：打分器训练与 LoRA 恢复
+
+## 目标
+在冻结的 H3 DiT 上训练 Veda 打分器（阶段 1）。可选阶段 2：用 LoRA 恢复稀疏学生的质量。两个阶段都
+支持 FL2VA（t2va/fl2va）和 Ref2VA（ref2va）两套权重。
+
+## 设计与不变量
+
+### 流程：先编码，再训练
+1. **prompt 扩写**（见 `prompt_expansion.md`，另一个 agent 负责）→ 结构化 prompt 的 jsonl。
+2. **离线编码**（`scripts/encode_samples.py`，单独的任务）：text encoder（仓库自带的 Qwen3-VL，
+   截断到 50 层并去掉最终 norm）+ 条件 latent（仓库自带的 VAE）写入样本缓存。训练进程里不加载
+   text encoder。
+3. **tile 搜索** → `plans/*.json`。
+4. **DiT 训练**（`scripts/train.py`）。
+
+### 教师与调度（`miowtion/train/teacher.py`）
+- 当前目标是**合并少步 LoRA 后的 8 步教师**（Turbo LoRA v4_step600_ema）。4/8/50 步三套配置都有：
+  `configs/{search,stage1}_{turbo4,turbo8,base50}*.yaml`。
+- `schedule: base` 使用发布版的 50 点网格（49 步，fp32 linspace）。`schedule: turbo` 使用少步网格：
+  视频 `σ_i = shift(1 − i/n, 12)`，音频 `shift(unshift(σ_v, 12), 3)`，按 double 闭式计算，与 Turbo
+  采样器一致。8 步网格：视频 1, .988, .973, .952, .923, .878, .800, .632, 0；音频 1, .955, .900,
+  .833, .750, .643, .500, .300, 0。
+- 适配器合并：trunk / refiner / final_layer 的 AdaLN 就地合并 `W += B@A`（fp32 计算，GPU 上算
+  delta，再转回 bf16；FSDP 分片只合并本地行）。block 的 `adaln_proj` 已经被表替代，它们的 delta
+  在建表时合并进权重。每个 adapter 项都必须有去处，否则报错。"AdaLN 走表"与"全部权重直接合并"
+  两条路径的前向逐位相等（单元测试）。
+- 注意：Turbo 在 ComfyUI 里默认在运行时施加 LoRA（`W x + B(A x)`）；我们按 `W += B·A` 合并，
+  数值上有 bf16 舍入差异，但语义相同。
+
+### 采样器即训练循环（`miowtion/train/trajectory.py`）
+- 没有视频数据集。每条轨迹从纯噪声出发，用教师自己的 Euler 步推进；轨迹上每个状态都是一个
+  micro-step。**轨迹始终用教师速度推进**（阶段 2 也一样）。
+- 少步教师必须在它自己的网格上推进（8 步：σ ≥ 0.632）。
+- 几何由**所有 rank 共享、不含 rank 项**的生成器抽取；样本和噪声种子按 rank 各自抽取。
+- fl2va 样本的关键帧 latent 绑定画布宽高比；prompt 的分镜时间绑定时长（`latent_t`，由 PE 记录）。
+  采样器只挑与当前几何兼容的样本。
+
+### 阶段 1（`miowtion/train/trainer.py`）
+- trunk 冻结，全程 no_grad；attention 使用 `TeacherCollector`：先算稠密输出（带 LSE），再对每个头组
+  训练打分器，每层的 KL **当场反向**（按头数加权，除以层数和 accum），不在层之间保留计算图。
+  输出与稠密教师逐位一致（已在真实权重上验证）。
+- 优化器 AdamW(0.9, 0.95)，wd 0，线性 warmup；梯度按参数组（predictor / lora / head）分别裁剪；
+  EMA 0.995。复制参数（打分器、输出头）的梯度拼成一个 fp32 缓冲区后做一次 all-reduce；缺失的梯度
+  补零，否则各 rank 的缓冲区长度不一致，集合通信会挂起。
+
+### 阶段 2（可选）
+- 可训练参数：打分器 + trunk qkv/out 投影的 LoRA（rank 64，切分前挂到原 Linear 上，用 forward hook
+  注入，基础权重名不变）+ 输出头。
+- 冻结教师：关闭 LoRA，并把输出头换回开始时保存的快照。学生：开启 LoRA，使用 `SparseStudent` 和
+  逐 block 梯度检查点。学生前向**不收集 KL**（检查点重算时会重复执行）。
+- 必须有 FA4 块稀疏 kernel（SM90/100）才会启动；拒绝退回参考 kernel。
+- 必须从阶段 1 的 checkpoint（EMA 权重）初始化。
+
+### 显存与性能（大模型、小显存）
+- **AdaLN 表**（`miowtion/train/adaln.py`）：冻结 trunk 时，50 个 `adaln_proj`（13B 参数）只把
+  timestep 映射成调制向量。启动时从 checkpoint 逐 block 读取，对调度中出现的所有 timestep 集合计算
+  好（49 步约 0.94 GB），之后把这些投影从模型中删除，trunk 从 33B 降到约 20B。
+  表的结果与实时计算逐位一致（单元测试 + 真实权重下 `equals_dense`）。
+- **FSDP2**：每个 block 一个切分单元；根模块也调用 `fully_shard`，但通过 `ignored_params` 让
+  embed/输出/打分器保持复制。根模块必须是 FSDP 模块，否则跨 block 预取会报
+  `FSDPCommContext has no all_gather_copy_in_stream`。
+- **部分 offload**：`offload_blocks=N` 按 Bresenham 均匀间隔选 N 个 block 放到 pinned 主机内存，
+  其余常驻显存；`prefetch` 控制前向预取的 block 数。offload 的 block 必须在 CPU 上物化
+  （`to_empty(device='cpu')`）。
+- **MLP 行分块**：`mlp_chunk_rows` 限制 `[rows, 2×14336]` 中间张量的大小。GEMM 的行数会影响
+  数值，所以搜索、训练、评估必须使用同一个值。
+- 阶段 2 的重算：逐 block 的非重入检查点。
+
+2×RTX 4090 实测（5 s 16:9，38010 token，每 rank 一个 clip）：
+
+| 配置 | 加载 | AdaLN 表 | 稠密前向 | 阶段 1 教师前向 | 显存峰值 |
+|---|---|---|---|---|---|
+| 50 个 block 全 offload | 132 s | 65 s | 33.5 s | 39.2 s | 11.3 GiB |
+| offload 30、预取 1 | 45 s | 10 s | 29.3 s | 33.6 s | 19.1 GiB |
+| offload 24、预取 2 | — | — | OOM | — | >23.5 GiB |
+
+### 数据（`miowtion/train/data.py`）
+- 样本缓存：`index.json` + `text.safetensors`（hidden bf16、tags int8）+ `cond.safetensors`
+  （干净的条件行 fp32）。训练时在主机上按需切片。
+- prompt 校验按 task 区分：t2va/fl2va 为三字段 + `[Shot 1]`；ref2va 为六段式（`subject_definitions`
+  → … → `non_diegetic_music`）。格式不对直接报错，不会静默丢弃。
+- 固定种子的 train/test 划分（默认 20 条测试），训练、评估、渲染共用同一个函数。
+
+### checkpoint（`miowtion/train/checkpoint.py`）
+- 内容：权重和 EMA（完整张量）、Adam 状态（按参数名）、每个 rank 的采样器位置和噪声生成器、
+  共享生成器（保存前跨 rank 校验哈希一致）、步数、配置。
+- 写盘：本地临时文件 → 原子重命名 → 带文件大小的完成标记 → 后台复制到持久目录；退出前等待复制
+  完成。没有完成标记的 checkpoint 不会被加载。
+- 分片张量（LoRA / EMA / Adam 状态）的 `full_tensor()` 是集合通信，必须在**所有 rank** 上完成后，
+  rank 0 才能单独写盘。
+- 恢复（resume）和初始化（init，只加载权重、严格、可显式丢弃前缀）是互斥的两种方式。world size
+  变化后，新的第 r 个 rank 继承旧的第 r % old 个 rank 的采样位置；生成器状态只恢复前 old 个 rank 的。
+
+## 代码位置与接口
+`miowtion/train/{parallel,adaln,data,trajectory,trainer,checkpoint,lora,encode}.py`；
+入口 `scripts/{train,encode_samples,smoke_dit}.py`；配置 `configs/*.yaml`（字段见 `TrainConfig`）。
+
+## 测试
+- `tests/unit/test_train_pipeline.py`：prompt 校验（两种格式）、样本缓存读写往返、AdaLN 表与实时
+  计算逐位一致、tiny DiT 上阶段 1 训练 3 步 + checkpoint + 恢复（CPU 端到端）。
+- 真实权重：`scripts/smoke_dit.py`（结果见上表，2026-09-23）。
+
+## 踩坑记录
+- CPU offload 要求被 offload 的 FSDP 参数先在 CPU 上物化，否则报 "FSDP parameters should be
+  materialized on CPU"。
+- 没有 FSDP root 时，`set_modules_to_forward_prefetch` 报 `FSDPCommContext` 缺少
+  `all_gather_copy_in_stream`。
+- 复制参数手动 all-reduce 时，缺失的梯度必须补零，否则各 rank 缓冲区长度不一致，通信挂起。
+- DTensor 的 `full_tensor()` 必须在所有 rank 上调用，之后才能提前 return 让 rank 0 单独写盘。
+
+## 验证记录
+- 2026-09-23 macOS CPU：unit 全部通过（阶段 1 端到端 + 恢复；optimizer offload 与不 offload
+  逐位一致；Turbo 适配器下表路径与全合并路径逐位一致）。
+- 2026-09-23 2×4090，50 步 base 教师，阶段 1 冒烟（10 条 PE prompt，5.17 s 16:9，冒烟方案表，
+  accum 2，optimizer offload）：3 次 update，KL 1.179 → 1.072 → 1.024，recall 0.477 → 0.495 →
+  0.508；每个 micro-step 约 31 s，每次 update 约 64 s，显存峰值 19.1 GiB。
+- 2026-09-23 2×4090：真实 FL2VA 权重，稠密/教师前向正常，教师输出与稠密逐位一致，初始 KL≈1.36，
+  recall≈0.44。
+
+## 待办
+- 阶段 1 在真实权重上的多步训练曲线（需要 prompt 语料，PE agent 正在准备）。
+- 更长的 clip（15 s，约 10 万 token）在 24 GB 卡上的显存方案（进一步分块 qkv / 更多 offload）。
+- ref2va 条件编码（参考视频的 VLM presentation、音频 VAE）以及 ref2va 的训练冒烟。
+- 阶段 2 需要 SM90/100 的机器（或者 SM89 上的 FA4 块稀疏，subagent 正在开发）。

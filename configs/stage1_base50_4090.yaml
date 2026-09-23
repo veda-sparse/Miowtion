@@ -1,0 +1,21 @@
+# Stage 1 on the 50-step base teacher (49 steps), 2x RTX 4090.
+run_name: stage1_base50_4090
+checkpoint_root: weights/MiniMax-H3
+sample_cache: artifacts/samples/moviegen_smoke10
+geometries: ['16:9@37']
+variant: FL2VA
+tasks: [t2va]
+plan_dir: runs/search_base50_4090/plans
+schedule: base
+num_steps: 49
+keep_ratio: 0.1
+teacher_q_tiles: 1.0
+accum: 2
+steps: 400
+warmup: 10
+save_every: 25
+out_dir: runs
+offload_blocks: 30
+prefetch: 1
+mlp_chunk_rows: 8192
+offload_optimizer: true

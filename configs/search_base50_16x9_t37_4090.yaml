@@ -1,0 +1,18 @@
+# Tile search with the 50-step base teacher (49 denoising steps), 2x RTX 4090.
+run_name: search_base50_4090
+checkpoint_root: weights/MiniMax-H3
+sample_cache: artifacts/samples/moviegen_smoke10
+geometry: '16:9@37'
+variant: FL2VA
+tasks: [t2va]
+num_clips: 2
+steps: [0, 12, 25, 40]
+schedule: base
+num_steps: 49
+candidates: ['8x4x4', '2x8x8', '4x4x8', '4x8x4', '8x2x8', '8x8x2']
+keep_ratio: 0.1
+query_tiles: 16
+out_dir: runs
+offload_blocks: 30
+prefetch: 1
+mlp_chunk_rows: 8192
