@@ -156,7 +156,7 @@ def _seeded(seed: int):
             torch.cuda.set_rng_state_all(cuda)
 
 
-def _import_release_package(variant_dir: str, package: str):
+def import_release_package(variant_dir: str, package: str):
     if variant_dir not in sys.path:
         sys.path.insert(0, variant_dir)
     return importlib.import_module(package)
@@ -167,7 +167,7 @@ class ConditionEncoder:
 
     def __init__(self, variant_dir: str, device: torch.device):
         self.device = device
-        video_pkg = _import_release_package(
+        video_pkg = import_release_package(
             variant_dir, 'video_vae.minimax_h3_video_vae')
         video_dir = os.path.join(variant_dir, 'video_vae')
         self.video_vae = video_pkg.MiniMaxH3VideoVAE.from_pretrained(

@@ -111,6 +111,7 @@ Set up Miowtion (this repository) for training on this machine.
 | 3. Tile-plan search | `torchrun --nproc_per_node N scripts/search_tiles.py --config configs/search_turbo8_16x9_t37_4090.yaml` | per-clip scores |
 | 4. Build the plan | `python scripts/build_plan.py --scores $RUN/scores/16x9_t37 --out plans/16x9_t37.json` | tile plan |
 | 5. Stage-1 training | `torchrun --nproc_per_node N scripts/train.py --config configs/stage1_turbo8_4090.yaml` | predictor checkpoints |
+| 6. Generate (dense vs Veda) | `torchrun --nproc_per_node 1 scripts/generate.py ... --attention dense veda` | videos, titled side by side, timing |
 
 Teacher configurations (`schedule` / `num_steps` / `teacher_adapter` in the configs):
 
@@ -153,6 +154,7 @@ miowtion/veda    tiling, plan, predictor, mask, heatmap, attention, search
 miowtion/kernels fa4 (single FA4 entry), fa4_sm8x (vendored SM8x patch),
                  block_heat_triton, reference, bench
 miowtion/train   parallel (FSDP2), teacher, trajectory, trainer, checkpoint, lora, data, encode
+miowtion/infer   pipeline (dense / Veda denoising), decode (VAEs, mp4, comparison)
 scripts/         thin CLI entry points          configs/   run configs
 tests/unit       CPU tests (run before every commit)   tests/gpu   GPU tests
 docs/            knowledge base: features, pitfalls, dependencies

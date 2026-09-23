@@ -137,6 +137,7 @@ miowtion/            全部库代码（可被 import 的逻辑只能放这里）
                      掩码的块分数）/ reference（参考实现）/ bench（测速）
   train/             训练：parallel（FSDP2/HSDP）/ teacher / trajectory / trainer /
                      checkpoint / data / lora / optim / encode / prompt_expansion
+  infer/             推理：pipeline（稠密 / Veda 去噪）/ decode（VAE 解码、mp4）
   utils/             无业务语义的通用工具（progress：进度日志）
 scripts/             命令行入口，只做参数解析并调用 miowtion/ 中的函数，不写业务逻辑
 configs/             版本化的运行配置（yaml/json），命名 <stage>_<geometry>_<note>.yaml；

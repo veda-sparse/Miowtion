@@ -12,6 +12,7 @@
 | [features/tile_search.md](features/tile_search.md) | oracle 评分、投票、每层 ≤2 种形状、搜索驱动 | 真实权重上 50 步 / 8 步搜索已跑通 |
 | [features/training.md](features/training.md) | FSDP2 训练框架：阶段 1/2、少步 LoRA 教师、AdaLN 表、数据、checkpoint | 阶段 1 已在 2×4090 真实权重上跑通；阶段 2 待 GPU 验证 |
 | [features/prompt_expansion.md](features/prompt_expansion.md) | prompt 扩写：短 prompt → H3 T2VA 结构化 prompt（DeepSeek；system prompt 由 H3 skill 拼成；校验 + repair 重试） | CPU 测试通过；MovieGenVideoBench 全量 1003 条已扩写并发布到 `data/prompts/` |
+| [features/inference.md](features/inference.md) | 推理：少步 LoRA 教师 + Veda 稀疏，稠密 / 稀疏并排对比，VAE 解码与 mp4 | 实现中，4090 上首次生成 |
 | [dependencies.md](dependencies.md) | 外部依赖、锁定版本、依赖的内部接口 | 当前 |
 | [pitfalls.md](pitfalls.md) | 踩坑总表 | 持续更新 |
 
