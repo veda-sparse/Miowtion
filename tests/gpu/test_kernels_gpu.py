@@ -66,13 +66,36 @@ def test_fa4_block_sparse_matches_reference():
     sel = veda_mask.select_video_blocks(scores[:, :lay.n_video_tiles], lay,
                                         blocks)
     block_mask = veda_mask.dense_block_mask(sel, lay)
-    out = fa4.block_sparse_attention(qt, kt, vt,
-                                     veda_mask.kernel_indices(sel, lay), lay)
+    out = fa4.block_sparse_attention(qt, kt, vt, block_mask, lay)
     ref = reference.block_sparse_attention(qt, kt, vt, block_mask,
                                            lay.valid_count)
     real = lay.slot_valid.bool()
     torch.testing.assert_close(out[real].float(), ref[real].float(),
                                rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.skipif(not fa4.available() or torch.cuda.get_device_capability()[0] != 8,
+                    reason='DenseBlockMask path is SM8x only')
+def test_sm8x_all_blocks_match_dense_with_mask_mod():
+    """Every block selected: the SM8x sparse walk matches the dense kernel.
+
+    Bitwise equality needs the dense kernel on the sparse path's tile config;
+    FA4's default dense config differs, which costs up to ~1 bf16 ulp.
+    """
+    lay = _layout(grid=(8, 12, 20))
+    q, k, v = _qkv(lay.seq_len)
+    qt, kt, vt = (tiling.gather_tiles(t, lay, None) for t in (q, k, v))
+    block_mask = torch.ones(4, lay.n_tiles, lay.n_tiles, dtype=torch.bool,
+                            device='cuda')
+    out = fa4.block_sparse_attention(qt, kt, vt, block_mask, lay)
+    dense = fa4.interface().flash_attn_func(
+        qt[None], kt[None], vt[None], softmax_scale=128**-0.5,
+        mask_mod=fa4._valid_key_mask_mod(),  # pylint: disable=protected-access
+        aux_tensors=[lay.slot_valid])
+    dense = (dense[0] if isinstance(dense, tuple) else dense)[0]
+    real = lay.slot_valid.bool()
+    torch.testing.assert_close(out[real].float(), dense[real].float(),
+                               rtol=0, atol=2e-3)
 
 
 @pytest.mark.skipif(not (fa4.available() and block_heat_triton.available()),

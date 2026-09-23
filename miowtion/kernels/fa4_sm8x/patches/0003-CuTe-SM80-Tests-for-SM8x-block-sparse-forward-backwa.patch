@@ -1,7 +1,7 @@
 From 4c77a24ba8da14b1943ec4af143bb8c69a541b28 Mon Sep 17 00:00:00 2001
 From: MarsTechHAN <hansh-sz@hotmail.com>
 Date: Wed, 23 Sep 2026 22:09:25 +0800
-Subject: [PATCH 3/3] [CuTe, SM80] Tests for SM8x block-sparse forward/backward
+Subject: [PATCH 3/5] [CuTe, SM80] Tests for SM8x block-sparse forward/backward
 
 Forward vs an fp32 token-level reference (partial blocks masked by an aux
 key-validity mask_mod, full blocks unmasked, empty rows, seqlen tails incl.

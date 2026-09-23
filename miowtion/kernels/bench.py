@@ -160,6 +160,27 @@ class _Fa4Sparse(_Backend):
         return self.fn(self.q, self.k, self.v, block_sparse_tensors=meta)[0][0]
 
 
+class _Fa4DenseMask(_Backend):
+    """SM8x only: the vendored DenseBlockMaskTorch input (no index lists)."""
+
+    name = 'fa4_dense_block_mask'
+
+    def __init__(self, q, k, v):
+        if torch.cuda.get_device_capability(q.device)[0] != 8:
+            raise NotImplementedError('DenseBlockMaskTorch is SM8x only')
+        _, _, block_sparsity, iface, _ = fa4._modules()  # pylint: disable=protected-access
+        self.bs, self.fn = block_sparsity, iface.flash_attn_func
+        self.q, self.k, self.v = q[None], k[None], v[None]
+
+    def prepare(self, mask):
+        return self.bs.DenseBlockMaskTorch(block_mask=mask[None],
+                                           block_size=(_TILE, _TILE))
+
+    def run(self, meta):
+        out = self.fn(self.q, self.k, self.v, block_sparse_tensors=meta)
+        return (out[0] if isinstance(out, tuple) else out)[0]
+
+
 class _Flex(_Backend):
     name = 'flex_block_sparse'
 
@@ -238,7 +259,7 @@ def run(seq: int = 32768, heads: int = 8, head_dim: int = 128,
     ref_sparse = _reference_rows(q, k, v, masks[0], check_blocks)
     ref_dense = _reference_rows(q, k, v, torch.ones_like(masks[0]),
                                 check_blocks)
-    factories = [_SdpaDense, _Fa4Dense, _Fa4Sparse, _Flex]
+    factories = [_SdpaDense, _Fa4Dense, _Fa4Sparse, _Fa4DenseMask, _Flex]
     if os.environ.get('MIOWTION_FASTVIDEO_KERNEL'):
         factories.append(_FastVideoTriton)
     results = []

@@ -20,13 +20,15 @@
 | recall 被错算为 0 | 预算里只有对角块，去掉对角后两个集合都为空 | 返回 NaN，日志用 nanmean 汇总 | [predictor_mask](features/veda_predictor_mask.md) |
 | 搜索中 partial tile 的块分数被污染 | pad 槽 gather 到了第 0 行的 q | softmax 之后先清零 pad 行 | [tile_search](features/tile_search.md) |
 | Triton 热力图 kernel 慢约 20% | 默认 num_stages=3，key tile 循环被软件流水后反而变慢 | 启动时传 `num_stages=1` | [predictor_mask](features/veda_predictor_mask.md) |
-| oracle 的 kernel 路径与参考路径的 rel-MSE 相差最多 88% | 子集行的 `kernel_indices` 用行数 R 当全局列起点 | 起点取 `layout.n_video_tiles`；单测对拍子集与全量 | [tile_search](features/tile_search.md) |
+| oracle 的 kernel 路径与参考路径的 rel-MSE 相差最多 88% | 子集行的块列表用行数 R 当全局列起点 | 起点取 `layout.n_video_tiles`；单测对拍子集与全量 | [tile_search](features/tile_search.md) |
 
 ## Kernel
 
 | 现象 | 原因 | 对策 | 链接 |
 |---|---|---|---|
 | FA4 在 4090 上的"块稀疏"与稠密耗时相同、结果也相同 | 上游 SM80 前向 kernel 忽略了 blocksparse_tensors | vendored 补丁（`kernels/fa4_sm8x`）装上才放行 SM8x，否则直接报错 | [veda_kernel](features/veda_kernel.md) |
+| SM8x 稀疏与稠密差 1 个 bf16 ulp | partial / full 分开遍历，访问顺序与稠密不同；或稠密调用的 tile 配置不同 | 补丁按稠密顺序合并遍历；逐位对拍时两边用同一 tile | [veda_kernel](features/veda_kernel.md) |
+| SM80 反向梯度静默出错（误差 1.4） | AtomLayoutNdKV=8，或 postprocess 线程数与主 kernel 不同 | 8 warps 用 (2,4,4)；postprocess 线程数跟随主 kernel | [veda_kernel](features/veda_kernel.md) |
 | 打了补丁的 FA4 没有生效 | `flash_attn.cute` 的 `__init__` 会 import interface，先 import 就拿到了上游版本 | 所有 FA4 import 都经过 `kernels/fa4.py`；`install()` 发现已 import 直接报错 | [veda_kernel](features/veda_kernel.md) |
 | FA4 在 SM100 上拒绝 128 行的 Q 块 | 接口在 seqlen>128 时强制 q_stage=2（256 行粒度） | 覆盖为 q_stage=1（待 B200 验证） | [veda_kernel](features/veda_kernel.md) |
 | FA4 报出看起来像掩码形状不对的错误 | `BlockSparseTensorsTorch` 的第 5 个字段是 `cu_total_m_blocks` | `block_size` 用关键字参数传 | [veda_kernel](features/veda_kernel.md) |

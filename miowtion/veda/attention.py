@@ -223,9 +223,7 @@ class SparseStudent:
                                                         tile_layout)
             if self.use_fa4:
                 o_tiles = fa4.block_sparse_attention(
-                    q_tiles, k_tiles, v_tiles,
-                    veda_mask.kernel_indices(selection, tile_layout),
-                    tile_layout, block_mask)
+                    q_tiles, k_tiles, v_tiles, block_mask, tile_layout)
             else:
                 o_tiles = reference.block_sparse_attention(
                     q_tiles, k_tiles, v_tiles, block_mask,

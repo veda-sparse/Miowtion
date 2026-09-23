@@ -13,7 +13,9 @@
 - full 块（valid_count=128）不需要逐 token 掩码，与 partial 块分开放入两个列表。
 - `BlockSparseTensorsTorch` 的第 5 个字段是 `cu_total_m_blocks`（varlen 用），**不是** block size。
   block size 必须用关键字参数 `block_size=(128,128)` 传入。
-- 反向需要按 Q 方向的（转置后的）块列表：`_transpose_indices`。
+- 封装的输入是稠密块掩码 `[H', R, n_tiles]`（`mask.dense_block_mask`）。SM8x 上直接作为
+  `DenseBlockMaskTorch` 交给 kernel（反向按列读同一个掩码，不需要索引列表和转置）；SM90/SM100 上由
+  `fa4.index_lists` 打包成 full/partial 列表，需要梯度时再打包 Q 方向（转置后）的反向列表。
 - 架构约束（读源码 + 实测）：
   - **SM90**：hdim 128 时 tile 为 128×128、q_stage=1，与 128 行的 Q tile 直接匹配。
   - **SM100**：seqlen_q>128 时接口强制 `q_stage=2`，Q 稀疏块必须是 256 的倍数，所以 128 行的 tile
@@ -53,21 +55,41 @@ flash-attn-4 4.0.0b32 @ d15f153：
   对象，把 vendored 模块按依赖顺序注册进 `sys.modules`，最后才执行 `__init__`。
 
 ## SM89 块稀疏：vendored 的 FA4 SM80 补丁（`miowtion/kernels/fa4_sm8x`）
-补丁系列 `patches/0001..0003` 基于 flash-attention d15f153（BSD-3-Clause，`LICENSE` 随目录
-提供），改动集中在四个模块：`block_sparsity`、`flash_fwd`、`flash_bwd`、`interface`。仓库里放的是
-打完补丁后的这四个文件（再生方法见 `fa4_sm8x/__init__.py` 的 docstring），运行期由 `install()`
-替换已安装的 FA4 中的同名模块：
-- 要求已安装的 flash-attn-4 版本恰好是 `4.0.0b32`，且其中四个原始模块的 sha256 与锁定的基线一致；
+补丁系列 `patches/0001..0005` 基于 flash-attention d15f153（BSD-3-Clause，`LICENSE` 与 `AUTHORS`
+随目录提供），改动集中在五个模块：`block_sparsity`、`block_sparse_utils`、`flash_fwd`、`flash_bwd`、
+`interface`。仓库里放的是打完补丁后的这五个文件（再生方法见 `fa4_sm8x/__init__.py` 的 docstring），
+运行期由 `install()` 按依赖顺序替换已安装的 FA4 中的同名模块：
+- 要求已安装的 flash-attn-4 版本恰好是 `4.0.0b32`，且其中五个原始模块的 sha256 与锁定的基线一致；
   否则报错，不打补丁（防止把补丁套在不匹配的 FA4 上）。
-- 升级 FA4 时：在新基线上重新 `git am` 补丁、重新生成四个文件并更新哈希，重跑
+- 升级 FA4 时：在新基线上重新 `git am` 补丁、重新生成五个文件并更新哈希，重跑
   `tests/gpu/test_kernels_gpu.py`。
 
 补丁内容：
-- 前向：`FlashAttentionForwardSm80` 新增块稀疏主循环，先 partial 后 full，均为倒序；下一个块的
-  索引提前读取；下一个 K tile 在当前 tile 做 softmax+PV 时用 cp.async 预取。tile 实测选 128×32
-  （kv_subtile=4，每个 SM 放 2 个 CTA）；128×128 会寄存器溢出，慢约 30 倍。
-- 反向：SM80 反向补上了 mask_mod 和 Q 方向的块稀疏主循环；SM8x 上前向是稀疏但缺少
-  `block_sparse_tensors_bwd` 时直接报错。
+- 前向：`FlashAttentionForwardSm80` 新增块稀疏主循环。partial 与 full 合并成一次遍历，**按稠密 kernel
+  的顺序**（KV 降序）访问，是否 partial 在循环里按块判断；下一个块的索引提前读取，下一个 K tile
+  在当前 tile 做 softmax+PV 时用 cp.async 预取。tile 实测选 128×32（kv_subtile=4，每个 SM 放 2 个
+  CTA）；128×128 会寄存器溢出，慢约 30 倍。
+- 反向：SM80 反向补上了 mask_mod 和 Q 方向的块稀疏主循环（Q 升序，与稠密一致）；8 warps、
+  AtomLayout (2,4,4)，postprocess 的线程数跟随主 kernel。
+- `DenseBlockMaskTorch`：`[B|1, H|1, M, N]` 的 bool/uint8 块掩码（0 跳过，1 full，2 partial）加上按
+  KV 列的 partial 标记。每个 CTA 用 ballot 把自己那一行（反向是那一列）转成 smem 里的 bitmask 再
+  逐位遍历，不需要 argsort 生成列表，也不需要为反向转置。每边最多 2048 个块（26 万 token）。
+- 同一签名第二次调用起走启动缓存；不需要梯度时跳过 `autograd.Function`。每次调用的主机时间从约
+  94 µs 降到约 30 µs。
+- **与稠密的一致性**（补丁作者的对拍）：同一 tile 配置下，稀疏遍历与"稠密 kernel + 等价 mask_mod"
+  的 O / LSE / dK / dV 逐位相等（dQ 用 fp32 atomic 累加，稠密 kernel 两次运行之间也不逐位相同）。
+  我们的封装里稠密调用用的是 FA4 的默认 tile，稀疏调用用 128×32，所以两者差约 1 个 bf16 ulp
+  （4090 实测最大 9.8e-4，见 GPU 测试）。
+- 补丁作者在 4090 上的 e2e 测速（H=8，密度 0.10，10% partial 块，每次调用换新掩码；括号内为纯 GPU
+  时间），单位 ms：
+
+  | 方法 | 前向 16k | 前向 32k | 前向+反向 16k | 前向+反向 32k |
+  |---|---|---|---|---|
+  | SDPA 稠密 × 密度 | 0.698 | 2.767 | 2.453 | 10.02 |
+  | FA4 DenseBlockMask | 0.754（0.701） | 2.771（2.718） | 2.985（2.892） | 11.30（10.79） |
+  | FA4 索引列表（含构建列表） | 1.038 | 3.092 | 3.398 | 11.16 |
+  | flex（构建列表 + BlockMask） | 2.177 | 4.339 | 5.531 | 17.31 |
+
 - 4090，8 头，密度约 0.1：前向 16k 0.70 ms / 32k 2.70 ms（**效率 0.97 / 1.00**，含主机开销时为
   0.83–0.96）；10% partial 块时为 0.96 / 0.99；S 从 8k 到 100k、H 从 4 到 56 时效率为 0.92–1.02。
   反向效率 0.75 / 0.84（以 SDPA 的稠密反向为基准；以 FA4 自己的稠密反向为基准时为 0.9–1.0）。
@@ -76,7 +98,11 @@ flash-attn-4 4.0.0b32 @ d15f153：
   1.5e-3 到 4.9e-3。仓库原有的 400 个块稀疏 mask_mod 用例中 360 个通过，其余 40 个是 tile
   (128,112)：SM8x 反向无法支持，会给出明确报错。
 - 发现的风险：SM90/SM100 上如果不传 `block_sparse_tensors_bwd`，反向会**静默算出稠密梯度**。
-  我们的封装在需要梯度时强制要求 `block_mask` 并构造反向列表，已经规避。
+  我们的封装在需要梯度时总是从块掩码构造反向列表，已经规避。
+- 补丁作者踩过的坑：partial 与 full 分开遍历时访问顺序与稠密不同，差 1 个 bf16 ulp，只有按稠密
+  顺序合并遍历才能逐位一致；SM80 反向 8 warps 配 (4,2,2) 或 (4,4,2) 时 ptxas 分配寄存器失败，
+  AtomLayoutNdKV=8 能编译但梯度静默出错（误差 1.4）；postprocess 的线程数必须等于主 kernel 的
+  线程数，否则 dQ/dK/dV 的累加器布局对不上。
 
 ## 验证记录
 - 2026-09-23 RTX 4090：见上表。结论：上游 FA4 在 SM89 上不支持块稀疏；我们的补丁达到效率门槛，
@@ -85,6 +111,11 @@ flash-attn-4 4.0.0b32 @ d15f153：
 - `tests/gpu/test_kernels_gpu.py`（2026-09-23，RTX 4090，通过 `fa4_sm8x.install()`）：4 passed。
   FA4 稠密的 LSE 与 fp32 参考一致；Triton 热力图与 torch 参考一致；FA4 块稀疏（含 partial tile）
   与 fp32 参考一致；oracle 的 kernel 路径与参考路径一致（见 tile_search.md）。
+- 2026-09-24，RTX 4090，同步到补丁 0001..0005 后：`tests/gpu` 5 passed（新增：全部块都选中时，
+  SM8x 稀疏路径与"FA4 稠密 + 等价 mask_mod"一致，最大差 9.8e-4，即 1 个 bf16 ulp，来自两边 tile
+  配置不同）。`scripts/bench_sparse_attention.py`（8 头，密度 0.1，每次调用换新掩码；GPU 与别人的
+  轻负载进程共用，数字略有噪声）：含掩码准备的效率，DenseBlockMask 16k 0.90 / 32k 1.04，索引列表
+  0.84 / 0.99，flex 0.80 / 0.85。
 
 ## 待办
 - **FP8 sparse**（用户要求，方案待定）：块稀疏 + FP8（或 INT8 QK / FP8 PV，参考 SageAttention /

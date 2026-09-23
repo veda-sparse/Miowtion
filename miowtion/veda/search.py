@@ -89,12 +89,12 @@ def _oracle_rel_mse_kernels(q, k, v, dense_out, lse, tile_layout, blocks,
     heat = block_heat_triton.teacher_heat(q_t, k_t, lse_t.contiguous(),
                                           tile_layout, rows)
     selection = veda_mask.select_video_blocks(heat, tile_layout, blocks, rows)
-    indices = veda_mask.kernel_indices(selection, tile_layout,
-                                       global_rows=False)
+    block_mask = veda_mask.dense_block_mask(selection, tile_layout,
+                                            global_rows=False)
     slots = (rows[:, None] * _TILE + torch.arange(
         _TILE, device=q.device)[None]).view(-1)
     o_sparse = fa4.block_sparse_attention(q_t.index_select(0, slots), k_t,
-                                          v_t, indices, tile_layout)
+                                          v_t, block_mask, tile_layout)
     o_dense = dense_out.index_select(
         0, tile_layout.gather_index.index_select(0, slots))
     valid = tile_layout.slot_valid.bool().index_select(0, slots)

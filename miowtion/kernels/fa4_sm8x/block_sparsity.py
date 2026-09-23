@@ -36,6 +36,116 @@ class BlockSparseTensors(NamedTuple):
         return BlockSparseTensors(*new_fields)
 
 
+class DenseBlockMask(NamedTuple):
+    """Kernel-side dense block mask (SM80-family only), see DenseBlockMaskTorch."""
+
+    block_mask: cute.Tensor
+    partial_kv_blocks: cute.Tensor | None = None
+
+    def __new_from_mlir_values__(self, values):
+        new_fields = []
+        idx = 0
+        for original in self:
+            if original is None:
+                new_fields.append(None)
+            else:
+                new_fields.append(values[idx])
+                idx += 1
+        return DenseBlockMask(*new_fields)
+
+
+# Longest block row/column a DenseBlockMask may have (it is turned into a smem bitmask of
+# DENSE_BLOCK_MASK_MAX_BLOCKS bits per class): 2048 blocks = 262144 tokens at block size 128.
+DENSE_BLOCK_MASK_MAX_BLOCKS = 2048
+
+
+class DenseBlockMaskTorch(NamedTuple):
+    """Dense block mask, consumed directly by the SM80-family kernels (no index lists).
+
+    block_mask: [B or 1, H or 1, num_q_blocks, num_kv_blocks], torch.bool or torch.uint8.
+        0 = skip, nonzero = compute the block. 1 = full block (mask_mod skipped),
+        2 = partial block (mask_mod applied).
+    partial_kv_blocks: optional [num_kv_blocks] torch.bool/torch.uint8; nonzero marks every
+        computed block of that KV column as partial (e.g. KV tiles containing padding).
+    block_size: (sparse_block_q, sparse_block_kv), e.g. (128, 128).
+
+    Forward reads row (b, h, q_block); backward reads column (b, h, :, kv_block) of the same
+    tensor, so no transposed (Q-direction) lists are needed. Blocks are visited in the same
+    order as the dense kernel (descending KV in forward, ascending Q in backward), so a
+    DenseBlockMaskTorch run is bit-identical to the dense kernel with an equivalent mask_mod.
+    """
+
+    block_mask: torch.Tensor
+    partial_kv_blocks: torch.Tensor | None = None
+    block_size: tuple[int, int] = (128, 128)
+
+
+def normalize_dense_block_mask(
+    mask: DenseBlockMaskTorch,
+    *,
+    batch_size: int,
+    num_head: int,
+    seqlen_q: int,
+    seqlen_k: int,
+    tile_m: int,
+    tile_n: int,
+) -> tuple[DenseBlockMaskTorch, int, int, Tuple[Tuple[bool, ...], ...]]:
+    """Validate a DenseBlockMaskTorch. Returns (normalized, q_subtile, kv_subtile, pattern)."""
+    block_q, block_kv = mask.block_size
+    if block_q % tile_m != 0 or block_kv % tile_n != 0:
+        raise ValueError(
+            f"DenseBlockMaskTorch block_size={mask.block_size} must be a multiple of the "
+            f"kernel tile ({tile_m}, {tile_n})."
+        )
+    bm = mask.block_mask
+    if bm.dtype == torch.bool:
+        bm = bm.view(torch.uint8)
+    if bm.dtype != torch.uint8:
+        raise ValueError("DenseBlockMaskTorch.block_mask must be torch.bool or torch.uint8")
+    if not bm.is_cuda:
+        raise ValueError("DenseBlockMaskTorch.block_mask must live on CUDA")
+    num_q_blocks, num_kv_blocks = ceildiv(seqlen_q, block_q), ceildiv(seqlen_k, block_kv)
+    expected = (batch_size, num_head, num_q_blocks, num_kv_blocks)
+    if bm.ndim != 4:
+        raise ValueError(f"DenseBlockMaskTorch.block_mask must be 4D {expected}, got {bm.shape}")
+    if max(num_q_blocks, num_kv_blocks) > DENSE_BLOCK_MASK_MAX_BLOCKS:
+        raise ValueError(
+            f"DenseBlockMaskTorch supports at most {DENSE_BLOCK_MASK_MAX_BLOCKS} blocks per "
+            f"side, got {bm.shape[2:]}"
+        )
+    if bm.stride(-1) != 1:
+        bm = bm.contiguous()
+    bm = _expand_sparsity_tensor(bm, expected, "block_mask", "DenseBlockMaskTorch", None)
+    part = mask.partial_kv_blocks
+    if part is not None:
+        if part.dtype == torch.bool:
+            part = part.view(torch.uint8)
+        if part.dtype != torch.uint8 or part.shape != (num_kv_blocks,):
+            raise ValueError(
+                f"partial_kv_blocks must be bool/uint8 of shape ({num_kv_blocks},), "
+                f"got {part.dtype} {tuple(part.shape)}"
+            )
+        part = part.contiguous()
+    pattern = (("dense",), get_broadcast_dims(bm), part is None)
+    return (
+        DenseBlockMaskTorch(bm, part, mask.block_size),
+        block_q // tile_m,
+        block_kv // tile_n,
+        pattern,
+    )
+
+
+def to_cute_dense_block_mask(
+    mask: DenseBlockMaskTorch, enable_tvm_ffi: bool = True
+) -> DenseBlockMask:
+    return DenseBlockMask(
+        to_cute_tensor(mask.block_mask, assumed_align=1, leading_dim=-1, enable_tvm_ffi=enable_tvm_ffi),
+        to_cute_tensor(mask.partial_kv_blocks, assumed_align=1, leading_dim=0, enable_tvm_ffi=enable_tvm_ffi)
+        if mask.partial_kv_blocks is not None
+        else None,
+    )
+
+
 class BlockSparseTensorsTorch(NamedTuple):
     mask_block_cnt: torch.Tensor
     mask_block_idx: torch.Tensor

@@ -69,6 +69,9 @@ from flash_attn.cute.sm100_hd256_2cta_fmha_backward import BlackwellFusedMultiHe
 from flash_attn.cute.utils import AuxData
 from flash_attn.cute.block_sparsity import (
     BlockSparseTensorsTorch,
+    DenseBlockMaskTorch,
+    normalize_dense_block_mask,
+    to_cute_dense_block_mask,
     block_sparse_bwd_supports_2cta,
     get_kv_subtile_factor,
     get_sparse_q_block_size,
@@ -568,6 +571,78 @@ def _compute_blocks_to_batch(cu_total_blocks, num_blocks, device):
 _compute_blocks_to_batch.compile_cache = get_jit_cache("blocks_to_batch")
 
 
+
+# ---------------------------------------------------------------------------------------------
+# SM8x DenseBlockMaskTorch launch cache.
+#
+# The generic _flash_attn_fwd spends ~70-100 us of host time per call on validation,
+# normalization and compile-key construction; with a new block mask every call and the kernel
+# itself at ~1 ms, that is ~10% of the end-to-end time. The first call with a given signature
+# goes through the full path and registers the compiled kernel plus its static launch
+# arguments; later calls with an identical signature (shapes, strides, dtypes, alignment,
+# mask_mod object, aux metadata) only allocate the outputs and launch.
+# ---------------------------------------------------------------------------------------------
+_SM8X_FAST_FWD: dict = {}
+
+
+def _sm8x_fast_fwd_key(q, k, v, bst, mask_mod, aux_tensors, aux_scalars, need_lse, extra):
+    """Signature of a DenseBlockMaskTorch forward call, or None if it is not cacheable."""
+    for t in (q, k, v):
+        if t is None or not t.is_contiguous() or t.data_ptr() % 16 != 0:
+            return None
+    bm, part = bst.block_mask, bst.partial_kv_blocks
+    if bm.stride(-1) != 1 or (part is not None and not part.is_contiguous()):
+        return None
+    aux_sig = None
+    if aux_tensors is not None:
+        aux_sig = tuple(
+            (t.dtype, t.shape, t.stride(), t.data_ptr() % 16, getattr(t, "__assumed_align__", None))
+            for t in aux_tensors
+        )
+    return (
+        q.device, q.dtype, q.shape, k.shape, v.shape,
+        bm.dtype, bm.shape, bm.stride(),
+        None if part is None else (part.dtype, part.shape),
+        tuple(bst.block_size), mask_mod, aux_sig,
+        None if aux_scalars is None else tuple(type(x) for x in aux_scalars),
+        need_lse, extra,
+    )
+
+
+class _Sm8xFastFwdEntry:
+    """Replays a registered SM8x DenseBlockMaskTorch forward launch."""
+
+    def __init__(self, compiled, call_args, i_sparse, i_aux, out_shape, out_dtype, lse_shape,
+                 need_lse, default_scale, bm_shape):
+        self.compiled = compiled
+        self.call_args = list(call_args)
+        self.i_sparse, self.i_aux = i_sparse, i_aux
+        self.out_shape, self.out_dtype = out_shape, out_dtype
+        self.lse_shape, self.need_lse = lse_shape, need_lse
+        self.default_scale = default_scale
+        self.bm_shape = bm_shape
+
+    def __call__(self, q, k, v, softmax_scale, bst, aux_tensors, aux_scalars):
+        device = q.device
+        out = torch.empty(self.out_shape, dtype=self.out_dtype, device=device)
+        lse = torch.empty(self.lse_shape, dtype=torch.float32, device=device) if self.need_lse else None
+        bm = bst.block_mask
+        if bm.dtype == torch.bool:
+            bm = bm.view(torch.uint8)
+        bm = bm.expand(self.bm_shape)
+        part = bst.partial_kv_blocks
+        if part is not None and part.dtype == torch.bool:
+            part = part.view(torch.uint8)
+        args = list(self.call_args)  # per-call copy: thread-safe, keeps no caller tensors alive
+        args[0], args[1], args[2] = q.detach(), k.detach(), v.detach()
+        args[3], args[4] = out, lse
+        args[5] = self.default_scale if softmax_scale is None else softmax_scale
+        args[self.i_sparse] = (bm, part)
+        args[self.i_aux] = AuxData(aux_tensors, tuple(aux_scalars) if aux_scalars else None)
+        self.compiled(*args)
+        return out, lse, None, None
+
+
 def _flash_attn_fwd(
     q: Optional[torch.Tensor],
     k: Optional[torch.Tensor],
@@ -630,6 +705,30 @@ def _flash_attn_fwd(
         t is not None and t.requires_grad for t in (q, k, v, qv, learnable_sink)
     )
     fake_mode = is_fake_mode()
+    sm8x_fast_key = None
+    if (
+        isinstance(block_sparse_tensors, DenseBlockMaskTorch)
+        and not fake_mode
+        and qv is None and cu_seqlens_q is None and cu_seqlens_k is None
+        and seqused_q is None and seqused_k is None and page_table is None
+        and not causal and softcap in (None, 0.0) and learnable_sink is None
+        and window_size_left is None and window_size_right is None
+        and score_mod is None and num_splits == 1 and out is None and lse is None
+        and q_descale is None and k_descale is None and v_descale is None
+        and gather_kv_indices is None and scheduler_metadata is None
+        and seqlen_k_per_split is None and not disable_scheduler_metadata
+        and not gather_bwd_recompute_p and _arch is None
+        and max_seqlen_q is None and max_seqlen_k is None and min_seqlen_k is None
+    ):
+        sm8x_fast_key = _sm8x_fast_fwd_key(
+            q, k, v, block_sparse_tensors, mask_mod, aux_tensors, aux_scalars,
+            requires_grad or return_lse,
+            (tile_mn, mma_pv_is_rs, intra_wg_overlap, num_threads, pack_gqa, softmax_scale is None),
+        )
+        if sm8x_fast_key is not None:
+            entry = _SM8X_FAST_FWD.get(sm8x_fast_key)
+            if entry is not None:
+                return entry(q, k, v, softmax_scale, block_sparse_tensors, aux_tensors, aux_scalars)
     q, k, v, qv = [maybe_contiguous(t) for t in (q, k, v, qv)]
     assert q is not None or qv is not None
     assert v is not None
@@ -953,7 +1052,16 @@ def _flash_attn_fwd(
     is_dense_noncausal = not is_varlen and not causal and not local
     use_clc_scheduler = requested_use_clc_scheduler and not is_varlen_mha and not is_dense_noncausal
 
-    if use_block_sparsity:
+    use_dense_block_mask = isinstance(block_sparse_tensors, DenseBlockMaskTorch)
+    if use_dense_block_mask:
+        if arch // 10 != 8:
+            raise NotImplementedError("DenseBlockMaskTorch is only supported on SM8x")
+        if cu_seqlens_q is not None or cu_seqlens_k is not None:
+            raise NotImplementedError("DenseBlockMaskTorch does not support varlen")
+        # NB: pack_gqa requires a head-broadcast (H == 1) block mask
+        if pack_gqa and block_sparse_tensors.block_mask.shape[1] != 1:
+            pack_gqa = False
+    elif use_block_sparsity:
         # NB: pack_gqa requires block sparse head dim == 1 (broadcasted)
         head_dim_idx = 0 if block_sparse_tensors.mask_block_cnt.ndim == 2 else 1
         if pack_gqa and block_sparse_tensors.mask_block_cnt.shape[head_dim_idx] != 1:
@@ -976,7 +1084,22 @@ def _flash_attn_fwd(
     normalized_block_sparse_tensors = None
     q_subtile_factor = 1
     kv_subtile_factor = 1
-    if block_sparse_tensors is not None:
+    if use_dense_block_mask:
+        (
+            normalized_block_sparse_tensors,
+            q_subtile_factor,
+            kv_subtile_factor,
+            block_sparse_broadcast_pattern,
+        ) = normalize_dense_block_mask(
+            block_sparse_tensors,
+            batch_size=batch_size,
+            num_head=num_head,
+            seqlen_q=seqlen_q,
+            seqlen_k=seqlen_k,
+            tile_m=tile_m,
+            tile_n=tile_n,
+        )
+    elif block_sparse_tensors is not None:
         block_sparse_config = normalize_block_sparse_config(
             block_sparse_tensors,
             batch_size=batch_size,
@@ -1225,8 +1348,8 @@ def _flash_attn_fwd(
         q_descale is not None,
         k_descale is not None,
         v_descale is not None,
-        block_sparse_tensors is None or block_sparse_tensors.cu_total_m_blocks is None,
-        block_sparse_tensors is None or block_sparse_tensors.cu_block_idx_offsets is None,
+        getattr(block_sparse_tensors, "cu_total_m_blocks", None) is None,
+        getattr(block_sparse_tensors, "cu_block_idx_offsets", None) is None,
         tile_m,
         tile_n,
         q_stage,
@@ -1305,7 +1428,9 @@ def _flash_attn_fwd(
         )
 
         sparse_tensors = None
-        if normalized_block_sparse_tensors is not None:
+        if use_dense_block_mask:
+            sparse_tensors = to_cute_dense_block_mask(normalized_block_sparse_tensors)
+        elif normalized_block_sparse_tensors is not None:
             sparse_tensors = to_cute_block_sparse_tensors(normalized_block_sparse_tensors)
 
         cute_aux_tensors = None
@@ -1607,8 +1732,13 @@ def _flash_attn_fwd(
             ]
             if arch // 10 in [10, 11]:
                 call_args.append(descale_tensors)
-            call_args.extend([
-                (
+            if use_dense_block_mask:
+                sparse_call_arg = (
+                    normalized_block_sparse_tensors.block_mask,
+                    normalized_block_sparse_tensors.partial_kv_blocks,
+                )
+            elif normalized_block_sparse_tensors is not None:
+                sparse_call_arg = (
                     normalized_block_sparse_tensors.mask_block_cnt,
                     normalized_block_sparse_tensors.mask_block_idx,
                     normalized_block_sparse_tensors.full_block_cnt,
@@ -1618,8 +1748,10 @@ def _flash_attn_fwd(
                     normalized_block_sparse_tensors.dq_write_order,
                     normalized_block_sparse_tensors.dq_write_order_full,
                 )
-                if normalized_block_sparse_tensors is not None
-                else None,
+            else:
+                sparse_call_arg = None
+            call_args.extend([
+                sparse_call_arg,
                 AuxData(aux_tensors, aux_scalars),
             ])
             if use_dedicated_hd256_kernel:
@@ -1645,6 +1777,12 @@ def _flash_attn_fwd(
                     cu_total_splits_m_blocks,
                 ])
             _flash_attn_fwd.compile_cache[compile_key](*call_args)
+            if sm8x_fast_key is not None and use_dense_block_mask and arch // 10 == 8:
+                _sm8x_register_fast_fwd(
+                    sm8x_fast_key, _flash_attn_fwd.compile_cache[compile_key], call_args,
+                    sparse_call_arg, out, lse, normalized_block_sparse_tensors.block_mask.shape,
+                    head_dim,
+                )
     if is_split_kv:
         _flash_attn_fwd_combine(
             out_partial,
@@ -1663,6 +1801,21 @@ def _flash_attn_fwd(
         # that this host-side zeroing is only needed when is_split_kv=False.
         tile_count_semaphore.zero_()
     return out, lse, p, row_max
+
+
+
+def _sm8x_register_fast_fwd(key, compiled, call_args, sparse_call_arg, out, lse, bm_shape, head_dim):
+    i_sparse = next(i for i, a in enumerate(call_args) if a is sparse_call_arg)
+    i_aux = next(i for i, a in enumerate(call_args) if isinstance(a, AuxData))
+    per_call = {0, 1, 2, 3, 4, 5, i_sparse, i_aux}
+    if any(torch.is_tensor(a) for i, a in enumerate(call_args) if i not in per_call):
+        return  # a per-call tensor we do not know how to rebuild: stay on the generic path
+    template = [None if i in per_call else a for i, a in enumerate(call_args)]
+    _SM8X_FAST_FWD[key] = _Sm8xFastFwdEntry(
+        compiled, template, i_sparse, i_aux, tuple(out.shape), out.dtype,
+        None if lse is None else tuple(lse.shape), lse is not None,
+        1.0 / math.sqrt(head_dim), tuple(bm_shape),
+    )
 
 
 _flash_attn_fwd.compile_cache = get_jit_cache("fwd")
@@ -2040,8 +2193,8 @@ def _flash_attn_bwd(
         assert mask_mod is None, "mask_mod backward not supported on SM 12.0"
         assert deterministic is False, "deterministic backward not supported on SM 12.0"
     elif arch // 10 == 8:
-        # SM80 family (sm80/86/89): SM80 MMA, 128 threads (4 warps). Use the SM120 tiling,
-        # which fits the ~100 KB smem of sm86/sm89 (and trivially sm80's 164 KB).
+        # SM80 family (sm80/86/89): SM80 MMA, 64 x 64 tiles, which fit the ~100 KB smem of
+        # sm86/sm89 (and trivially sm80's 164 KB).
         m_block_size = 64
         n_block_size = 64
         if head_dim <= 64:
@@ -2050,17 +2203,31 @@ def _flash_attn_bwd(
         else:
             num_stages_Q = 1
             num_stages_dO = 1
+        if block_sparse_tensors is not None:
+            # the block-sparse Q/dO prefetch is written for single-stage buffers
+            num_stages_Q = 1
+            num_stages_dO = 1
         SdP_swapAB = False
         dKV_swapAB = False
         dQ_swapAB = False
-        AtomLayoutMSdP = 4
-        AtomLayoutNdKV = 4
-        AtomLayoutMdQ = 4
+        if head_dim > 64:
+            # 8 warps, atom layouts (2, 4, 4): measured on RTX 4090 (hdim 128, S=16k, 8 heads)
+            # 18.5 ms dense backward vs 21.9 ms for the SM120 setting (4 warps, (4, 4, 4));
+            # SDPA/FA2 is 18.0 ms. (4, 2, 2) / (4, 4, 2) with 8 warps fail in ptxas (register
+            # allocation), AtomLayoutNdKV = 8 silently gives wrong gradients.
+            AtomLayoutMSdP = 2
+            AtomLayoutNdKV = 4
+            AtomLayoutMdQ = 4
+            num_threads = 256
+        else:
+            AtomLayoutMSdP = 4
+            AtomLayoutNdKV = 4
+            AtomLayoutMdQ = 4
+            num_threads = 128
         V_in_regs = False
         dQ_single_wg = False
         cluster_size = 1
         use_2cta_instrs = False
-        num_threads = 128
         if block_sparse_tensors is not None:
             kv_subtile_factor = get_kv_subtile_factor(block_sparse_tensors, n_block_size)
         assert score_mod is None and score_mod_bwd is None, "score_mod backward not supported on SM 8.x"
@@ -2420,7 +2587,25 @@ def _flash_attn_bwd(
 
     block_sparse_broadcast_pattern = None
     normalized_block_sparse_tensors = None
-    if use_block_sparsity:
+    use_dense_block_mask = isinstance(block_sparse_tensors, DenseBlockMaskTorch)
+    if use_dense_block_mask:
+        if arch // 10 != 8:
+            raise NotImplementedError("DenseBlockMaskTorch is only supported on SM8x")
+        (
+            normalized_block_sparse_tensors,
+            q_subtile_factor,
+            kv_subtile_factor,
+            block_sparse_broadcast_pattern,
+        ) = normalize_dense_block_mask(
+            block_sparse_tensors,
+            batch_size=batch_size,
+            num_head=num_head,
+            seqlen_q=seqlen_q,
+            seqlen_k=seqlen_k,
+            tile_m=m_block_size,
+            tile_n=n_block_size,
+        )
+    elif use_block_sparsity:
         (
             normalized_block_sparse_tensors,
             block_sparse_broadcast_pattern,
@@ -2453,7 +2638,7 @@ def _flash_attn_bwd(
                 )
     if (
         normalized_block_sparse_tensors is not None
-        and normalized_block_sparse_tensors.spt is not None
+        and getattr(normalized_block_sparse_tensors, "spt", None) is not None
     ):
         spt = normalized_block_sparse_tensors.spt and deterministic
     else:
@@ -2696,7 +2881,9 @@ def _flash_attn_bwd(
 
         # Block sparse tensors for backward use Q-direction indexing (transposed from forward).
         sparse_tensors_compile = None
-        if normalized_block_sparse_tensors is not None:
+        if use_dense_block_mask:
+            sparse_tensors_compile = to_cute_dense_block_mask(normalized_block_sparse_tensors)
+        elif normalized_block_sparse_tensors is not None:
             sparse_tensors_compile = to_cute_block_sparse_tensors(normalized_block_sparse_tensors)
         dq_accum_tensor = dq_tensor if use_dedicated_hd256_kernel else dq_accum_tensor
 
@@ -2767,6 +2954,11 @@ def _flash_attn_bwd(
             dV_semaphore,
             AuxData(aux_tensors, aux_scalars),
             (
+                normalized_block_sparse_tensors.block_mask,
+                normalized_block_sparse_tensors.partial_kv_blocks,
+            )
+            if use_dense_block_mask
+            else (
                 normalized_block_sparse_tensors.mask_block_cnt,
                 normalized_block_sparse_tensors.mask_block_idx,
                 normalized_block_sparse_tensors.full_block_cnt,
@@ -2801,8 +2993,10 @@ def _flash_attn_bwd(
             num_threads_post_dQ = 128 if dQ_single_wg else cfg.num_wg * 128
             num_threads_post_dKV = cfg.num_wg * 128
         else:
-            num_threads_post_dQ = 128
-            num_threads_post_dKV = 128
+            # The fp32 dQ/dK/dV accumulators are laid out by the main kernel's MMA thread
+            # partition; the postprocess must use the same thread count (SM8x may run 256).
+            num_threads_post_dQ = num_threads if arch // 10 == 8 else 128
+            num_threads_post_dKV = num_threads if arch // 10 == 8 else 128
 
         _bwd_postprocess_convert(
             dq_accum, dq, softmax_scale,
@@ -3516,6 +3710,9 @@ class FlashAttnFunc(torch.autograd.Function):
         ctx.score_mod_bwd = score_mod_bwd 
         ctx.mask_mod = mask_mod
         ctx.aux_scalars = aux_scalars
+        if block_sparse_tensors_bwd is None and isinstance(block_sparse_tensors, DenseBlockMaskTorch):
+            # A dense block mask serves both directions (backward reads its columns).
+            block_sparse_tensors_bwd = block_sparse_tensors
         ctx.block_sparse_tensors_bwd = block_sparse_tensors_bwd
         ctx.fwd_is_block_sparse = block_sparse_tensors is not None
         ctx.gather_bwd_token_chunk = gather_bwd_token_chunk
@@ -3862,6 +4059,36 @@ def flash_attn_func(
             "the backward will run unchunked (full-size dS transient).",
             stacklevel=2,
         )
+    if (
+        isinstance(block_sparse_tensors, DenseBlockMaskTorch)
+        and qv is None
+        and gather_kv_indices is None
+        and learnable_sink is None
+        and not (
+            torch.is_grad_enabled()
+            and any(t is not None and t.requires_grad for t in (q, k, v))
+        )
+    ):
+        # Inference: skip the autograd.Function bookkeeping (~30 us of host time per call).
+        out, lse, _, _ = _flash_attn_fwd(
+            q,
+            k,
+            v,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size_left=window_size[0],
+            window_size_right=window_size[1],
+            softcap=softcap,
+            num_splits=num_splits,
+            pack_gqa=pack_gqa,
+            score_mod=score_mod,
+            mask_mod=mask_mod,
+            aux_tensors=aux_tensors,
+            aux_scalars=aux_scalars,
+            block_sparse_tensors=block_sparse_tensors,
+            return_lse=return_lse,
+        )
+        return out, lse
     return FlashAttnFunc.apply(
         q,
         k,

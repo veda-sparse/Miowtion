@@ -2,22 +2,33 @@
 
 Upstream FlashAttention-4 accepts block-sparse tensors on SM8x but its SM80
 kernels ignore them and compute dense attention. This package vendors the
-four FA4 modules changed by the patch series in `patches/` (applied on top of
-flash-attention d15f1531a460ba456f41b01a774f33ab2db8febf, BSD-3-Clause, see
-LICENSE): block-sparse forward and backward main loops for the SM80 kernels,
-SM8x backward configs, and KV sub-tiling for 128x128 sparse blocks.
+five FA4 modules changed by the patch series in `patches/`, applied on top of
+flash-attention d15f1531a460ba456f41b01a774f33ab2db8febf (modified copies;
+BSD-3-Clause, see LICENSE and AUTHORS):
+  * block-sparse forward and backward main loops for the SM80 kernels that
+    visit blocks in the dense kernel's order (descending KV forward,
+    ascending Q backward), so results are bit-identical to the dense kernel
+    with an equivalent mask_mod (dQ excepted: its fp32 atomics are
+    nondeterministic in the dense kernel too);
+  * `DenseBlockMaskTorch`: a [B, H, M, N] block mask (0 skip, 1 full, 2
+    partial, plus per-KV-column partial flags) read directly by the kernels,
+    for forward and backward alike, so no index lists or transposed lists
+    are built;
+  * an SM8x launch cache and a no-grad fast path (~30 us host time per call),
+    8-warp SM8x backward, and KV sub-tiling for 128x128 sparse blocks.
 
 `install()` swaps them in for the installed FA4 package. It must run before
 anything imports `flash_attn.cute` (whose __init__ imports the interface), so
 all FA4 access in Miowtion goes through miowtion.kernels.fa4. The installed
-package must be exactly the pinned base: its unpatched copies of the four
+package must be exactly the pinned base: its unpatched copies of the five
 modules are hash-checked, and anything else raises.
 
 Regenerate the vendored files from the patches:
     git clone https://github.com/Dao-AILab/flash-attention && cd flash-attention
     git checkout d15f1531a460ba456f41b01a774f33ab2db8febf
     git am <this dir>/patches/*.patch
-    cp flash_attn/cute/{block_sparsity,flash_fwd,flash_bwd,interface}.py <this dir>
+    cp flash_attn/cute/{block_sparsity,block_sparse_utils,flash_fwd,flash_bwd,interface}.py \
+        AUTHORS LICENSE <this dir>
 """
 
 from __future__ import annotations
@@ -29,11 +40,15 @@ import os
 import sys
 
 _BASE_VERSION = '4.0.0b32'
-# sha256 of the unpatched modules at the base commit, in load order (the
-# interface imports the other three).
+# sha256 of the unpatched modules at the base commit, in load order: each
+# module is registered before the modules that import it (block_sparse_utils
+# imports block_sparsity, the kernels import block_sparse_utils, and the
+# interface imports all of them).
 _BASE_SHA256 = {
     'block_sparsity':
         '9331cb2abd4be4da87a74c0839b665d5f914ac6f51cb97491e97b26199668ac9',
+    'block_sparse_utils':
+        '608f6c5a1c68daadfca402ec1259917019a195dc748ce9f24b92f0551d2ff6ba',
     'flash_fwd':
         'be6e88c7d9f122aa5ab29ff5946f6270af0b580e4403351b869f1330b71ca53c',
     'flash_bwd':
@@ -56,7 +71,7 @@ def _sha256(path: str) -> str:
 
 
 def install() -> None:
-    """Replaces the four FA4 modules with the SM8x block-sparse versions.
+    """Replaces the five FA4 modules with the SM8x block-sparse versions.
 
     Raises:
         RuntimeError: If flash_attn.cute was imported already, or the

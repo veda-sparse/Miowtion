@@ -1,7 +1,7 @@
 From d0bfb9bdebf1daf91d3d63fffa525cb9a48826d5 Mon Sep 17 00:00:00 2001
 From: MarsTechHAN <hansh-sz@hotmail.com>
 Date: Wed, 23 Sep 2026 21:38:40 +0800
-Subject: [PATCH 2/3] [CuTe, SM80] Enable SM8x backward; block-sparse +
+Subject: [PATCH 2/5] [CuTe, SM80] Enable SM8x backward; block-sparse +
  mask_mod backward
 
 - interface: _flash_attn_bwd accepted only 9.x-12.x; add an arch 8.x config

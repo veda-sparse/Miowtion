@@ -4,14 +4,19 @@ Every FA4 import goes through `_modules()`, which on SM8x first installs the
 vendored block-sparse patch (miowtion.kernels.fa4_sm8x; it must precede any
 `flash_attn.cute` import).
 
+The block pattern is given as a dense block mask. On SM8x it goes to the
+kernels as is (`DenseBlockMaskTorch` of the vendored patch: no index lists,
+and backward reads the same mask column-wise). On SM90 / SM100 it is packed
+into full / partial index lists here.
+
 Block-sparse integration rules (each one silently costs speed or
 correctness if broken):
   * The mask_mod is a module-level singleton. FA4 hashes the callable to key
     its compile cache; a fresh closure per call re-hashes (and may recompile)
     every time.
-  * Full key tiles (valid_count == 128) and partial key tiles go into
-    separate lists. Full blocks skip the per-token mask_mod; putting all
-    blocks in the masked list is ~25-30% slower.
+  * Full key tiles (valid_count == 128) skip the per-token mask_mod; only
+    key tiles with padding are partial. Masking every block is ~25-30%
+    slower.
   * BlockSparseTensorsTorch's 5th positional field is cu_total_m_blocks
     (varlen), not the block size; block_size must be passed by keyword.
   * Kernels process q_stage * tile_m query rows per CTA and require the
@@ -20,8 +25,8 @@ correctness if broken):
     picks q_stage = 2 whenever seqlen_q > 128, so the forward config is
     overridden to q_stage = 1 there (_force_q_stage_one; pending B200
     validation).
-  * Backward needs Q-direction (transposed) block lists. Without them FA4's
-    SM90/SM100 backward silently computes dense gradients, so they are
+  * SM90/SM100 backward needs Q-direction (transposed) block lists. Without
+    them FA4's backward silently computes dense gradients, so they are
     always built when gradients are required.
 
 q, k, v are tile-ordered [N, H', D] (seq-major), which is FA4's native
@@ -38,7 +43,6 @@ import threading
 import torch
 
 from miowtion.kernels import fa4_sm8x
-from miowtion.veda import mask as veda_mask
 from miowtion.veda import tiling
 
 _TILE = tiling.TILE_SIZE
@@ -162,47 +166,59 @@ def _force_q_stage_one(device: torch.device):
         _Q_STAGE_ONE.active = False
 
 
-def _transpose_indices(block_mask: torch.Tensor, layout: tiling.TileLayout
-                       ) -> tuple[torch.Tensor, ...]:
-    """Q-direction lists for backward: per key tile, the query tiles."""
-    mask_t = block_mask.transpose(1, 2)  # [H', nk, nq]
-    heads, nk, nq = mask_t.shape
-    rows_full = layout.full_tile[None, :, None]
-    cols = torch.arange(nq, device=mask_t.device).expand(heads, nk, nq)
+def _pack_lists(member: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Left-packed column indices of `member` [H', R, C] -> (cnt, idx)."""
+    heads, rows, cols = member.shape
+    order = torch.argsort((~member).to(torch.int8), dim=-1, stable=True)
+    index = torch.arange(cols, device=member.device).expand(heads, rows, cols)
+    return (member.sum(-1)[None].to(torch.int32),
+            torch.gather(index, -1, order)[None].to(torch.int32).contiguous())
 
-    def pack(member):
-        order = torch.argsort((~member).to(torch.int8), dim=-1, stable=True)
-        return (member.sum(-1)[None].to(torch.int32),
-                torch.gather(cols, -1, order)[None].to(torch.int32)
-                .contiguous())
 
-    full_cnt, full_idx = pack(mask_t & rows_full)
-    part_cnt, part_idx = pack(mask_t & ~rows_full)
+def index_lists(block_mask: torch.Tensor, layout: tiling.TileLayout,
+                transpose: bool = False) -> tuple[torch.Tensor, ...]:
+    """Full / partial index lists (SM90 / SM100 kernels).
+
+    Args:
+        block_mask: [H', R, n_tiles] bool, rows are query tiles.
+        layout: Tile layout (full / non-empty key tiles).
+        transpose: Q-direction lists for backward (per key tile, its query
+            tiles); needs all n_tiles query rows.
+
+    Returns:
+        (partial_cnt, partial_idx, full_cnt, full_idx), cnt [1, H', rows]
+        and idx [1, H', rows, cols] int32, in BlockSparseTensorsTorch order.
+    """
+    block_mask = block_mask & layout.kv_ok
+    full = layout.full_tile
+    if transpose:
+        block_mask = block_mask.transpose(1, 2)
+        full = full[:, None]
+    full_cnt, full_idx = _pack_lists(block_mask & full)
+    part_cnt, part_idx = _pack_lists(block_mask & ~full)
     return part_cnt, part_idx, full_cnt, full_idx
 
 
 def block_sparse_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
-                           indices: veda_mask.KernelIndices,
-                           layout: tiling.TileLayout,
-                           block_mask: torch.Tensor | None = None
-                           ) -> torch.Tensor:
+                           block_mask: torch.Tensor,
+                           layout: tiling.TileLayout) -> torch.Tensor:
     """FA4 block-sparse attention on tile-ordered tensors.
 
     Args:
         q: [R * 128, H', D] bf16 query tiles (all tiles, or a subset whose
-            lists `indices` describes).
+            rows `block_mask` describes).
         k: [N, H', D] bf16 (all key tiles).
         v: [N, H', D] bf16.
-        indices: Full/partial lists from mask.kernel_indices.
+        block_mask: [H', R, n_tiles] bool, row r = query tile r of `q`
+            (mask.dense_block_mask). Empty key tiles are skipped.
         layout: Tile layout (slot validity for the mask_mod).
-        block_mask: [H', n, n] bool; required when gradients are needed
-            (backward lists are its transpose).
 
     Returns:
         [R * 128, H', D] bf16.
 
     Raises:
         NotImplementedError: On architectures without block sparsity.
+        ValueError: If gradients are required for a subset of query tiles.
     """
     if not available(q.device):
         reason = f' ({_sm8x_error})' if _sm8x_error else ''
@@ -211,24 +227,29 @@ def block_sparse_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
             f'{"".join(map(str, torch.cuda.get_device_capability(q.device)))}'
             f'{reason}; refusing to fall back to dense attention')
     _, _, block_sparsity, iface, _ = _modules()
-    tensors = block_sparsity.BlockSparseTensorsTorch(
-        mask_block_cnt=indices.partial_cnt,
-        mask_block_idx=indices.partial_idx,
-        full_block_cnt=indices.full_cnt,
-        full_block_idx=indices.full_idx,
-        block_size=(_TILE, _TILE))
-    tensors_bwd = None
     needs_grad = torch.is_grad_enabled() and any(
         t.requires_grad for t in (q, k, v))
-    if needs_grad:
-        if block_mask is None:
-            raise ValueError('block_mask is required for backward')
-        part_cnt, part_idx, full_cnt, full_idx = _transpose_indices(
-            block_mask, layout)
-        tensors_bwd = block_sparsity.BlockSparseTensorsTorch(
+    if needs_grad and block_mask.shape[1] != layout.n_tiles:
+        raise ValueError('backward needs the block mask of all query tiles')
+    tensors_bwd = None
+    if torch.cuda.get_device_capability(q.device)[0] == 8:
+        tensors = block_sparsity.DenseBlockMaskTorch(
+            block_mask=(block_mask & layout.kv_ok)[None],
+            partial_kv_blocks=~layout.full_tile, block_size=(_TILE, _TILE))
+    else:
+        part_cnt, part_idx, full_cnt, full_idx = index_lists(block_mask,
+                                                             layout)
+        tensors = block_sparsity.BlockSparseTensorsTorch(
             mask_block_cnt=part_cnt, mask_block_idx=part_idx,
             full_block_cnt=full_cnt, full_block_idx=full_idx,
             block_size=(_TILE, _TILE))
+        if needs_grad:
+            part_cnt, part_idx, full_cnt, full_idx = index_lists(
+                block_mask, layout, transpose=True)
+            tensors_bwd = block_sparsity.BlockSparseTensorsTorch(
+                mask_block_cnt=part_cnt, mask_block_idx=part_idx,
+                full_block_cnt=full_cnt, full_block_idx=full_idx,
+                block_size=(_TILE, _TILE))
     with _force_q_stage_one(q.device):
         out = iface.flash_attn_func(
             q[None], k[None], v[None],

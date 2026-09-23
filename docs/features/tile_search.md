@@ -23,7 +23,7 @@
   `OracleScorer` 的稠密 attention 本来就要算，顺带取出 `out` 与 `lse`（按 token，与 tile 排列无关，
   所有候选形状共用）。每个头组一次完成：`gather_tiles` → 按 tile 顺序取 LSE（pad 槽置 0）→
   `block_heat_triton.teacher_heat`（块分数 = 块内 `exp(s·scale − lse)` 的最大值，只算 QKᵀ）→
-  `select_video_blocks` → `kernel_indices(global_rows=False)` → FA4 块稀疏只算抽样的 query tile →
+  `select_video_blocks` → `dense_block_mask(global_rows=False)` → FA4 块稀疏只算抽样的 query tile →
   与稠密输出对应行比较。块分数与参考路径的 fp32 概率块最大值等价（exp 单调、lse 是精确的）。
   其他情况走 `oracle_rel_mse_reference`（逐头 fp32，CPU 单测用）。
 
@@ -48,14 +48,14 @@ python scripts/build_plan.py --scores runs/<run>/scores/16x9_t37 --out plans/16x
 ## 测试
 `tests/unit/test_veda_search.py`：全保留时误差为 0、误差随稀疏度单调上升、scorer 输出逐位等于稠密、
 投票与每层 ≤2 种形状、补齐过滤、完成标记。`tests/unit/test_veda_predictor_mask.py`：子集行的
-`kernel_indices` 与全量结果的对应行逐位相等。`tests/gpu/test_kernels_gpu.py`：kernel 路径与参考
+`dense_block_mask` 与全量掩码的对应行逐位相等。`tests/gpu/test_kernels_gpu.py`：kernel 路径与参考
 路径的 rel-MSE 对拍（rtol 1e-2；4090 上实测相对差 ≤ 2e-4）。
 
 ## 踩坑记录
 - **partial query tile 中的 pad 行**：gather 时 pad 槽指向第 0 行，拿到的是第 0 行的 q，会污染块内
   最大概率。现在在 softmax 之后先把这些行清零，再做任何计算。
 
-- **子集行的 `kernel_indices` 把全局列算错**：全局列的起点曾用所选行数 R 代替
+- **子集行的块列表把全局列算错**（当时的 `kernel_indices`，现已由 `dense_block_mask` 取代）：全局列的起点曾用所选行数 R 代替
   `layout.n_video_tiles`，于是抽样行的列表里混进了视频列、漏掉了真正的全局列，kernel 路径的
   rel-MSE 与参考路径相差最多 88%。现在起点取自 layout，`global_rows=True` 时还检查 R 必须等于视频
   tile 数。

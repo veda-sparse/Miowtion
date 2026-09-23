@@ -181,105 +181,35 @@ def select_video_blocks(scores: torch.Tensor, layout: tiling.TileLayout,
 
 
 @torch.no_grad()
-def dense_block_mask(selection: Selection,
-                     layout: tiling.TileLayout) -> torch.Tensor:
-    """[H', n_tiles, n_tiles] bool block mask (rules 1-7)."""
-    heads = selection.index.shape[0]
-    n, n_video = layout.n_tiles, layout.n_video_tiles
-    mask = torch.zeros(heads, n, n, dtype=torch.bool,
-                       device=selection.index.device)
-    mask[:, :n_video].scatter_(2, selection.index, selection.keep)
-    mask[:, :, n_video:] = layout.kv_ok[n_video:]
-    mask[:, n_video:, :] = layout.kv_ok
-    return mask
-
-
-@dataclasses.dataclass
-class KernelIndices:
-    """Block-sparse description split into full and partial key tiles.
-
-    Full tiles (valid_count == 128) skip per-token masking in the kernel;
-    partial tiles apply the valid-prefix mask. Lists are left-packed; only
-    the first `*_cnt` entries of each row are meaningful.
-
-    Attributes:
-        full_cnt: [1, H', n_tiles] int32.
-        full_idx: [1, H', n_tiles, W] int32.
-        partial_cnt: [1, H', n_tiles] int32.
-        partial_idx: [1, H', n_tiles, W] int32.
-    """
-
-    full_cnt: torch.Tensor
-    full_idx: torch.Tensor
-    partial_cnt: torch.Tensor
-    partial_idx: torch.Tensor
-
-
-def _pack_left(entries: torch.Tensor, member: torch.Tensor
-               ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Stable left-packing of `entries` where `member`, plus counts."""
-    order = torch.argsort((~member).to(torch.int8), dim=-1, stable=True)
-    return torch.gather(entries, -1, order), member.sum(-1)
-
-
-@torch.no_grad()
-def kernel_indices(selection: Selection, layout: tiling.TileLayout,
-                   global_rows: bool = True) -> KernelIndices:
-    """Converts a selection into full/partial index lists for the kernel.
+def dense_block_mask(selection: Selection, layout: tiling.TileLayout,
+                     global_rows: bool = True) -> torch.Tensor:
+    """Block mask of a selection (rules 1-7), the kernels' input.
 
     Args:
-        selection: Video query tiles' selected key tiles (all n_video tiles,
-            or a subset of R query tiles).
+        selection: Video query tiles' selected key tiles (all n_video rows,
+            or a subset of R rows).
         layout: Tile layout.
-        global_rows: Append the dense lists of the global query tiles (the
-            full-sequence case). False yields lists for the selection's rows
-            only, e.g. to run sampled query tiles.
+        global_rows: Append the global query rows, which see every non-empty
+            tile (the full-sequence case). False yields the selection's R
+            rows only, e.g. to run sampled query tiles.
+
+    Returns:
+        [H', n_tiles, n_tiles] bool, or [H', R, n_tiles] without global rows.
+        Global key columns are always kept.
     """
     heads, num_rows, _ = selection.index.shape
     n, n_video = layout.n_tiles, layout.n_video_tiles
     if global_rows and num_rows != n_video:
         raise ValueError('global_rows needs a selection of all video rows')
-    all_cols = torch.arange(n, device=selection.index.device)
-    # The global columns start after the layout's video tiles, whatever the
+    mask = torch.zeros(heads, n if global_rows else num_rows, n,
+                       dtype=torch.bool, device=selection.index.device)
+    # Global columns start after the layout's video tiles, whatever the
     # number of selected rows.
-    global_cols = all_cols[n_video:]
-
-    # Video query rows: global columns first, then the selected video tiles.
-    entries = torch.cat([global_cols.expand(heads, num_rows, -1),
-                         selection.index], -1)
-    is_full = layout.full_tile[entries]
-    is_part = layout.kv_ok[entries] & ~is_full
-    selected = torch.cat([torch.ones_like(entries[..., :global_cols.numel()],
-                                          dtype=torch.bool),
-                          selection.keep], -1)
-    v_full_idx, v_full_cnt = _pack_left(entries, selected & is_full)
-    v_part_idx, v_part_cnt = _pack_left(entries, selected & is_part)
-    if not global_rows:
-        return KernelIndices(
-            full_cnt=v_full_cnt[None].to(torch.int32),
-            full_idx=v_full_idx[None].to(torch.int32).contiguous(),
-            partial_cnt=v_part_cnt[None].to(torch.int32),
-            partial_idx=v_part_idx[None].to(torch.int32).contiguous())
-
-    # Global query rows see every non-empty tile.
-    g_rows = n - n_video
-    col_full = layout.full_tile.expand(heads, g_rows, n)
-    col_part = (layout.kv_ok & ~layout.full_tile).expand(heads, g_rows, n)
-    cols = all_cols.expand(heads, g_rows, n)
-    g_full_idx, g_full_cnt = _pack_left(cols, col_full)
-    g_part_idx, g_part_cnt = _pack_left(cols, col_part)
-
-    width = max(entries.shape[-1], n)
-    pad = lambda t: torch.nn.functional.pad(t, (0, width - t.shape[-1]))
-    full_idx = torch.cat([pad(v_full_idx), pad(g_full_idx)], 1)
-    part_idx = torch.cat([pad(v_part_idx), pad(g_part_idx)], 1)
-    return KernelIndices(
-        full_cnt=torch.cat([v_full_cnt, g_full_cnt], 1)[None].to(torch.int32),
-        full_idx=full_idx[None].to(torch.int32).contiguous(),
-        partial_cnt=torch.cat([v_part_cnt, g_part_cnt], 1)[None].to(
-            torch.int32),
-        partial_idx=part_idx[None].to(torch.int32).contiguous(),
-    )
+    mask[:, :num_rows].scatter_(2, selection.index, selection.keep)
+    mask[:, :, n_video:] = layout.kv_ok[n_video:]
+    if global_rows:
+        mask[:, n_video:, :] = layout.kv_ok
+    return mask
 
 
 def kept_tiles_per_row(selection: Selection) -> torch.Tensor:

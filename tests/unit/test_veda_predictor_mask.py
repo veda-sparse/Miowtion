@@ -135,28 +135,7 @@ def test_row_subset_follows_tile_ids():
     assert torch.equal(sub.keep, full.keep[:, rows])
 
 
-def test_kernel_indices_match_dense_mask():
-    lay = _layout(target_grid=(7, 6, 10))  # padded -> partial tiles
-    assert lay.partial_tiles.numel() > 0
-    blocks = veda_mask.column_blocks(lay, veda_mask.Budget(ratio=0.5))
-    scores = torch.randn(3, lay.n_tiles, lay.n_tiles)
-    sel = veda_mask.select_video_blocks(scores[:, :lay.n_video_tiles], lay,
-                                        blocks)
-    mask = veda_mask.dense_block_mask(sel, lay)
-    idx = veda_mask.kernel_indices(sel, lay)
-    rebuilt_full = torch.zeros_like(mask)
-    rebuilt_part = torch.zeros_like(mask)
-    for h in range(3):
-        for i in range(lay.n_tiles):
-            fc, pc = idx.full_cnt[0, h, i], idx.partial_cnt[0, h, i]
-            rebuilt_full[h, i, idx.full_idx[0, h, i, :fc].long()] = True
-            rebuilt_part[h, i, idx.partial_idx[0, h, i, :pc].long()] = True
-    assert not (rebuilt_full & rebuilt_part).any()
-    assert torch.equal(rebuilt_full | rebuilt_part, mask)
-    assert torch.equal(rebuilt_full, mask & lay.full_tile)
-
-
-def test_kernel_indices_for_a_row_subset():
+def test_dense_block_mask_for_a_row_subset():
     lay = _layout(target_grid=(16, 8, 16))
     blocks = veda_mask.column_blocks(lay, veda_mask.Budget(ratio=0.3))
     scores = torch.randn(2, lay.n_tiles, lay.n_tiles)
@@ -164,14 +143,8 @@ def test_kernel_indices_for_a_row_subset():
                                          blocks)
     rows = torch.tensor([1, 5, lay.n_video_tiles - 1])
     sub = veda_mask.select_video_blocks(scores[:, rows], lay, blocks, rows)
-    all_idx = veda_mask.kernel_indices(full, lay)
-    sub_idx = veda_mask.kernel_indices(sub, lay, global_rows=False)
-    n_global = lay.n_tiles - lay.n_video_tiles
-    kept = sub.keep.sum(-1)
-    assert torch.equal((sub_idx.full_cnt + sub_idx.partial_cnt)[0],
-                       kept + n_global)
-    for field in ('full_cnt', 'partial_cnt'):
-        assert torch.equal(getattr(sub_idx, field)[0],
-                           getattr(all_idx, field)[0][:, rows])
+    sub_mask = veda_mask.dense_block_mask(sub, lay, global_rows=False)
+    assert sub_mask.shape == (2, 3, lay.n_tiles)
+    assert torch.equal(sub_mask, veda_mask.dense_block_mask(full, lay)[:, rows])
     with pytest.raises(ValueError):
-        veda_mask.kernel_indices(sub, lay)
+        veda_mask.dense_block_mask(sub, lay)
