@@ -50,6 +50,11 @@ _TILE = tiling.TILE_SIZE
 # sparsity; 8 only with the vendored SM8x patch installed.
 _SPARSE_MAJOR_ARCHS = (9, 10, 11)
 _sm8x_error: str | None = None
+# FA4 calls are serialized across threads (one thread per GPU in multi-GPU
+# inference): the first call of a signature JIT-compiles through CuTe DSL /
+# MLIR, which is not documented as thread-safe. Only the host-side launch is
+# held; kernels still run concurrently on their GPUs.
+_CALL_LOCK = threading.Lock()
 
 
 def _any_sm8x() -> bool:
@@ -101,9 +106,10 @@ def dense_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
                     scale: float, return_lse: bool
                     ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Dense attention. q, k, v: [S, H, D] -> out [S, H, D], lse [S, H]."""
-    out = interface().flash_attn_func(q[None], k[None], v[None],
-                                      softmax_scale=scale,
-                                      return_lse=return_lse)
+    with _CALL_LOCK:
+        out = interface().flash_attn_func(q[None], k[None], v[None],
+                                          softmax_scale=scale,
+                                          return_lse=return_lse)
     if not return_lse:
         return (out[0] if isinstance(out, tuple) else out)[0], None
     out, lse = out
@@ -250,7 +256,7 @@ def block_sparse_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
                 mask_block_cnt=part_cnt, mask_block_idx=part_idx,
                 full_block_cnt=full_cnt, full_block_idx=full_idx,
                 block_size=(_TILE, _TILE))
-    with _force_q_stage_one(q.device):
+    with _CALL_LOCK, _force_q_stage_one(q.device):
         out = iface.flash_attn_func(
             q[None], k[None], v[None],
             softmax_scale=q.shape[-1]**-0.5,

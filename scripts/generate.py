@@ -20,6 +20,7 @@ Example (one GPU):
 """
 
 import argparse
+import copy
 import dataclasses
 import gc
 import json
@@ -98,26 +99,47 @@ def main():
         os.makedirs(out_dir, exist_ok=True)
         jobs.append((sample, geometry, out_dir))
 
+    devices = _devices(env)
+    assigned = pipeline.assign_jobs(
+        [pipeline.geometry_cost(g) for _, g, _ in jobs], len(devices))
+    progress.log(f'{len(jobs)} samples on {len(devices)} GPU(s): '
+                 f'{[len(a) for a in assigned]} per GPU')
     if args.decode_only:
         results = [{mode: pipeline.Generated(**torch.load(
             os.path.join(out_dir, f'{mode}_latents.pt')))
                     for mode in args.attention} for _, _, out_dir in jobs]
     else:
-        results = _denoise_all(args, env, cache, jobs)
-    if env.is_main:
+        results = _denoise_all(args, env, cache, jobs, devices, assigned)
+    summaries: list[dict | None] = [None] * len(jobs)
+
+    def decode_work(rank: int, device: torch.device) -> None:
         decoder = decode.Decoder(os.path.join(args.root, args.variant),
-                                 env.device)
-        summaries = [_decode_and_compare(args, sample, geometry, result,
-                                         decoder, out_dir)
-                     for (sample, geometry, out_dir), result
-                     in zip(jobs, results)]
-        if len(jobs) > 1:
-            with open(os.path.join(args.out_dir, 'summary.json'), 'w') as f:
-                json.dump(summaries, f, indent=1)
+                                 device)
+        for index in assigned[rank]:
+            sample, geometry, out_dir = jobs[index]
+            summaries[index] = _decode_and_compare(
+                args, sample, geometry, results[index], decoder, out_dir)
+
+    pipeline.run_on_devices(devices, decode_work)
+    if len(jobs) > 1:
+        with open(os.path.join(args.out_dir, 'summary.json'), 'w') as f:
+            json.dump(summaries, f, indent=1)
 
 
-def _denoise_all(args, env, cache, jobs) -> list[dict]:
-    """Denoises every (sample, geometry) in every mode; saves latents."""
+def _devices(env) -> list[torch.device]:
+    """Every visible GPU: one process drives them all (see run_on_devices)."""
+    if env.world_size > 1:
+        raise ValueError('run generate.py as one process; it uses every '
+                         'visible GPU (set CUDA_VISIBLE_DEVICES)')
+    return [torch.device('cuda', i) for i in range(torch.cuda.device_count())]
+
+
+def _denoise_all(args, env, cache, jobs, devices, assigned) -> list[dict]:
+    """Denoises every (sample, geometry) in every mode; saves latents.
+
+    The teacher is built once on the first GPU; other GPUs get replicas that
+    share its pinned host copy of the offloaded blocks.
+    """
     tch = teacher.build_teacher(
         args.root, args.variant, args.schedule, args.num_steps, args.adapter,
         env, visual_conditions=any(s.task != 't2va' for s, _, _ in jobs),
@@ -132,43 +154,54 @@ def _denoise_all(args, env, cache, jobs) -> list[dict]:
         cfg = tch.model.config
         predictor = pipeline.load_predictor(
             args.checkpoint, cfg.num_layers, cfg.num_heads, cfg.head_dim,
-            env.device)
+            devices[0])
         veda_config = veda_attention.VedaConfig(
             target_budget=veda_mask.Budget(ratio=args.keep_ratio))
         progress.log(f'veda: plans {args.plan_dir}, predictor '
                      f'{args.checkpoint}, keep {args.keep_ratio}, dense '
                      f'steps {args.dense_steps}')
-    all_results = []
-    for index, (sample, geometry, out_dir) in enumerate(jobs):
-        plan = plans.select(geometry) if plans is not None else None
-        progress.log(f'[{index + 1}/{len(jobs)}] {sample.id} on '
-                     f'{geometry.name}' + (f' (plan {plan.geometry})'
-                                           if plan else ''))
-        results = {}
-        for mode in args.attention:
-            saved = os.path.join(out_dir, f'{mode}_latents.pt')
-            if os.path.exists(saved):
-                # Resume: a finished (sample, mode) of an earlier run.
-                results[mode] = pipeline.Generated(**torch.load(saved))
-                progress.log(f'{mode}: reusing {saved}')
-                continue
-            results[mode] = pipeline.generate(
-                tch.model, tch.schedule, tch.tables, cache, sample, geometry,
-                args.seed, env.device, mode, plan, predictor, veda_config,
-                args.dense_steps)
-            progress.log(f'{mode}: denoised in {results[mode].seconds:.1f} '
-                         f's, attention '
-                         f'{sum(results[mode].attention_seconds):.1f} s '
-                         f'({results[mode].sparse_calls} sparse / '
-                         f'{results[mode].dense_calls} dense attention calls)')
-            if env.is_main:
-                torch.save(dataclasses.asdict(results[mode]),
-                           os.path.join(out_dir, f'{mode}_latents.pt'))
-        all_results.append(results)
-    del tch, predictor
+    replicas = [(tch.model, tch.tables, predictor)]
+    for device in devices[1:]:
+        with progress.Timer(f'replicate the teacher on {device}'):
+            replicas.append((
+                parallel.replicate(tch.model, device, args.prefetch),
+                tch.tables.to(device),
+                copy.deepcopy(predictor).to(device)
+                if predictor is not None else None))
+    results: list[dict | None] = [None] * len(jobs)
+
+    def work(rank: int, device: torch.device) -> None:
+        model, tables, rank_predictor = replicas[rank]
+        for index in assigned[rank]:
+            sample, geometry, out_dir = jobs[index]
+            plan = plans.select(geometry) if plans is not None else None
+            progress.log(f'[{device}] {sample.id} on {geometry.name}'
+                         + (f' (plan {plan.geometry})' if plan else ''))
+            modes = {}
+            for mode in args.attention:
+                saved = os.path.join(out_dir, f'{mode}_latents.pt')
+                if os.path.exists(saved):
+                    # Resume: a finished (sample, mode) of an earlier run.
+                    modes[mode] = pipeline.Generated(**torch.load(saved))
+                    progress.log(f'[{device}] {mode}: reusing {saved}')
+                    continue
+                modes[mode] = pipeline.generate(
+                    model, tch.schedule, tables, cache, sample, geometry,
+                    args.seed, device, mode, plan, rank_predictor,
+                    veda_config, args.dense_steps)
+                progress.log(f'[{device}] {sample.id} {mode}: denoised in '
+                             f'{modes[mode].seconds:.1f} s, attention '
+                             f'{sum(modes[mode].attention_seconds):.1f} s')
+                torch.save(dataclasses.asdict(modes[mode]), saved)
+            results[index] = modes
+
+    pipeline.run_on_devices(devices, work)
+    del tch, predictor, replicas
     gc.collect()
-    torch.cuda.empty_cache()
-    return all_results
+    for device in devices:
+        with torch.cuda.device(device):
+            torch.cuda.empty_cache()
+    return results
 
 
 def _decode_and_compare(args, sample, geometry, results, decoder,

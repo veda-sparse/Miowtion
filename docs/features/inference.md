@@ -19,6 +19,19 @@
 - 先释放 DiT 再加载 VAE。视频 VAE 开启空间 tile 解码（256，重叠 64）。反归一化
   （`revert_tensor`）按帧分块（`_REVERT_CHUNK_FRAMES = 32`）：它是逐元素的，分块结果逐位相同，
   只为避免 345 帧 1344×768 的 fp32 副本（4 GB）撑爆 24 GB 卡。
+- **多卡在同一个进程里**（`--devices 0,1` 或 `CUDA_VISIBLE_DEVICES`）：模型只构建一次，
+  `train/parallel.replicate` 把常驻参数深拷到其他卡，**offload 的 block 继续共享同一批 pinned
+  slab**（host 内存不随卡数增长，这是关键：每个进程自己 pin 一份的话两进程就吃掉 70 GB）。
+  AdaLN 表用 `AdalnTables.to(device)` 复制，打分器 deepcopy。每张卡一个线程，
+  `assign_jobs` 用"最长优先 + 最小负载"把样本分配到卡上（代价 `geometry_cost` = token 数的平方，
+  即注意力的量级），并列时给编号小的卡，所以分配是确定的。任何一个线程抛异常都会重新抛到主线程。
+- FA4 的 host 端 launch 用 `_CALL_LOCK` 串行化：首次调用某个签名会经 CuTe DSL / MLIR 做 JIT，
+  没有文档保证线程安全。只锁住 launch，kernel 仍在各自的卡上并发执行。
+- **标准对比方式**（以后所有稠密 / 稀疏对比都按这个来）：每种模式单独一个 `<mode>.mp4`；另有
+  `dense_vs_veda.mp4`，左右拼接，顶部标题栏分别是 "Dense" 和 "Veda <S>% Sparsity"
+  （S = 100 × (1 − 保留比例)），带两条音轨（稠密在前）；`summary.json` 记录每步耗时、注意力 GPU
+  时间（CUDA event，Veda 包括打分、选块和 gather）、端到端与注意力加速比、逐帧 PSNR。第 0 步包含
+  kernel 编译，不计入加速比。还会保存 `<mode>_latents.pt`。
 
 ## 用法
 ```bash
@@ -52,6 +65,8 @@ prompt 先用 `scripts/encode_samples.py` 编码进样本缓存。`--sample-id` 
   必须按 warmup 之后的步折算。
 - **解码 14.4 s 16:9 时 OOM**：`revert_tensor(recon.float())` 要把 [1,3,345,768,1344] 转成 fp32
   （约 4 GB）再加上输出，单卡放不下。按帧分块后峰值有界，单测检查分块与不分块逐位相同。
+- **两个单卡推理进程被 host OOM killer 干掉**：每个进程为 offload 的 44 个 block pin 约 35 GB，
+  125 GB 的机器上两个进程就只剩十几 GB。改成一个进程驱动多张卡、共享 pinned slab。
 
 ## 验证记录
 - 2026-09-24，RTX 4090 单卡（40 个 block offload），FL2VA + Turbo v4_step600_ema 8 步，16:9

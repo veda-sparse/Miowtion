@@ -11,8 +11,9 @@ steps listed as dense.
 from __future__ import annotations
 
 import dataclasses
+import threading
 import time
-from collections.abc import Collection
+from collections.abc import Callable, Collection, Sequence
 
 import torch
 
@@ -163,3 +164,53 @@ def generate(model: h3_model.H3DiT, schedule, tables,
     return Generated(traj.video_rows[traj.n_cond_video:].cpu(),
                      traj.audio_rows[traj.n_cond_audio:].cpu(), step_seconds,
                      attention_seconds, calls['sparse'], calls['dense'])
+
+
+def assign_jobs(costs: Sequence[float], num_devices: int) -> list[list[int]]:
+    """Greedy longest-first assignment of job indices to devices.
+
+    Deterministic: ties go to the lowest device index. Each device's list
+    keeps the longest-first order, so the slow jobs start early.
+    """
+    if num_devices < 1:
+        raise ValueError(f'num_devices must be >= 1, got {num_devices}')
+    loads = [0.0] * num_devices
+    assigned: list[list[int]] = [[] for _ in range(num_devices)]
+    for job in sorted(range(len(costs)), key=lambda j: (-costs[j], j)):
+        device = min(range(num_devices), key=lambda d: (loads[d], d))
+        assigned[device].append(job)
+        loads[device] += costs[job]
+    return assigned
+
+
+def geometry_cost(geometry: h3_geometry.Geometry) -> float:
+    """Relative generation cost: attention grows with tokens squared."""
+    t, h, w = geometry.video_grid
+    return float(t * h * w) ** 2
+
+
+def run_on_devices(devices: Sequence[torch.device],
+                   work: Callable[[int, torch.device], None]) -> None:
+    """Runs work(rank, device) in one thread per GPU; re-raises failures.
+
+    One process drives all GPUs: the model is loaded, merged and tabulated
+    once, offloaded blocks live once in pinned host memory, and each GPU
+    streams them over its own PCIe link; there is no inter-GPU traffic.
+    """
+    errors: list[BaseException] = []
+
+    def target(rank: int, device: torch.device) -> None:
+        try:
+            torch.cuda.set_device(device)
+            work(rank, device)
+        except BaseException as e:  # pylint: disable=broad-except
+            errors.append(e)
+
+    threads = [threading.Thread(target=target, args=(r, d), name=f'gpu{r}')
+               for r, d in enumerate(devices)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    if errors:
+        raise errors[0]

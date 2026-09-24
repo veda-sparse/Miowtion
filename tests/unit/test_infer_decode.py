@@ -86,6 +86,31 @@ def test_mp4_keeps_the_full_audio(tmp_path):
     assert all(abs(d - seconds) < 0.1 for d in durations['audio'])
 
 
+def test_assign_jobs_balances_longest_first():
+    from miowtion.infer import pipeline
+    # One device takes everything, in longest-first order.
+    assert pipeline.assign_jobs([1.0, 5.0, 3.0], 1) == [[1, 2, 0]]
+    # Two devices: 5 | 3 + 1.
+    assert pipeline.assign_jobs([1.0, 5.0, 3.0], 2) == [[1], [2, 0]]
+    # Ties go to the lowest index, so the split is deterministic.
+    assert pipeline.assign_jobs([2.0, 2.0, 2.0, 2.0], 2) == [[0, 2], [1, 3]]
+    assert pipeline.assign_jobs([], 3) == [[], [], []]
+    with pytest.raises(ValueError):
+        pipeline.assign_jobs([1.0], 0)
+
+
+def test_geometry_cost_grows_with_tokens_squared():
+    from miowtion.infer import pipeline
+    short = geometry.geometry_from_latent_t('16:9', 37)
+    long = geometry.geometry_from_latent_t('16:9', 102)
+    square = geometry.geometry_from_latent_t('1:1', 37)
+    assert pipeline.geometry_cost(long) > pipeline.geometry_cost(short)
+    assert pipeline.geometry_cost(short) > pipeline.geometry_cost(square)
+    ratio = pipeline.geometry_cost(long) / pipeline.geometry_cost(short)
+    tokens = [math.prod(g.video_grid) for g in (long, short)]
+    assert ratio == pytest.approx((tokens[0] / tokens[1]) ** 2)
+
+
 def test_video_frame_chunking_is_exact(monkeypatch):
     """The de-normalization is elementwise, so chunking must not change it."""
     class _Processor:
