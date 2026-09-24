@@ -17,21 +17,21 @@ from miowtion.mlx import veda_plan  # noqa: E402
 _HEADS = 3
 
 
-def _layout(cond=(2, 4, 4), text=70):
+def _layout(cond=(2, 4, 4), text=70, shape='8x4x4'):
     spans, start = [], text
     if cond is not None:
         spans.append(tiling.TiledSpan(start, cond,
                                       tiling.least_padding_shape(cond)))
         start += math.prod(cond)
     target = tiling.TiledSpan(start + 30, (5, 6, 8),
-                              tiling.TileShape.parse('8x4x4'))
+                              tiling.TileShape.parse(shape))
     used = target.start + target.num_rows
     return tiling.build_tile_layout(spans + [target], used, used)
 
 
-def _selection(layout, ratio=0.4, seed=0):
+def _selection(layout, ratio=0.4, seed=0, heads=_HEADS):
     torch.manual_seed(seed)
-    scores = torch.randn(_HEADS, layout.n_video_tiles, layout.n_tiles)
+    scores = torch.randn(heads, layout.n_video_tiles, layout.n_tiles)
     blocks = veda_mask.column_blocks(layout, veda_mask.Budget(ratio=ratio),
                                      veda_mask.Budget(ratio=ratio))
     return veda_mask.select_video_blocks(scores, layout, blocks)
@@ -103,3 +103,54 @@ def test_plan_needs_every_video_query_tile():
     selection.keep = selection.keep[:, :-1]
     with pytest.raises(ValueError):
         veda_plan.plan_from_selection(selection, layout)
+
+
+def _reference(group, q, k, v):
+    """Dense attention under the group's mask, in packed row order."""
+    plan = group.plan
+    slots = group.gather.shape[0]
+    mask = sa.block_mask_from_index(plan.index, plan.q_block, plan.k_block,
+                                    slots, plan.keep, plan.key_valid,
+                                    plan.dense_rows)
+    tiled = [mx.take(x, group.gather, axis=1) for x in (q, k, v)]
+    heads = q.shape[0]
+    out = mx.stack([sa.dense_reference(
+        tiled[0][h:h + 1], tiled[1][h:h + 1], tiled[2][h:h + 1],
+        mask=mask if mask.ndim == 2 else mask[h])[0] for h in range(heads)])
+    zero = mx.zeros((heads, 1, q.shape[2]), dtype=out.dtype)
+    return mx.take(mx.concatenate([out, zero], axis=1), group.scatter, axis=1)
+
+
+def test_layer_plan_gives_every_head_group_its_own_permutation():
+    # Two tile shapes in one layer: the heads split into groups that see
+    # different permutations of the same packed sequence.
+    layout_a, layout_b = _layout(), _layout(shape='4x8x4')
+    assert layout_a.num_slots != layout_b.num_slots or not torch.equal(
+        layout_a.perm, layout_b.perm)
+    group_a = veda_plan.head_group_plan(
+        [0, 2], _selection(layout_a, seed=2, heads=2), layout_a)
+    group_b = veda_plan.head_group_plan(
+        [1], _selection(layout_b, seed=3, heads=1), layout_b)
+    layer = veda_plan.layer_plan([group_a, group_b], _HEADS)
+    used = layout_a.used
+    mx.random.seed(0)
+    q, k, v = (mx.random.normal((_HEADS, used, 128)) for _ in range(3))
+    mx.eval(q, k, v)
+
+    got = sa.layer_attention(layer, q, k, v)
+    pick = {group_a: mx.array([0, 2]), group_b: mx.array([1])}
+    for group, heads in pick.items():
+        want = _reference(group, *(mx.take(x, heads, axis=0)
+                                   for x in (q, k, v)))
+        mx.eval(want)
+        assert mx.array_equal(mx.take(got, heads, axis=0), want).item()
+
+
+def test_layer_plan_needs_a_partition_of_the_heads():
+    layout = _layout()
+    group = veda_plan.head_group_plan([0, 1], _selection(layout, heads=2),
+                                      layout)
+    with pytest.raises(ValueError):
+        veda_plan.layer_plan([group], _HEADS)
+    with pytest.raises(ValueError):
+        veda_plan.head_group_plan([0], _selection(layout, heads=2), layout)

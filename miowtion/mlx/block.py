@@ -198,14 +198,18 @@ class BlockOptions:
             until the final eval, which defeats the chunking entirely (S=38912
             peaks at 6.44 GB instead of 4.43 GB). It is also marginally
             faster, so there is no reason to turn it off outside experiments.
-        sparse: Veda block-sparse attention plan; None runs dense attention.
-            Requires `used` to be a multiple of both tile sizes.
+        sparse: Veda block-sparse attention; None runs dense attention. A
+            SparsePlan applies one selection to the packed rows directly
+            (`used` must then be a multiple of both tile sizes); a LayerPlan
+            carries one permutation and selection per head group, which is
+            what a real tile plan needs (up to two tile shapes per layer).
     """
 
     head_chunk: int | None = None
     row_chunk: int = DEFAULT_ROW_CHUNK
     eval_chunks: bool = True
-    sparse: sparse_attention.SparsePlan | None = None
+    sparse: (sparse_attention.SparsePlan | sparse_attention.LayerPlan
+             | None) = None
 
 
 class _Stages:
@@ -311,29 +315,47 @@ def _check_inputs(x, adaln, adaln_index, rope, used, config, options):
                          f'{config.num_heads}')
     if options.row_chunk < 1:
         raise ValueError(f'row_chunk must be >= 1, got {options.row_chunk}')
-    plan = options.sparse
-    if plan is not None:
-        # Padding rows must stay out of attention, and the gathered problem
-        # must be rectangular, so the real rows have to tile exactly. Veda's
-        # geometries are tile-aligned by construction; refuse rather than
-        # silently attend to padding.
-        sparse_rows = used - plan.dense_rows
-        if (sparse_rows <= 0 or sparse_rows % plan.q_block
-                or used % plan.k_block):
-            raise ValueError(
-                f'{sparse_rows} sparse rows of used {used} must be a positive '
-                f'multiple of q_block {plan.q_block}, and used a multiple of '
-                f'k_block {plan.k_block}')
-        if plan.index.shape[0] != sparse_rows // plan.q_block:
-            raise ValueError(
-                f'sparse index has {plan.index.shape[0]} query tiles, '
-                f'expected {sparse_rows // plan.q_block}')
-        if plan.keep is not None and plan.keep.shape != plan.index.shape:
-            raise ValueError(f'sparse keep {plan.keep.shape} must match '
-                             f'index {plan.index.shape}')
-        if plan.key_valid is not None and plan.key_valid.shape != (used,):
-            raise ValueError(f'sparse key_valid must be [{used}], got '
-                             f'{plan.key_valid.shape}')
+    sparse = options.sparse
+    if isinstance(sparse, sparse_attention.SparsePlan):
+        _check_plan(sparse, used)
+    elif sparse is not None:
+        if sparse.num_heads != config.num_heads:
+            raise ValueError(f'layer plan covers {sparse.num_heads} heads, '
+                             f'expected {config.num_heads}')
+        for group in sparse.groups:
+            if group.scatter.shape != (used,):
+                raise ValueError(f'group scatter must be [{used}], got '
+                                 f'{group.scatter.shape}')
+            _check_plan(group.plan, group.gather.shape[0])
+
+
+def _check_plan(plan, rows: int) -> None:
+    """Checks one selection against the rows it is meant to cover.
+
+    Padding rows must stay out of attention, and the gathered problem must
+    be rectangular, so the real rows have to tile exactly. Veda's geometries
+    are tile-aligned by construction; refuse rather than silently attend to
+    padding.
+
+    Raises:
+        ValueError: On any mismatch.
+    """
+    sparse_rows = rows - plan.dense_rows
+    if sparse_rows <= 0 or sparse_rows % plan.q_block or rows % plan.k_block:
+        raise ValueError(
+            f'{sparse_rows} sparse rows of {rows} must be a positive '
+            f'multiple of q_block {plan.q_block}, and {rows} a multiple of '
+            f'k_block {plan.k_block}')
+    if plan.n_query_tiles != sparse_rows // plan.q_block:
+        raise ValueError(
+            f'sparse index has {plan.n_query_tiles} query tiles, '
+            f'expected {sparse_rows // plan.q_block}')
+    if plan.keep is not None and plan.keep.shape != plan.index.shape:
+        raise ValueError(f'sparse keep {plan.keep.shape} must match '
+                         f'index {plan.index.shape}')
+    if plan.key_valid is not None and plan.key_valid.shape != (rows,):
+        raise ValueError(f'sparse key_valid must be [{rows}], got '
+                         f'{plan.key_valid.shape}')
 
 
 def block_forward(x: mx.array, weights: BlockWeights,
@@ -405,20 +427,20 @@ def block_forward(x: mx.array, weights: BlockWeights,
         v = qkv[:, :, 2]
         del qkv
         stages.mark('qk_norm_rope', q, k)
-        if options.sparse is None:
+        sparse = options.sparse
+        qt, kt, vt = (t[:used].transpose(1, 0, 2) for t in (q, k, v))
+        if sparse is None:
             out = mx.fast.scaled_dot_product_attention(
-                q[:used].transpose(1, 0, 2)[None],
-                k[:used].transpose(1, 0, 2)[None],
-                v[:used].transpose(1, 0, 2)[None], scale=scale)[0]
-        else:
+                qt[None], kt[None], vt[None], scale=scale)[0]
+        elif isinstance(sparse, sparse_attention.SparsePlan):
             out = sparse_attention.block_sparse_attention(
-                q[:used].transpose(1, 0, 2), k[:used].transpose(1, 0, 2),
-                v[:used].transpose(1, 0, 2), options.sparse.index,
-                q_block=options.sparse.q_block,
-                k_block=options.sparse.k_block, scale=scale,
-                keep=options.sparse.keep,
-                key_valid=options.sparse.key_valid,
-                dense_rows=options.sparse.dense_rows)
+                qt, kt, vt, sparse.index, q_block=sparse.q_block,
+                k_block=sparse.k_block, scale=scale, keep=sparse.keep,
+                key_valid=sparse.key_valid, dense_rows=sparse.dense_rows)
+        else:
+            out = sparse_attention.layer_attention(sparse, qt, kt, vt,
+                                                   head_start=h0, scale=scale)
+        del qt, kt, vt
         out = out.transpose(1, 0, 2)  # [used, head_chunk, D]
         del q, k, v
         outs.append(out)

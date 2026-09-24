@@ -415,6 +415,40 @@ def sparse_plan(seq_len: int, density: float, q_block: int,
     return sparse_attention.SparsePlan(index, q_block, k_block)
 
 
+def permuted_layer_plan(plan: sparse_attention.SparsePlan, num_heads: int,
+                        groups: int, seq_len: int, seed: int = 0
+                        ) -> sparse_attention.LayerPlan:
+    """The same selection behind one random permutation per head group.
+
+    A real tile plan gives a layer up to two tile shapes, i.e. up to two
+    permutations of the sequence; this reproduces the *cost* of that (the
+    gather / scatter around attention) without needing a clip geometry.
+
+    Args:
+        plan: The selection every group runs.
+        num_heads: Heads of the layer; must be divisible by `groups`.
+        groups: Head groups, i.e. distinct permutations.
+        seq_len: Packed rows (all real, so the permutation is a bijection).
+        seed: Permutation seed.
+
+    Raises:
+        ValueError: If the heads do not split evenly.
+    """
+    if groups < 1 or num_heads % groups:
+        raise ValueError(f'{groups} groups do not divide {num_heads} heads')
+    mx.random.seed(seed)
+    per_group = num_heads // groups
+    out = []
+    for g in range(groups):
+        gather = mx.random.permutation(seq_len).astype(mx.int32)
+        scatter = mx.argsort(gather).astype(mx.int32)
+        mx.eval(gather, scatter)
+        out.append(sparse_attention.HeadGroupPlan(
+            heads=tuple(range(g * per_group, (g + 1) * per_group)),
+            gather=gather, scatter=scatter, plan=plan))
+    return sparse_attention.LayerPlan(tuple(out), num_heads)
+
+
 def attention_only(config: h3_config.H3Config, seq_len: int,
                    plan: sparse_attention.SparsePlan | None,
                    head_chunk: int | None = None, reps: int = 3) -> dict:

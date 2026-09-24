@@ -34,11 +34,15 @@ def _emit(result: dict, out: str | None) -> None:
             f.write(line + '\n')
 
 
-def _options(args, seq_len: int) -> mlx_block.BlockOptions:
+def _options(args, seq_len: int, config: h3_config.H3Config
+             ) -> mlx_block.BlockOptions:
     plan = None
     if args.density < 1.0:
         plan = bench.sparse_plan(seq_len, args.density, args.q_block,
                                  args.k_block)
+        if args.permute_groups:
+            plan = bench.permuted_layer_plan(plan, config.num_heads,
+                                             args.permute_groups, seq_len)
     return mlx_block.BlockOptions(head_chunk=args.head_chunk,
                                   row_chunk=args.row_chunk,
                                   eval_chunks=args.eval_chunks, sparse=plan)
@@ -102,6 +106,9 @@ def main():
         p.add_argument('--no-eval-chunks', dest='eval_chunks',
                        action='store_false',
                        help='keep every chunk lazy (raises peak memory)')
+        p.add_argument('--permute-groups', type=int, default=0,
+                       help='head groups, each with its own tile-order '
+                            'permutation (0 keeps the packed order)')
         if name == 'compute':
             p.add_argument('--seq-len', type=int, nargs='+', required=True)
             p.add_argument('--bits', type=int, default=0, choices=(0, 4, 8))
@@ -166,9 +173,9 @@ def main():
     elif args.cmd == 'compute':
         for seq_len in args.seq_len:
             bench.require_headroom(args.min_available_gb)
+            options = _options(args, seq_len, config)
             result = bench.compute_block(config, seq_len, args.bits,
-                                         args.qmm, _options(args, seq_len),
-                                         reps=args.reps,
+                                         args.qmm, options, reps=args.reps,
                                          profile=not args.no_profile)
             result['cmd'] = 'compute'
             _emit(result, args.out)
@@ -177,7 +184,7 @@ def main():
     else:
         result = bench.streamed_run(args.dir, args.blocks, args.passes,
                                     args.seq_len, config,
-                                    _options(args, args.seq_len),
+                                    _options(args, args.seq_len, config),
                                     depth=args.depth, nocache=not args.cache,
                                     dequantize=args.dequantize)
         result['cmd'] = 'stream'

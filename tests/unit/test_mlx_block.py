@@ -228,3 +228,46 @@ def test_sparse_plan_is_validated():
     for bad in bad_plans:
         with pytest.raises(ValueError):
             mlx_block.block_forward(*args, mlx_block.BlockOptions(sparse=bad))
+
+
+def _identity_group(heads, plan):
+    from miowtion.mlx import sparse_attention
+    rows = mx.arange(_USED, dtype=mx.int32)
+    return sparse_attention.HeadGroupPlan(heads=heads, gather=rows,
+                                          scatter=rows, plan=plan)
+
+
+def test_layer_plan_splits_the_heads_without_changing_the_result():
+    # Two head groups carrying the same selection and the identity
+    # permutation must be exactly the single-plan path: the split only
+    # decides which heads are gathered together.
+    from miowtion.mlx import sparse_attention
+    plan = _plan(20, 16, budget=2)
+    heads = _CONFIG.num_heads
+    layer = sparse_attention.LayerPlan(
+        (_identity_group(tuple(range(0, heads, 2)), plan),
+         _identity_group(tuple(range(1, heads, 2)), plan)), heads)
+    got = _mlx_forward(torch.float32, mlx_block.BlockOptions(sparse=layer))
+    want = _mlx_forward(torch.float32, mlx_block.BlockOptions(sparse=plan))
+    assert torch.equal(got, want)
+
+
+def test_layer_plan_is_validated():
+    from miowtion.mlx import sparse_attention
+    weights = interop.block_weights_from_torch(_torch_block(torch.bfloat16))
+    x, tables, index, rope = _inputs(torch.bfloat16)
+    args = [interop.from_torch(x), weights,
+            [interop.from_torch(t) for t in tables],
+            interop.from_torch(index.to(torch.int32)),
+            tuple(interop.from_torch(r) for r in rope), _USED, _CONFIG]
+    plan = _plan(20, 16, 2)
+    heads = _CONFIG.num_heads
+    group = _identity_group(tuple(range(heads)), plan)
+    bad = [sparse_attention.LayerPlan((_identity_group((0,), plan),), 1),
+           sparse_attention.LayerPlan(
+               (dataclasses.replace(group, scatter=group.scatter[:-1]),),
+               heads)]
+    for layer in bad:
+        with pytest.raises(ValueError):
+            mlx_block.block_forward(*args,
+                                    mlx_block.BlockOptions(sparse=layer))

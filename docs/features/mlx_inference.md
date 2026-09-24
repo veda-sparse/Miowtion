@@ -77,8 +77,8 @@ round 到 bf16：RMSNorm 的统计量和乘权重在 fp32 里算、只 round 一
 | 文件 | 作用 |
 |---|---|
 | `miowtion/mlx/block.py` | 一个 trunk block 的前向；`BlockWeights`（发布 layout，含量化）、`BlockOptions`（head / row 分块） |
-| `miowtion/mlx/sparse_attention.py` | Veda 块稀疏：`SparsePlan`、gather 版 `block_sparse_attention`、稠密参考、代价模型 |
-| `miowtion/mlx/veda_plan.py` | 把 `veda.mask.Selection` 转成 `SparsePlan`（真实 Veda 掩码的唯一入口） |
+| `miowtion/mlx/sparse_attention.py` | Veda 块稀疏：`SparsePlan`、`HeadGroupPlan` / `LayerPlan`（每层两个头组、各自的排列）、gather 版 `block_sparse_attention`、稠密参考、代价模型 |
+| `miowtion/mlx/veda_plan.py` | 把 `veda.mask.Selection` 转成 `SparsePlan` / `LayerPlan`（真实 Veda 掩码的唯一入口） |
 | `miowtion/mlx/interop.py` | torch ↔ MLX 的逐位转换（numpy 没有 bf16，按 16 bit 原始位走） |
 | `miowtion/mlx/slab.py` | slab 格式、`SlabReader`（pread 进预分配 buffer）、`BlockPrefetcher`、`convert_checkpoint` |
 | `miowtion/mlx/offload.py` | 不转换的替代方案：直接读发布的 safetensors（`mx.load` 惰性加载 / 每个分片一个 mmap） |
@@ -253,6 +253,32 @@ gather 出来的 key 顺序和稠密路径一致，结果**逐位相等**（单�
 gather 量是 `q_block=2048` 的 16 倍（S=38912 下一遍 33 GB），所以 `head_chunk`
 必须调小到 2：head_chunk=4 会多花 2.8 GB 峰值，还因为内存压力更慢。
 
+### 每层两个头组：排列也是 plan 的一部分
+
+`TilePlan` 允许一层用两种 tile 形状，也就是两个**不同的排列**。MLX 侧因此不是"一个
+block 一个 plan"，而是 `LayerPlan`：每个头组带自己的 `gather` / `scatter` 和
+`SparsePlan`，block 本身始终拿 packed 顺序的 q/k/v，进出 attention 时由头组自己排列。
+这样 block 不需要知道 Veda 的几何，头组也可以各用各的 tile 形状。
+
+- `gather`：slot → packed 行；padding slot 指向第 0 行，靠 `key_valid` 掩掉，取值
+  无所谓。
+- `scatter`：packed 行 → slot；输出末尾补一行零，没被任何 tile 覆盖的行指向它
+  （`build_tile_layout` 下不会发生，发生就报错）。反排列用 gather 而不是原地
+  scatter，路径保持函数式，也避开 MLX 的 in-place 写。
+- `head_chunk` 落在头组边界内时不需要额外挑头；跨界时 `layer_attention` 会按组挑出
+  各自的头，算完再按输入顺序拼回去。
+
+排列的代价（S=38912，密度 10 %，`q_block=128`，`head_chunk=2`，`row_chunk=4096`）：
+
+| 配置 | 每 block | 其中 attention | MLX 峰值 |
+|---|---|---|---|
+| 单 plan，不排列 | 7.74 s | 2.51 s | 4.84 GB |
+| `LayerPlan`，两个头组各一个排列 | 7.97 s | 2.61 s | 4.94 GB |
+
+即 **+3.0 %**（+0.23 s）。微基准对得上：一次 `[2, 38912, 128]` bf16 的行 gather 是
+2.0 ms，每个头组每 block 要做 4 次（q / k / v 和反排列），56 个头 28 个 chunk 就是
+0.22 s。这是随机排列的上界，Veda 的排列在 tile 内是连续的，只会更快。
+
 ### 18 GB 上的序列长度上限
 
 开了稀疏和 `eval_chunks`（`head_chunk=8, row_chunk=4096, q_block=2048`，
@@ -330,7 +356,7 @@ gather 量是 `q_block=2048` 的 16 倍（S=38912 下一遍 33 GB），所以 `h
 
 ## 测试
 
-`tests/unit/test_mlx_block.py`（11 个，缺 mlx 时自动 skip）：
+`tests/unit/test_mlx_block.py`（13 个，缺 mlx 时自动 skip）：
 
 - torch ↔ MLX 转换、RoPE、SwiGLU 逐位相等（`torch.equal`）。
 - 整个 block 对 torch 参考实现：fp32 相对 L2 < 1e-5；bf16 < 5e-3，并且额外要求
@@ -339,14 +365,18 @@ gather 量是 `q_block=2048` 的 16 倍（S=38912 下一遍 33 GB），所以 `h
 - 8 / 4 bit 量化的误差量级；`BlockWeights.from_tensors` 对缺失和多余的 tensor 报错。
 - 满预算的稀疏 plan 与稠密一致；部分预算确实改变结果；tile 不整除 `used` 或 plan 的
   query tile 数不对时报错。
+- 把同一个 plan 拆成两个头组（恒等排列）与单 plan 路径**逐位相等**；`LayerPlan` 的
+  头数、`scatter` 长度不对时报错。
 
-`tests/unit/test_mlx_veda_plan.py`（4 个）：
+`tests/unit/test_mlx_veda_plan.py`（6 个）：
 
 - plan 展开出来的逐行掩码与 `veda.mask.dense_block_mask`（再按 `slot_valid` 掩掉
   padding 行）**逐位相等**（`torch.equal`）。
 - 用该 plan 跑 gather 版，与同一掩码下的稠密 attention 逐位相等。
 - 满预算时各头选择相同，head 轴会被收起来（一次 gather 服务整组头）。
 - 选择没有覆盖全部视频 query tile 时报错。
+- 一层两种 tile 形状：两个头组各自排列，每组的结果与"该组掩码下的稠密 attention
+  再反排列"**逐位相等**，头也回到输入顺序；头组不构成划分时报错。
 
 `tests/unit/test_mlx_sparse_attention.py`（13 个）：
 
@@ -418,10 +448,9 @@ gather 量是 `q_block=2048` 的 16 倍（S=38912 下一遍 33 GB），所以 `h
 - 接上 `miowtion/infer` 的去噪循环（目前只有 block 级前向，没有时间步循环、
   文本条件和 VAE 解码）。
 - AdaLN 表的预计算目前还在 torch 侧，MLX 侧只消费表；考虑一并搬过来。
-- `veda_plan` 只覆盖"一个头组、一个排列"。`TilePlan` 允许每层有两种 tile 形状，
-  也就是两个排列、两个 plan；`block_forward` 目前只接受一个 plan，且不做排列 /
-  反排列。要跑真实模型还需要：按头组切分 QKV、各自 gather 排列、算完再 scatter
-  回去。
+- `LayerPlan` 的头组还要由调用方自己拼（预测器在 torch 侧）。缺的是把
+  `TilePlan.head_groups` + `ClipTiling` + 预测器打分串成一个"给定层号返回
+  `LayerPlan`"的入口；MLX 侧的打分器本身也还没移植。
 - `q_block=128` 的 gather 量是 `q_block=2048` 的 16 倍。可以把 16 个相邻 query
   tile 的选择取并集，共享一次 gather，再对每个 tile 单独调一次 SDPA（掩码仍然按
   tile）。并集能省多少取决于相邻 query tile 的选择有多重合，随机打分器上并集≈全集，

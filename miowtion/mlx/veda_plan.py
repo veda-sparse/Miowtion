@@ -30,6 +30,8 @@ layer needs one plan per head group -- see docs/features/mlx_inference.md.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import torch
 
 from miowtion.mlx import interop
@@ -89,3 +91,49 @@ def plan_from_selection(selection: veda_mask.Selection,
         keep=interop.from_torch(keep),
         key_valid=interop.from_torch(layout.slot_valid.to(torch.bool)),
         dense_rows=layout.n_global_tiles * tiling.TILE_SIZE)
+
+
+def head_group_plan(heads: Sequence[int], selection: veda_mask.Selection,
+                    layout: tiling.TileLayout, share_heads: bool = True
+                    ) -> sparse_attention.HeadGroupPlan:
+    """Builds one head group's permutation and plan.
+
+    Args:
+        heads: Global head ids of the group, in the order the selection's
+            head axis uses.
+        selection: The group's selection (H' = len(heads) heads).
+        layout: The tile layout of the group's tile shape.
+        share_heads: See `plan_from_selection`.
+
+    Returns:
+        The head group plan, which permutes packed rows into tile order and
+        back around the sparse attention.
+
+    Raises:
+        ValueError: If the selection's head count does not match `heads`, or
+            if some real row is not covered by a tile.
+    """
+    if selection.index.shape[0] != len(heads):
+        raise ValueError(f'selection has {selection.index.shape[0]} heads, '
+                         f'expected {len(heads)}')
+    plan = plan_from_selection(selection, layout, share_heads)
+    num_slots = layout.num_slots
+    # Rows that no tile covers would read from the zero row appended to the
+    # output; with build_tile_layout every real row is tiled, so treat a gap
+    # as a bug in the caller's layout rather than silently zeroing it.
+    scatter = torch.full((layout.used,), num_slots, dtype=torch.int32)
+    slots = torch.nonzero(layout.slot_valid.to(torch.bool)).view(-1)
+    scatter[layout.perm[slots]] = slots.to(torch.int32)
+    if bool((scatter == num_slots).any()):
+        raise ValueError('the tile layout leaves real rows untiled')
+    return sparse_attention.HeadGroupPlan(
+        heads=tuple(int(h) for h in heads),
+        gather=interop.from_torch(layout.gather_index.to(torch.int32)),
+        scatter=interop.from_torch(scatter),
+        plan=plan)
+
+
+def layer_plan(groups: Sequence[sparse_attention.HeadGroupPlan],
+               num_heads: int) -> sparse_attention.LayerPlan:
+    """The plan of one layer; `groups` must partition the layer's heads."""
+    return sparse_attention.LayerPlan(tuple(groups), num_heads)

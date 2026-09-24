@@ -333,3 +333,137 @@ def suggest_q_block(seq_len: int, density: float, k_block: int) -> int:
     """
     target = max(k_block, int(math.sqrt(seq_len * density * k_block)))
     return 1 << max(int(target).bit_length() - 1, int(math.log2(k_block)))
+
+
+@dataclasses.dataclass(frozen=True)
+class HeadGroupPlan:
+    """One head group's permutation and selection.
+
+    Veda's tile plan gives a layer up to two tile shapes, so the heads of a
+    layer split into groups that each see a *different* permutation of the
+    sequence. The permutation is part of the plan, not of the block: the
+    block keeps q / k / v in packed order and every group permutes its own
+    heads in and out.
+
+    Attributes:
+        heads: Ascending global head ids of the group.
+        gather: [num_slots] int32 packed row of every permuted slot. Padding
+            slots point at row 0; `plan.key_valid` keeps them out of the
+            softmax, so their value never matters.
+        scatter: [rows] int32 permuted slot of every packed row. Rows that
+            no tile covers point at `num_slots`, a zero row appended to the
+            output.
+        plan: The selection, on the permuted sequence.
+    """
+
+    heads: tuple[int, ...]
+    gather: mx.array
+    scatter: mx.array
+    plan: SparsePlan
+
+
+@dataclasses.dataclass(frozen=True)
+class LayerPlan:
+    """The head groups of one layer; the groups must partition the heads.
+
+    Raises:
+        ValueError: If the groups do not partition [0, num_heads).
+    """
+
+    groups: tuple[HeadGroupPlan, ...]
+    num_heads: int
+
+    def __post_init__(self):
+        seen = sorted(h for g in self.groups for h in g.heads)
+        if seen != list(range(self.num_heads)):
+            raise ValueError(f'head groups {seen} do not partition '
+                             f'[0, {self.num_heads})')
+
+    def density(self, seq_len: int | None = None) -> float:
+        """Kept fraction of the attention matrix, averaged over the heads.
+
+        Args:
+            seq_len: Ignored; every group knows how many rows its own
+                permutation has. The argument only keeps the signature
+                interchangeable with SparsePlan.density.
+        """
+        del seq_len
+        kept = sum(len(g.heads) * g.plan.density(g.gather.shape[0])
+                   for g in self.groups)
+        return kept / self.num_heads
+
+
+def group_attention(group: HeadGroupPlan, q: mx.array, k: mx.array,
+                    v: mx.array, scale: float | None = None,
+                    head_chunk: int | None = None) -> mx.array:
+    """Block-sparse attention of one head group, in packed row order.
+
+    Args:
+        q: [heads, rows, head_dim] packed rows of this group's heads only.
+        k: Same shape as q.
+        v: Same shape as q.
+        scale: Query scale; defaults to head_dim ** -0.5.
+        head_chunk: Heads per gather inside the group.
+
+    Returns:
+        [heads, rows, head_dim] in q's dtype.
+    """
+    plan = group.plan
+    permuted = [mx.take(x, group.gather, axis=1) for x in (q, k, v)]
+    out = block_sparse_attention(*permuted, plan.index, q_block=plan.q_block,
+                                 k_block=plan.k_block, scale=scale,
+                                 head_chunk=head_chunk, keep=plan.keep,
+                                 key_valid=plan.key_valid,
+                                 dense_rows=plan.dense_rows)
+    del permuted
+    zero = mx.zeros((out.shape[0], 1, out.shape[2]), dtype=out.dtype)
+    return mx.take(mx.concatenate([out, zero], axis=1), group.scatter, axis=1)
+
+
+def layer_attention(layer: LayerPlan, q: mx.array, k: mx.array, v: mx.array,
+                    head_start: int = 0, scale: float | None = None,
+                    head_chunk: int | None = None) -> mx.array:
+    """Block-sparse attention of a contiguous range of a layer's heads.
+
+    Args:
+        layer: The layer's head groups.
+        q: [heads, rows, head_dim] of heads
+            [head_start, head_start + heads).
+        k: Same shape as q.
+        v: Same shape as q.
+        head_start: Global id of q's first head.
+        scale: Query scale; defaults to head_dim ** -0.5.
+        head_chunk: Heads per gather inside a group.
+
+    Returns:
+        [heads, rows, head_dim], the heads back in their input order.
+
+    Raises:
+        ValueError: If the range runs past the layer's heads.
+    """
+    heads = q.shape[0]
+    stop = head_start + heads
+    if head_start < 0 or stop > layer.num_heads:
+        raise ValueError(f'heads [{head_start}, {stop}) outside '
+                         f'[0, {layer.num_heads})')
+    parts, order = [], []
+    for group in layer.groups:
+        local = [h - head_start for h in group.heads if head_start <= h < stop]
+        if not local:
+            continue
+        if len(local) == heads:
+            sub = (q, k, v)
+        else:
+            pick = mx.array(local, dtype=mx.int32)
+            sub = tuple(mx.take(x, pick, axis=0) for x in (q, k, v))
+        parts.append(group_attention(group, *sub, scale=scale,
+                                     head_chunk=head_chunk))
+        order += local
+    if len(parts) == 1:
+        return parts[0]
+    # The groups took the heads out of order; put them back.
+    out = mx.concatenate(parts, axis=0)
+    inverse = [0] * heads
+    for position, head in enumerate(order):
+        inverse[head] = position
+    return mx.take(out, mx.array(inverse, dtype=mx.int32), axis=0)
