@@ -154,3 +154,45 @@ def test_layer_plan_needs_a_partition_of_the_heads():
         veda_plan.layer_plan([group], _HEADS)
     with pytest.raises(ValueError):
         veda_plan.head_group_plan([0], _selection(layout, heads=2), layout)
+
+
+def test_layer_plan_from_scores_follows_the_tile_plan():
+    # The same sequence SparseStudent runs, stopping at the selection: two
+    # tile shapes in one layer must give two head groups, each with its own
+    # layout, and the heads must come back in the plan's order.
+    from miowtion.h3 import geometry
+    from miowtion.h3 import layout as h3_layout
+    from miowtion.veda import attention as veda_attention
+    from miowtion.veda import plan as veda_tile_plan
+
+    geo = geometry.Geometry('16:9', 512, 256, 39, 12, 16, 32, 20)
+    packed = h3_layout.pack(torch.ones(30, dtype=torch.long), geo)
+    clip = veda_attention.ClipTiling(
+        packed, veda_attention.VedaConfig(
+            target_budget=veda_mask.Budget(ratio=0.25)), torch.device('cpu'))
+    shapes = [tiling.TileShape(4, 4, 8), tiling.TileShape(2, 8, 8)]
+    tile_plan = veda_tile_plan.TilePlan(geo.name, geo.video_grid, shapes,
+                                        [[0, 1, 1, 0]], {})
+
+    def scores(layout, heads):
+        torch.manual_seed(int(heads.sum()))
+        return torch.randn(len(heads), layout.n_video_tiles, layout.n_tiles)
+
+    layer = veda_plan.layer_plan_from_scores(tile_plan, clip, 0, scores)
+    assert layer.num_heads == 4
+    assert [g.heads for g in layer.groups] == [(0, 3), (1, 2)]
+    for group, shape in zip(layer.groups, shapes):
+        assert group.gather.shape == (clip.get(shape).num_slots,)
+        assert group.scatter.shape == (packed.used,)
+    assert 0.0 < layer.density() < 1.0
+
+    mx.random.seed(0)
+    q, k, v = (mx.random.normal((4, packed.used, 128)) for _ in range(3))
+    mx.eval(q, k, v)
+    got = sa.layer_attention(layer, q, k, v)
+    for group in layer.groups:
+        heads = mx.array(list(group.heads))
+        want = _reference(group, *(mx.take(x, heads, axis=0)
+                                   for x in (q, k, v)))
+        mx.eval(want)
+        assert mx.array_equal(mx.take(got, heads, axis=0), want).item()

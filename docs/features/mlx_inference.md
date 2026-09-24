@@ -78,7 +78,7 @@ round 到 bf16：RMSNorm 的统计量和乘权重在 fp32 里算、只 round 一
 |---|---|
 | `miowtion/mlx/block.py` | 一个 trunk block 的前向；`BlockWeights`（发布 layout，含量化）、`BlockOptions`（head / row 分块） |
 | `miowtion/mlx/sparse_attention.py` | Veda 块稀疏：`SparsePlan`、`HeadGroupPlan` / `LayerPlan`（每层两个头组、各自的排列）、gather 版 `block_sparse_attention`、稠密参考、代价模型 |
-| `miowtion/mlx/veda_plan.py` | 把 `veda.mask.Selection` 转成 `SparsePlan` / `LayerPlan`（真实 Veda 掩码的唯一入口） |
+| `miowtion/mlx/veda_plan.py` | 把 `veda.mask.Selection` 转成 `SparsePlan` / `LayerPlan`；`layer_plan_from_scores` 从 `TilePlan` + `ClipTiling` + 打分直接得到一层的 plan（真实 Veda 掩码的唯一入口） |
 | `miowtion/mlx/interop.py` | torch ↔ MLX 的逐位转换（numpy 没有 bf16，按 16 bit 原始位走） |
 | `miowtion/mlx/slab.py` | slab 格式、`SlabReader`（pread 进预分配 buffer）、`BlockPrefetcher`、`convert_checkpoint` |
 | `miowtion/mlx/offload.py` | 不转换的替代方案：直接读发布的 safetensors（`mx.load` 惰性加载 / 每个分片一个 mmap） |
@@ -368,7 +368,7 @@ block 一个 plan"，而是 `LayerPlan`：每个头组带自己的 `gather` / `s
 - 把同一个 plan 拆成两个头组（恒等排列）与单 plan 路径**逐位相等**；`LayerPlan` 的
   头数、`scatter` 长度不对时报错。
 
-`tests/unit/test_mlx_veda_plan.py`（6 个）：
+`tests/unit/test_mlx_veda_plan.py`（7 个）：
 
 - plan 展开出来的逐行掩码与 `veda.mask.dense_block_mask`（再按 `slot_valid` 掩掉
   padding 行）**逐位相等**（`torch.equal`）。
@@ -377,6 +377,8 @@ block 一个 plan"，而是 `LayerPlan`：每个头组带自己的 `gather` / `s
 - 选择没有覆盖全部视频 query tile 时报错。
 - 一层两种 tile 形状：两个头组各自排列，每组的结果与"该组掩码下的稠密 attention
   再反排列"**逐位相等**，头也回到输入顺序；头组不构成划分时报错。
+- `layer_plan_from_scores` 走真实几何（16:9、`h3.layout.pack`、`ClipTiling`、
+  `TilePlan` 两种形状）：头组、排列长度、密度都对，跑出来的 attention 同样逐位相等。
 
 `tests/unit/test_mlx_sparse_attention.py`（13 个）：
 
@@ -448,9 +450,9 @@ block 一个 plan"，而是 `LayerPlan`：每个头组带自己的 `gather` / `s
 - 接上 `miowtion/infer` 的去噪循环（目前只有 block 级前向，没有时间步循环、
   文本条件和 VAE 解码）。
 - AdaLN 表的预计算目前还在 torch 侧，MLX 侧只消费表；考虑一并搬过来。
-- `LayerPlan` 的头组还要由调用方自己拼（预测器在 torch 侧）。缺的是把
-  `TilePlan.head_groups` + `ClipTiling` + 预测器打分串成一个"给定层号返回
-  `LayerPlan`"的入口；MLX 侧的打分器本身也还没移植。
+- 打分器本身还在 torch 侧：`layer_plan_from_scores` 接受一个"给定 tile layout 和
+  头号返回 logits"的回调，真实运行时要么把 `veda.predictor` 移植到 MLX，要么每层
+  往返一次 torch（后者会把排列的 3 % 开销变成一次真正的同步，得先测）。
 - `q_block=128` 的 gather 量是 `q_block=2048` 的 16 倍。可以把 16 个相邻 query
   tile 的选择取并集，共享一次 gather，再对每个 tile 单独调一次 SDPA（掩码仍然按
   tile）。并集能省多少取决于相邻 query tile 的选择有多重合，随机打分器上并集≈全集，

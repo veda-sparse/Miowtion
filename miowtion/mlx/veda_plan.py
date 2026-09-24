@@ -30,13 +30,15 @@ layer needs one plan per head group -- see docs/features/mlx_inference.md.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 import torch
 
 from miowtion.mlx import interop
 from miowtion.mlx import sparse_attention
+from miowtion.veda import attention as veda_attention
 from miowtion.veda import mask as veda_mask
+from miowtion.veda import plan as veda_tile_plan
 from miowtion.veda import tiling
 
 
@@ -137,3 +139,41 @@ def layer_plan(groups: Sequence[sparse_attention.HeadGroupPlan],
                num_heads: int) -> sparse_attention.LayerPlan:
     """The plan of one layer; `groups` must partition the layer's heads."""
     return sparse_attention.LayerPlan(tuple(groups), num_heads)
+
+
+def layer_plan_from_scores(tile_plan: veda_tile_plan.TilePlan,
+                           clip: veda_attention.ClipTiling, layer: int,
+                           scores: Callable[[tiling.TileLayout, torch.Tensor],
+                                            torch.Tensor],
+                           share_heads: bool = True
+                           ) -> sparse_attention.LayerPlan:
+    """Builds one layer's plan from a tile plan and a tile scorer.
+
+    This is the same sequence `veda.attention.SparseStudent` runs -- one
+    tile layout per head group, the predictor's logits, then the top-k per
+    column block -- but it stops at the selection and hands it to MLX
+    instead of to the FA4 kernel. The scoring itself stays on the torch
+    side, so the predictor does not have to be ported to run the block.
+
+    Args:
+        tile_plan: The geometry's tile plan.
+        clip: Tile layouts of the clip (one per tile shape).
+        layer: Trunk layer index.
+        scores: Called with a head group's tile layout and its head ids;
+            returns [H', rows, n_tiles] logits with at least
+            `n_video_tiles` rows (extra rows are ignored, as in
+            SparseStudent).
+        share_heads: See `plan_from_selection`.
+
+    Returns:
+        The layer's plan, one head group at a time.
+    """
+    groups = []
+    for group in tile_plan.head_groups(layer, clip.device):
+        layout = clip.get(group.shape)
+        logits = scores(layout, group.heads)
+        selection = veda_mask.select_video_blocks(
+            logits[:, :layout.n_video_tiles], layout, clip.blocks(layout))
+        groups.append(head_group_plan(group.heads.tolist(), selection,
+                                      layout, share_heads))
+    return layer_plan(groups, len(tile_plan.head_shape[layer]))
