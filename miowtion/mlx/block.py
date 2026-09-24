@@ -193,15 +193,18 @@ class BlockOptions:
             None processes all heads at once.
         row_chunk: Rows per chunk of the row-local work.
         eval_chunks: Evaluate every chunk before building the next one, so
-            that at most one chunk's temporaries are alive (bounds peak
-            unified memory on long clips; costs one GPU sync per chunk).
+            that at most one chunk's temporaries are alive. Defaults to True:
+            without it MLX's lazy graph keeps every chunk's temporaries alive
+            until the final eval, which defeats the chunking entirely (S=38912
+            peaks at 6.44 GB instead of 4.43 GB). It is also marginally
+            faster, so there is no reason to turn it off outside experiments.
         sparse: Veda block-sparse attention plan; None runs dense attention.
             Requires `used` to be a multiple of both tile sizes.
     """
 
     head_chunk: int | None = None
     row_chunk: int = DEFAULT_ROW_CHUNK
-    eval_chunks: bool = False
+    eval_chunks: bool = True
     sparse: sparse_attention.SparsePlan | None = None
 
 

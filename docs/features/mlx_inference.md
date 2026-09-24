@@ -138,6 +138,19 @@ round 到 bf16：RMSNorm 的统计量和乘权重在 fp32 里算、只 round 一
 进程峰值 6.21 GB，分块后降到 2.57 / 3.56 GB，而时间还略快一点（3.925 vs 4.009 s）。
 在 18 GB 的机器上这是能不能跑长序列的区别。
 
+**光分块还不够，必须同时开 `eval_chunks`**：MLX 的图是惰性的，不在每个 chunk 之后
+`mx.eval`，所有 chunk 的中间量会一直活到最后一次 eval，分块等于白做。实测（稀疏、
+`head_chunk=8, row_chunk=4096`）：
+
+| 序列长度 | 关（进程峰值 / 时间） | 开 |
+|---|---|---|
+| 4 096 | 2.78 GB / 0.590 s | 2.53 GB / 0.583 s |
+| 16 384 | 4.15 GB / 2.505 s | **3.06 GB** / 2.471 s |
+| 38 912 | 6.44 GB / 6.617 s | **4.43 GB** / 6.458 s |
+
+每个尺寸都是又省内存又快一点，所以 `BlockOptions.eval_chunks` 的默认值是 **True**，
+命令行用 `--no-eval-chunks` 才关掉（只为做对照实验）。
+
 量化**不会让计算变快**（M3 Pro 上 GEMM 已经是算力受限，不是带宽受限）：
 
 | 序列长度 | bf16 | 8 bit（quantized matmul） | 4 bit |
@@ -175,6 +188,51 @@ S=38080 下 8 bit 的进程峰值是 3.59 GB，bf16 是 4.51 GB。
 稀疏之后 attention 只剩 14 % 的时间，**剩下的 86 % 是 GEMM**（S=38912 下
 qkv 1.55 s + out 0.55 s + MLP 3.13 s ≈ 5.67 s）。而量化过的 GEMM 并不更快（见上），
 所以 6.62 s 就是这台机器在这个序列长度上的地板；再想快只能降分辨率或换机器。
+
+### GEMM 已经到顶，NPU 也帮不上忙
+
+稀疏之后 86 % 的时间是 GEMM，所以单独测了 MLX 的裸 GEMM：**所有形状都是平的
+5.88 TFLOPS**（block 的四个 linear、以及 2048/4096/8192 的方阵），block 前向里的
+GEMM 时间和裸 GEMM 相差不到 2 %。换 dtype 也没用：
+
+| 方阵 | fp32 | fp16 | bf16 |
+|---|---|---|---|
+| 4 096 | 5.18 | 5.91 | 5.93 |
+| 8 192 | 3.57 | 5.96 | 5.96 |
+
+18 核的 M3 Pro GPU 理论 FMA 峰值约 6.45 TFLOPS，5.96 已经是 **92 %**；而且
+fp16/bf16 与 fp32 同速——这代 Apple GPU 没有 NVIDIA tensor core 那种半精度双倍吞吐
+（GPU 内的矩阵乘单元要到 M5 的 Neural Accelerators 才有）。所以 `mx.compile`、换
+tile 形状之类的优化没有空间，**6.62 s / block 就是这台机器的地板**。
+
+Neural Engine 同样不是出路。用 CoreML 把同一个 fc1 形状的 fp16 GEMM 分别跑在三个
+后端上：
+
+| 后端 | 时间 | 吞吐 | 编译 + 加载 |
+|---|---|---|---|
+| ANE（`CPU_AND_NE`） | 334.8 ms | 3.30 TFLOPS | 33.8 s |
+| GPU（`CPU_AND_GPU`） | 188.3 ms | 5.87 TFLOPS | 3.9 s |
+| CPU | 325.4 ms | 3.40 TFLOPS | 4.4 s |
+
+**ANE 比 GPU 慢 1.8 倍**（标称的 18 TOPS 是 int8 峰值，不是 fp16 稠密 GEMM）。即使
+它更快也用不了：MLX 没有 ANE 后端，唯一的入口 CoreML 要求权重编译进模型，而本方案
+的前提正是按 block 从 NVMe 换权重——上表里一个 4 次 matmul 的模型编译加载就要
+33.8 s，400 次换权重的代价远超任何收益。ANE 还只有 fp16，会破坏与 torch 的数值对齐。
+
+### 18 GB 上的序列长度上限
+
+开了稀疏和 `eval_chunks`（`head_chunk=8, row_chunk=4096, q_block=2048`，
+密度 10 %）之后：
+
+| 序列长度 | 每 block | 进程峰值 | 400 次前向外推 |
+|---|---|---|---|
+| 38 912 | 6.46 s | 4.43 GB | 43 min |
+| 49 152 | 8.39 s | 4.50 GB | 56 min |
+| 65 536 | 12.81 s | 5.55 GB | 85 min |
+| 98 304 | 19.86 s | **8.03 GB** | 132 min |
+
+98 304 token 大致是 16:9 / 14.4 s 的 clip，也就是说**内存不再是这台机器的限制，
+时间才是**：峰值 8 GB 离 18 GB 还有余量，但一次生成要两个多小时。
 
 ### 端到端流式（预取 depth=1，2 个 slot）
 
@@ -230,8 +288,9 @@ qkv 1.55 s + out 0.55 s + MLP 3.13 s ≈ 5.67 s）。而量化过的 GEMM 并不
 - 不要用 mmap 方案。不想做 checkpoint 转换时用 `mx.load`（一样快），代价是走
   page cache 且不能后台预取。
 - 读参数保持 16 MiB 一块、4 线程；调小会直接掉带宽。
-- 内存主要被激活占，不是被权重占：在 18 GB 机器上真正的上限来自序列长度，务必开
-  分块。
+- 内存主要被激活占，不是被权重占：务必开分块，并且**保持 `eval_chunks=True`**
+  （默认值）——不在 chunk 之间 eval 的话分块等于白做。开了之后 98 304 token 的峰值
+  只有 8 GB，18 GB 机器的限制已经从内存变成时间。
 - **块稀疏用 gather 版（`BlockOptions.sparse`），`q_block` 取 2048 或更大**；小
   `q_block` 既慢又吃内存。gather 缓冲配合 `head_chunk` 一起压。
 
@@ -281,6 +340,14 @@ qkv 1.55 s + out 0.55 s + MLP 3.13 s ≈ 5.67 s）。而量化过的 GEMM 并不
 - **稀疏的 `q_block` 不能太小**。现象：S=16384、密度 10 % 时 `q_block=512` 比
   `q_block=4096` 慢 46 %、峰值内存多 2.7 GB。原因：gather 的量正比于 `S/q_block`。
   对策：`q_block` 取 2048 以上，并用 `head_chunk` 压峰值。
+- **分了块但峰值内存没下来**。现象：S=38912 开了 `head_chunk=8, row_chunk=4096`，
+  峰值仍然 6.44 GB；S=49152 到 9.38 GB。排查时先怀疑 QKV 没分块，读了
+  `block_forward` 才排除。原因：MLX 的图是惰性的，不在每个 chunk 之后 `mx.eval`，
+  所有 chunk 的中间量会一直活到最后一次 eval，分块只是换了个构图顺序。对策：
+  `BlockOptions.eval_chunks` 默认 True（S=38912 峰值 6.44 → 4.43 GB，还快 2 %）。
+- **不要指望 GEMM 优化或 ANE**。花时间测了裸 GEMM（5.88 TFLOPS，各形状都一样）
+  和 CoreML 的三个后端，结论是 GEMM 已经到理论峰值的 92 %、ANE 比 GPU 还慢
+  1.8 倍。对策：记在这里，不要再试第二遍。
 - **numpy 没有 bfloat16**。torch ↔ MLX 只能按 16 bit 原始位搬（两边都 view 成
   int16），否则会经过 fp32 损失精度。见 `interop.py`。
 - **`mx.load` 的返回值要及时丢掉**。它是惰性的，但 evaluate 过的 array 会一直持有
@@ -303,9 +370,9 @@ qkv 1.55 s + out 0.55 s + MLP 3.13 s ≈ 5.67 s）。而量化过的 GEMM 并不
   AGENTS.md 1.5 做人工可视化确认。
 - 接上 `miowtion/infer` 的去噪循环（目前只有 block 级前向，没有时间步循环、
   文本条件和 VAE 解码）。
-- 测 S=65536 及以上，确认 18 GB 上真正的序列上限。
 - AdaLN 表的预计算目前还在 torch 侧，MLX 侧只消费表；考虑一并搬过来。
-- 稀疏的 `index` 目前是测速用的随机选择；接上 Veda 打分器产出的真实 plan（以及
-  按头不同的 tile 形状）还没做。
-- 稀疏之后 GEMM 占 86 %，值得测一下 MLX 有没有更快的 GEMM 路径（`mx.compile`、
-  不同的 tile 形状）。
+- 稀疏的 `index` 目前是测速用的随机选择；接上 Veda 打分器产出的真实 plan 还没做。
+  难点是 Veda 的三处非均匀性：tile 几何按头组不同、Bresenham 预算逐 query tile
+  ±1 且分摊在两个列块上、全局文本 / 音频的行列是稠密的且不出现在 `Selection.index`
+  里。gather 版要求每个 query tile 的预算相同，所以需要一层左对齐补齐（可以参考
+  `kernels/fa4.index_lists` 已有的 `full_idx` / `partial_idx` 打包）。

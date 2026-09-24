@@ -99,7 +99,9 @@ def main():
         p.add_argument('--k-block', type=int, default=128)
         p.add_argument('--row-chunk', type=int,
                        default=mlx_block.DEFAULT_ROW_CHUNK)
-        p.add_argument('--eval-chunks', action='store_true')
+        p.add_argument('--no-eval-chunks', dest='eval_chunks',
+                       action='store_false',
+                       help='keep every chunk lazy (raises peak memory)')
         if name == 'compute':
             p.add_argument('--seq-len', type=int, nargs='+', required=True)
             p.add_argument('--bits', type=int, default=0, choices=(0, 4, 8))

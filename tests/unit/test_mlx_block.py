@@ -116,7 +116,11 @@ def test_chunking_does_not_change_the_result():
     whole = _mlx_forward(torch.bfloat16)
     for options in (mlx_block.BlockOptions(head_chunk=1, row_chunk=_SEQ),
                     mlx_block.BlockOptions(head_chunk=2, row_chunk=7,
-                                           eval_chunks=True)):
+                                           eval_chunks=True),
+                    # Where the graph is evaluated is a memory/latency knob
+                    # only; it must not move a single bit of the result.
+                    mlx_block.BlockOptions(head_chunk=2, row_chunk=7,
+                                           eval_chunks=False)):
         assert _rel_l2(_mlx_forward(torch.bfloat16, options), whole) < 1e-3
 
 

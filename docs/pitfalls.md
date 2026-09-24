@@ -84,4 +84,6 @@
 | 逐 block 读完后内存持续增长 | `mx.load` 惰性，但 evaluate 过的 array 会一直持有数据 | 每个 block 用完即丢掉返回的 dict，不要缓存 | [mlx_inference](features/mlx_inference.md) |
 | 给 MLX 的融合 attention 上 90 % 稀疏的块掩码，时间只降到 0.97 倍 | 掩码在 Q@K.T 矩阵乘之后才施加，只有内置 `"causal"` 会缩短 key 循环上界 | 按固定预算把选中的 key tile gather 成规整批量问题，走一次稠密 kernel，拿到 9–10 倍 | [mlx_inference](features/mlx_inference.md) |
 | 块稀疏开了反而吃内存、加速不明显 | `q_block` 太小，gather 量正比于 `S/q_block` | `q_block` 取 2048 以上，再用 `head_chunk` 压峰值 | [mlx_inference](features/mlx_inference.md) |
+| 分了块，峰值内存却没下来（S=38912 仍然 6.44 GB） | MLX 的图是惰性的，不在 chunk 之间 eval，所有 chunk 的中间量活到最后 | `BlockOptions.eval_chunks` 默认 True，每个 chunk 算完就 `mx.eval`；峰值降到 4.43 GB 且更快 | [mlx_inference](features/mlx_inference.md) |
+| 想靠 GEMM 优化 / ANE 再提速 | MLX GEMM 已跑到 5.9 TFLOPS（理论峰值的 92%），ANE 只有 3.3 TFLOPS 且权重被编译进模型 | 不要在这两条路上花时间，瓶颈只能靠稀疏度和序列长度解决 | [mlx_inference](features/mlx_inference.md) |
 | torch ↔ MLX 转换后 bf16 精度变差 | numpy 没有 bfloat16，默认路径经过 fp32 | 两边 view 成 int16，按原始 16 bit 搬运 | [mlx_inference](features/mlx_inference.md) |
