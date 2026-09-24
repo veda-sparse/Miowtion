@@ -43,12 +43,27 @@
   （竖屏视频的注意力局部性不一定是横屏的转置），是用户选择的省时做法。
 - 方案文件里记录的保留比例只作来源信息，训练一律使用运行时参数。
 
+### 头组补齐长度不同时，预算保证 kernel 代价相同
+两个头组的 `N = n_tiles × 128` 可以不同，所以"每行保留几个块"不能是一个常数：
+`Budget.per_row = ratio × n_ideal² / n_tiles`（`n_ideal = ceil(真实 token 数 / 128)`）。
+补齐更多的那一组 `n_tiles` 更大、每行保留更少，乘回去 `n_tiles × per_row = ratio × n_ideal²`
+对所有头组相同。**补齐买不到额外预算**，两组的 kernel 代价也相同。
+
 ## 测试
 `tests/unit/test_veda_tiling_plan.py`：36 种形状、补齐量（(1,8,16)→333、(8,4,4)→330 个 tile）、
 排列覆盖、前缀性质、tile 是 3D 盒子、全局在后/参考在前、gather/scatter 往返、方案限制与选择规则。
+`tests/unit/test_veda_heatmap_attention.py` 里 `_unequal_plan()` 的三个用例覆盖**两个头组补齐后
+长度不同**这一条（见下面的踩坑记录）：n_tiles 相差 1、前缀性质、排列是 `[0, used)` 的双射、
+上面那条等代价关系，以及 SparseStudent（保留全部 = 稠密）和 TeacherCollector（教师那一路逐位等于
+稠密，两个头组各有一条 recall，梯度只到打分器）。
 
 ## 踩坑记录
 - `TileLayout` 需要带上 `used`，搜索和测试都要用它计算 pad 段。
+- **"每头不同形状"的测试其实没测到变长**：原有的混合形状用例都跑在 (12, 8, 16) 网格上，而
+  4x4x8 和 2x8x8 在这个网格上都恰好是 12 个 tile、补齐为 0，所以两个头组的 N 相同，真正要验证的
+  "补齐后长度不同"从来没被执行到。改用 latent_t = 11 的网格：4x4x8 要补一整个 t 块（12 个 tile，
+  末尾是 partial），1x8x16 恰好整除（11 个 tile）。
+- `partial_tiles` 存的是 tile 下标而不是掩码，断言里要用 `numel()`，`sum()` 是在加下标。
 
 ## 验证记录
 - 2026-09-23，macOS CPU：unit 全部通过。

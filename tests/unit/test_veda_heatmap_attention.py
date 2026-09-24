@@ -203,3 +203,89 @@ def test_sparse_student_head_chunks_are_exact(monkeypatch):
         monkeypatch.setattr(veda_attention, '_COLLECT_BYTES', 1)
         chunked = student(q, k, v, 0)
     assert torch.equal(chunked, whole)
+
+
+def _unequal_plan():
+    """A layer whose two head groups pad to different lengths.
+
+    The existing mixed-shape tests run on a (12, 8, 16) grid, where both
+    shapes happen to tile it exactly, so they never exercise the case the
+    layouts are built for: latent_t = 11 makes 4x4x8 pad a whole t-block
+    (12 tiles, partial tiles at the end) while 1x8x16 fits exactly (11).
+    """
+    from miowtion.h3 import geometry
+    from miowtion.h3 import layout as h3_layout
+    from miowtion.veda import plan as veda_plan
+    geo = geometry.Geometry('16:9', 512, 256, 39, 11, 16, 32, 20)
+    lay = h3_layout.pack(torch.ones(300, dtype=torch.long), geo)
+    plan = veda_plan.TilePlan(geo.name, geo.video_grid,
+                              [tiling.TileShape(4, 4, 8),
+                               tiling.TileShape(1, 8, 16)],
+                              [[0, 1, 1, 0]])
+    return lay, plan
+
+
+def test_head_groups_of_unequal_padded_length():
+    """Different N per group, and a budget that equalizes kernel cost."""
+    lay, plan = _unequal_plan()
+    config = veda_attention.VedaConfig(
+        target_budget=veda_mask.Budget(ratio=0.3))
+    clip = veda_attention.ClipTiling(lay, config, torch.device('cpu'))
+    padded, exact = (clip.get(s) for s in plan.shapes)
+    assert padded.n_tiles == exact.n_tiles + 1
+    assert padded.num_slots == padded.n_tiles * tiling.TILE_SIZE
+    assert exact.num_slots == exact.n_tiles * tiling.TILE_SIZE
+    # partial_tiles holds tile indices, not a mask.
+    assert padded.partial_tiles.numel() > exact.partial_tiles.numel()
+    assert int(padded.valid_count.min()) < tiling.TILE_SIZE
+    # Real rows are a prefix of every tile, and no row is lost or doubled.
+    for layout in (padded, exact):
+        rows = layout.perm.view(-1, tiling.TILE_SIZE)
+        assert torch.equal((rows >= 0).sum(1).to(torch.int32),
+                           layout.valid_count)
+        pad = (rows < 0).to(torch.int8)  # pads are a suffix of every tile
+        assert torch.equal(pad, pad.cummax(dim=1).values)
+        assert torch.equal(torch.sort(layout.perm[layout.perm >= 0]).values,
+                           torch.arange(layout.used))
+    # A more padded group gets a smaller per-row keep count, so both groups
+    # cost the same: n_tiles * per_row == ratio * n_ideal^2.
+    costs = []
+    for layout in (padded, exact):
+        block = veda_mask.column_blocks(layout,
+                                        veda_mask.Budget(ratio=0.3))[0]
+        n_cols = block.stop - block.start
+        costs.append(n_cols * block.budget.per_row(block.real_tokens, n_cols))
+    assert costs[0] == pytest.approx(costs[1], rel=1e-12)
+
+
+def test_sparse_student_unequal_groups_keep_all_equals_dense():
+    lay, plan = _unequal_plan()
+    q, k, v = (t.float() for t in _qkv(lay.seq_len, heads=4))
+    pred = veda_predictor.TileScorePredictor(1, 4, 32)
+    dense = h3_attention.dense_attention(q, k, v, lay.used, backend='math')[0]
+    clip = veda_attention.ClipTiling(
+        lay, veda_attention.VedaConfig(
+            target_budget=veda_mask.Budget(ratio=1.0)), torch.device('cpu'))
+    with torch.no_grad():
+        out = veda_attention.SparseStudent(
+            clip, plan, pred, allow_reference_kernel=True)(q, k, v, 0)
+    torch.testing.assert_close(out, dense, rtol=1e-5, atol=1e-5)
+
+
+def test_teacher_collector_unequal_groups():
+    lay, plan = _unequal_plan()
+    q, k, v = _qkv(lay.seq_len, heads=4)
+    pred = veda_predictor.TileScorePredictor(1, 4, 32)
+    config = veda_attention.VedaConfig(
+        target_budget=veda_mask.Budget(ratio=0.3), teacher_q_tiles=0.5,
+        recall_every=1)
+    clip = veda_attention.ClipTiling(lay, config, torch.device('cpu'))
+    collector = veda_attention.TeacherCollector(
+        clip, plan, pred, torch.Generator().manual_seed(0), grad_scale=1.0,
+        dense_backend='math')
+    with torch.no_grad():
+        out = collector(q, k, v, 0)
+    dense = h3_attention.dense_attention(q, k, v, lay.used, backend='math')[0]
+    assert torch.equal(out, dense)  # the teacher pass stays dense
+    assert len(collector.stats.recall) == 2  # one per head group
+    assert pred.layers[0].proj_q.grad.abs().sum() > 0
