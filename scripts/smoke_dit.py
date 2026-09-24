@@ -121,8 +121,9 @@ def main():
     (video_t, _), report['teacher'] = _timed(env, teacher_forward)
     report['teacher']['equals_dense'] = bool(torch.equal(video_t, video_v))
     report['teacher']['kl_mean'] = sum(collector.stats.kl) / cfg.num_layers
-    report['teacher']['recall'] = (sum(collector.stats.recall)
-                                   / max(1, len(collector.stats.recall)))
+    resolved = collector.stats.resolve()
+    report['teacher']['recall'] = (sum(resolved['recall'])
+                                   / max(1, len(resolved['recall'])))
 
     if args.scorer:
         scorer = search.OracleScorer(

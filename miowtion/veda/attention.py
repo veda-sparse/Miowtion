@@ -39,7 +39,7 @@ class VedaConfig:
             group: a fraction of the clip's video tiles when <= 1, else an
             absolute count. Resolved per clip, since tile counts differ ~3x
             between geometries.
-        recall_every: Compute mask recall on every n-th layer (diagnostic).
+        recall_every: Compute the mask diagnostics on every n-th layer.
         dense_layers: Layers that stay dense in the sparse student.
     """
 
@@ -47,7 +47,7 @@ class VedaConfig:
     ref_budget: veda_mask.Budget | None = None
     tile_conditions: bool = False
     teacher_q_tiles: float = 1.0
-    recall_every: int = 4
+    recall_every: int = 1
     dense_layers: frozenset[int] = frozenset()
 
 
@@ -149,10 +149,41 @@ def _gather_lse(lse: torch.Tensor, tile_layout: tiling.TileLayout,
     return out
 
 
+# Diagnostic fields of LayerStats, in the order resolve() transfers them.
+_STAT_FIELDS = ('kl', 'logit_std', 'recall', 'heat_kept', 'heat_ceiling')
+
+
 @dataclasses.dataclass
 class LayerStats:
-    kl: list[float] = dataclasses.field(default_factory=list)
-    recall: list[float] = dataclasses.field(default_factory=list)
+    """Training diagnostics, kept on the device until `resolve()`.
+
+    Every entry is a 0-d device tensor. Reading them one by one would
+    synchronize once per layer and head group (50 layers x 2 groups per
+    micro step), so they are stacked and transferred once at the end.
+
+    `kl` has exactly one entry per layer; the others have one per layer and
+    head group, and only for the layers where they were computed.
+    """
+
+    kl: list[torch.Tensor] = dataclasses.field(default_factory=list)
+    logit_std: list[torch.Tensor] = dataclasses.field(default_factory=list)
+    recall: list[torch.Tensor] = dataclasses.field(default_factory=list)
+    heat_kept: list[torch.Tensor] = dataclasses.field(default_factory=list)
+    heat_ceiling: list[torch.Tensor] = dataclasses.field(default_factory=list)
+
+    def resolve(self) -> dict[str, list[float]]:
+        """Host values of every field, in one device transfer."""
+        fields = {name: getattr(self, name) for name in _STAT_FIELDS}
+        flat = [t for values in fields.values() for t in values]
+        if not flat:
+            return {name: [] for name in fields}
+        host = torch.stack([t.detach().float().reshape(())
+                            for t in flat]).cpu().tolist()
+        out, start = {}, 0
+        for name, values in fields.items():
+            out[name] = host[start:start + len(values)]
+            start += len(values)
+        return out
 
 
 class TeacherCollector:
@@ -167,6 +198,16 @@ class TeacherCollector:
                  predictor: veda_predictor.TileScorePredictor,
                  generator: torch.Generator, grad_scale: float,
                  dense_backend: str = 'auto'):
+        """Initializes the collector.
+
+        Args:
+            clip: Tile layouts and sparsity settings of this clip.
+            plan: Tile shapes per layer and head.
+            predictor: The trained scorer.
+            generator: Draws the supervised query tiles.
+            grad_scale: Scale of every KL backward.
+            dense_backend: Kernel for the teacher's dense attention.
+        """
         self.clip = clip
         self.plan = plan
         self.predictor = predictor
@@ -188,7 +229,7 @@ class TeacherCollector:
         out, lse = h3_attention.dense_attention(
             q, k, v, self.clip.layout.used, return_lse=True,
             backend=self.dense_backend)
-        layer_kl = 0.0
+        layer_kl = None
         for group in self.plan.head_groups(layer_index, self.clip.device):
             tile_layout = self.clip.get(group.shape)
             rows = self._sample_rows(tile_layout)
@@ -208,11 +249,22 @@ class TeacherCollector:
                         feats_q[:, rows], feats_k, heads)
                     kl = heatmap.seer_kl(logits, heat, tile_layout)
                     (kl * (weight * self.grad_scale)).backward()
-                layer_kl += weight * kl.item()
+                # Accumulated on the device: .item() here would synchronize
+                # once per layer and head group.
+                term = kl.detach() * weight
+                layer_kl = term if layer_kl is None else layer_kl + term
+                # A collapsing predictor scores every key tile alike; the
+                # spread of its logits is the cheapest way to see it.
+                self.stats.logit_std.append(
+                    logits.detach().std(dim=-1).mean())
+                # Diagnostics are cheap: they work on the /128 tile grid,
+                # where a top-k costs ~1e-6 of the heat that produced it.
                 if layer_index % self.clip.config.recall_every == 0:
-                    self.stats.recall.append(heatmap.mask_recall(
+                    values = heatmap.mask_diagnostics(
                         logits.detach(), heat, tile_layout,
-                        self.clip.blocks(tile_layout), rows).item())
+                        self.clip.blocks(tile_layout), rows)
+                    for name, value in values.items():
+                        getattr(self.stats, name).append(value)
         self.stats.kl.append(layer_kl)
         return out
 

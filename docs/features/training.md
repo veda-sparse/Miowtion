@@ -119,16 +119,40 @@
 - 样本：MovieGenVideoBench 扩写集中每个 latent_t 各 150 条（10 s 的 150 条单独扩写）；另外随机
   留出 20 条（随机宽高比与时长）只用于最终的稠密 / 稀疏对比，不参与训练。
 - lr 1e-3（用户指定），warmup 20（lr 是参考配方的 10 倍，第一步不能把权重整个替换掉），accum 2
-  （每次 update 4 个状态），每 10 次 update 存一次，`keep_last: 2`（一个 checkpoint 4.2 GB）。
-- `teacher_q_tiles: 0.25`：热力图和打分器 logits 的开销与抽样行数成正比，14.4 s 的 clip 上全部行
-  需要约 45 s/micro-step；抽 25% 的行仍然无偏，每个头每层仍有 75 个以上的 query tile。
+  （每次 update 4 个状态）；warmup 之后是常数 lr，没有衰减。
+- checkpoint：每 50 次 update 存一次，**一个都不删**。权重 + EMA 是训练历史（打分器 275.25M
+  参数 → 1.03 GiB + 1.03 GiB），2000 次 update 共约 82 GiB。Adam 的一阶 / 二阶矩另外占
+  2.05 GiB，单独写在 `optim.pt` 里，只有最近 `keep_optimizer: 2` 个 checkpoint 保留（恢复只会从
+  最新的那个开始），更老的只删 `optim.pt`，目录和 `state.pt` 永远保留。
+- `teacher_q_tiles: 1.0`：监督每一个 query tile。抽样（旧默认 0.25）虽然无偏，但把梯度的方差和
+  诊断量的噪声都放大了；教师热力图本身是 O(S²·D)，抽样省下的那部分不值得用训练信号去换。
 - `offload_blocks: 44`：104k token 时 30 / 40 都会 OOM（先后在 RoPE、TeacherCollector、AdaLN 调制
   处，均已分块修复），44 时峰值 20.9 GiB。多卡时 FSDP 的 copy-in 流让拷贝与计算重叠。
 - 冒烟（`configs/stage1_turbo8_multigeo_smoke_4090.yaml`，每个几何 1 步）：micro-step 1:1 t37
   16 s、16:9 t37 31 s、1:1 t72 36 s、4:3 t72 54 s、1:1 t102 63 s、4:3 t102 81 s、16:9 / 9:16
   t102 150 s；初始 KL 0.94–1.64，recall ≈ 0.52–0.54。
 
+## 训练动态的诊断量（`miowtion/veda/{attention,heatmap}.py`）
+每个 micro-step 记录，日志里每 `log_every` 步汇总一次：
+
+| 字段 | 含义 | 怎么看 |
+|---|---|---|
+| `kl` | 所有层按头数加权平均的 seer KL | 主损失 |
+| `kl_layers` | 逐层 KL（只是 rank 0 自己的 micro-step） | 看深度上哪些层落后；跨 rank 平均只会把几何差异抹平 |
+| `logit_std` | 打分器 logits 在 key tile 维上的标准差 | 塌缩检测：打分器给所有 tile 打一样的分时趋于 0 |
+| `heat_kept` | 预测掩码保住的教师块热量占比 | 真正关心的量：掩码丢掉了多少注意力质量 |
+| `heat_ceiling` | oracle（按教师热量取 top-k）保住的占比 | 当前预算下的上限。`heat_ceiling` 本身低说明教师不够集中，训练救不回来 |
+| `recall` | 预测掩码与 oracle 掩码（去掉对角）的交集 / oracle | 与 `heat_kept` 互补：不加权的命中率 |
+
+代价：这些量都在 **÷128 的压缩 tile 网格**上算（103k token 时是 `[28, 810, 810]` ≈ 18M 元素），
+相对产生它们的 O(S²·D) 教师热力图约 1e-6，可以忽略，所以 `recall_every: 1`，每层都算。真正的开销
+不是 FLOPs 而是**设备同步**：原先每层每头组都 `kl.item()`，并且 `mask_recall` 里对设备张量做了
+Python 分支。现在全部累加成 0 维设备张量，每个 micro-step 只有 `LayerStats.resolve()` 里的一次
+`torch.stack(...).cpu()`。
+
 ## 踩坑记录
+- **诊断量里的 `.item()` 比诊断量本身贵得多**：逐层 `.item()` 会把 CPU 和 GPU 串起来，让前向失去
+  流水；诊断张量一律留在设备上，一个 micro-step 只做一次传输。
 - CPU offload 要求被 offload 的 FSDP 参数先在 CPU 上物化，否则报 "FSDP parameters should be
   materialized on CPU"。
 - 没有 FSDP root 时，`set_modules_to_forward_prefetch` 报 `FSDPCommContext` 缺少

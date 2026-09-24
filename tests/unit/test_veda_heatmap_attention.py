@@ -61,8 +61,10 @@ def test_kl_zero_at_optimum_and_recall_one():
     assert torch.isfinite(logits.grad).all()
     rows = torch.tensor([0, 1, 2])
     blocks = veda_mask.column_blocks(lay, veda_mask.Budget(ratio=0.9))
-    assert heatmap.mask_recall(logits.detach(), heat, lay, blocks,
-                               rows).item() == 1.0
+    diag = heatmap.mask_diagnostics(logits.detach(), heat, lay, blocks, rows)
+    assert diag['recall'].item() == 1.0
+    # A perfect predictor keeps exactly what the oracle keeps.
+    assert diag['heat_kept'].item() == diag['heat_ceiling'].item()
 
 
 def test_reference_kernel_keep_all_equals_dense():
@@ -106,6 +108,8 @@ def test_teacher_collector_trains_only_the_predictor():
     dense = h3_attention.dense_attention(q, k, v, lay.used, backend='math')[0]
     assert torch.equal(out, dense)
     assert len(collector.stats.kl) == 1 and len(collector.stats.recall) == 2
+    resolved = collector.stats.resolve()
+    assert 0.0 <= resolved['heat_kept'][0] <= resolved['heat_ceiling'][0] <= 1.0
     assert pred.layers[0].proj_q.grad is not None
     assert pred.layers[0].proj_q.grad.abs().sum() > 0
 

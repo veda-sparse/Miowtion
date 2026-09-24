@@ -34,6 +34,7 @@ from torch.distributed.tensor import _utils as dtensor_utils
 from miowtion.train import parallel
 
 _FILE = 'state.pt'
+_OPTIM = 'optim.pt'
 _MARKER = 'done.json'
 
 
@@ -86,24 +87,27 @@ class CheckpointManager:
     """Writes checkpoints locally and mirrors them to persistent storage."""
 
     def __init__(self, local_dir: str, persistent_dir: str | None,
-                 env: parallel.DistEnv, keep_last: int | None = None):
+                 env: parallel.DistEnv, keep_optimizer: int = 2):
         """Initializes the manager.
 
         Args:
             local_dir: Directory of step_* checkpoints.
             persistent_dir: Optional mirror (never pruned).
             env: Distributed environment.
-            keep_last: Keep only this many newest local checkpoints (older
-                complete ones are deleted after each successful save); None
-                keeps all. A checkpoint is several GB, so long runs on small
-                disks need this.
+            keep_optimizer: How many of the newest checkpoints keep their
+                Adam moments. No checkpoint is ever deleted: weights and
+                EMA are the training history and must survive the whole
+                run. The moments are half of a checkpoint's bytes and are
+                only read to resume, which only ever happens from the
+                newest one, so older ones drop them.
         """
-        if keep_last is not None and keep_last < 1:
-            raise ValueError(f'keep_last must be >= 1, got {keep_last}')
+        if keep_optimizer < 1:
+            raise ValueError(f'keep_optimizer must be >= 1, got '
+                             f'{keep_optimizer}')
         self.local_dir = local_dir
         self.persistent_dir = persistent_dir
         self.env = env
-        self.keep_last = keep_last
+        self.keep_optimizer = keep_optimizer
         self._copy_thread: threading.Thread | None = None
 
     def save(self, step: int, named_params: Sequence[tuple[str, nn.Parameter]],
@@ -131,7 +135,6 @@ class CheckpointManager:
             'step': step,
             'weights': weights,
             'ema': ema_state,
-            'optimizer': opt_state,
             'param_groups': [{k: v for k, v in g.items() if k != 'params'}
                              for g in optimizer.param_groups],
             'rank_states': rank_states,
@@ -140,25 +143,30 @@ class CheckpointManager:
         }
         directory = os.path.join(self.local_dir, f'step_{step:07d}')
         os.makedirs(directory, exist_ok=True)
-        path = os.path.join(directory, _FILE)
-        torch.save(payload, path + '.tmp')
-        os.replace(path + '.tmp', path)
+        # The moments go in their own file so that pruning them later does
+        # not have to rewrite (and briefly double) the weights.
+        _write(os.path.join(directory, _OPTIM), opt_state)
+        path = _write(os.path.join(directory, _FILE), payload)
         with open(os.path.join(directory, _MARKER), 'w') as f:
             json.dump({'step': step, 'bytes': os.path.getsize(path)}, f)
         self._start_copy(directory)
         self._prune()
 
     def _prune(self) -> None:
-        """Deletes complete local checkpoints beyond the newest keep_last."""
-        if self.keep_last is None:
-            return
-        complete = sorted(
-            d for d in os.listdir(self.local_dir)
-            if d.startswith('step_')
-            and os.path.exists(os.path.join(self.local_dir, d, _MARKER)))
-        for name in complete[:-self.keep_last]:
-            # The persistent mirror copies from the newest directory only.
-            shutil.rmtree(os.path.join(self.local_dir, name))
+        """Drops the Adam moments of all but the newest keep_optimizer.
+
+        Checkpoint directories themselves are never removed.
+        """
+        for root in (self.local_dir, self.persistent_dir):
+            if not root or not os.path.isdir(root):
+                continue
+            complete = sorted(
+                d for d in os.listdir(root) if d.startswith('step_')
+                and os.path.exists(os.path.join(root, d, _MARKER)))
+            for name in complete[:-self.keep_optimizer]:
+                moments = os.path.join(root, name, _OPTIM)
+                if os.path.exists(moments):
+                    os.remove(moments)
 
     def _start_copy(self, directory: str) -> None:
         if not self.persistent_dir:
@@ -202,11 +210,24 @@ def latest(directories: Sequence[str]) -> str | None:
     return found[max(found)] if found else None
 
 
+def _write(path: str, payload) -> str:
+    """Atomic torch.save; returns the path."""
+    torch.save(payload, path + '.tmp')
+    os.replace(path + '.tmp', path)
+    return path
+
+
 def load(directory: str) -> dict:
+    """Payload of a checkpoint; 'optimizer' is empty once pruned."""
     if not os.path.exists(os.path.join(directory, _MARKER)):
         raise FileNotFoundError(f'{directory} has no completion marker')
-    return torch.load(os.path.join(directory, _FILE), map_location='cpu',
-                      weights_only=False)
+    payload = torch.load(os.path.join(directory, _FILE), map_location='cpu',
+                         weights_only=False)
+    moments = os.path.join(directory, _OPTIM)
+    payload['optimizer'] = (
+        torch.load(moments, map_location='cpu', weights_only=False)
+        if os.path.exists(moments) else {})
+    return payload
 
 
 @torch.no_grad()

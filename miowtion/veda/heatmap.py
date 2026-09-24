@@ -1,4 +1,4 @@
-"""Teacher block heat maps, the seer KL loss and mask recall.
+"""Teacher block heat maps, the seer KL loss and mask diagnostics.
 
 Teacher heat of (query tile i, key tile j) is the maximum true attention
 probability inside the block:
@@ -112,16 +112,30 @@ def seer_kl(logits: torch.Tensor, heat: torch.Tensor,
 
 
 @torch.no_grad()
-def mask_recall(logits: torch.Tensor, heat: torch.Tensor,
-                layout: tiling.TileLayout,
-                blocks: list[veda_mask.ColumnBlock],
-                q_tiles: torch.Tensor) -> torch.Tensor:
-    """Overlap of predicted and oracle top-k sets, diagonal excluded.
+def mask_diagnostics(logits: torch.Tensor, heat: torch.Tensor,
+                     layout: tiling.TileLayout,
+                     blocks: list[veda_mask.ColumnBlock],
+                     q_tiles: torch.Tensor) -> dict[str, torch.Tensor]:
+    """Predictor vs. oracle on the video quadrant, as device scalars.
 
-    Both sets have the same size per row, so recall equals precision. Only
-    the video -> video quadrant counts; the forced diagonal is not a
-    predictor decision and is removed from both sets. Returns NaN when the
-    budget holds nothing but the diagonal.
+    Every value stays on the device: the caller resolves a whole micro
+    step's diagnostics with one transfer, because a `.item()` here would
+    synchronize once per layer and head group.
+
+    Returns:
+        recall: overlap of the predicted and the oracle top-k set. Both
+            sets have the same size per row, so recall equals precision.
+            The forced diagonal is not a predictor decision and is removed
+            from both; NaN when the budget holds nothing else.
+        heat_kept: share of a row's total video block heat that the
+            predicted tiles carry, averaged over rows and heads. The
+            diagonal counts, because the kernel does compute it. This is
+            what recall is a proxy for: recall counts blocks, this weighs
+            them by how much attention they actually hold.
+        heat_ceiling: the same for the oracle's own selection, i.e. the
+            most any predictor could keep at this budget. A low ceiling
+            means the teacher itself is not concentrated enough for the
+            budget, which no amount of training can fix.
     """
     n_video = layout.n_video_tiles
     pred = veda_mask.select_video_blocks(logits, layout, blocks, q_tiles)
@@ -132,9 +146,22 @@ def mask_recall(logits: torch.Tensor, heat: torch.Tensor,
                           device=sel.index.device)
         return out.scatter_(2, sel.index, sel.keep)
 
+    pred_set, oracle_set = dense(pred), dense(oracle)
+    video_heat = heat[:, :, :n_video].float().clamp(min=0.0)
+    total = video_heat.sum(-1)
+    row_ok = total > 0
+    tiny = torch.finfo(torch.float32).tiny
+
+    def share(selected: torch.Tensor) -> torch.Tensor:
+        row = (video_heat * selected).sum(-1) / total.clamp(min=tiny)
+        return (row * row_ok).sum() / row_ok.sum().clamp(min=1)
+
     diag = F.one_hot(q_tiles, n_video).bool()[None]
-    pred_set, oracle_set = dense(pred) & ~diag, dense(oracle) & ~diag
-    total = oracle_set.sum()
-    if total == 0:  # the budget holds only the diagonal
-        return torch.tensor(float('nan'))
-    return (pred_set & oracle_set).sum() / total
+    pred_off, oracle_off = pred_set & ~diag, oracle_set & ~diag
+    found = (pred_off & oracle_off).sum()
+    possible = oracle_off.sum()
+    # No Python branch on `possible`: that would synchronize.
+    recall = torch.where(possible > 0, found / possible.clamp(min=1),
+                         torch.nan)
+    return {'recall': recall, 'heat_kept': share(pred_set),
+            'heat_ceiling': share(oracle_set)}

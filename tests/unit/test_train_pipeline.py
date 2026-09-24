@@ -123,7 +123,7 @@ def test_stage1_trains_and_resumes(tmp_path):
         'schedule': 'base', 'num_steps': 4, 'accum': 2, 'steps': 3, 'save_every': 2,
         'warmup': 1, 'keep_ratio': 0.5, 'recall_every': 1,
         'out_dir': str(tmp_path / 'runs'), 'dense_backend': 'math',
-        'bootstrap_shape': '1x8x16', 'keep_last': 1,
+        'bootstrap_shape': '1x8x16', 'keep_optimizer': 1,
     }
     path = tmp_path / 'cfg.yaml'
     path.write_text(yaml.safe_dump(cfg))
@@ -137,15 +137,24 @@ def test_stage1_trains_and_resumes(tmp_path):
     steps = [r for r in log if 'step' in r]
     assert [r['step'] for r in steps] == [1, 2, 3]
     assert all(r['kl'] > 0 for r in steps)
+    # Training dynamics: per-layer KL, mask quality and its ceiling.
+    assert all(len(r['kl_layers']) == 2 for r in steps)
+    assert all(0.0 <= r['heat_kept'] <= r['heat_ceiling'] <= 1.0
+               for r in steps)
+    assert all(r['logit_std'] >= 0 for r in steps)
     # Update diagnostics: cosine needs a previous update.
     assert all(len(r['grad_norm_layers']) == 2 and r['update_ratio'] > 0
                for r in steps)
     assert 'grad_cos' not in steps[0] and -1 <= steps[1]['grad_cos'] <= 1
     latest = checkpoint.latest([str(tmp_path / 'runs' / 'tiny' / 'ckpt')])
     assert latest.endswith('step_0000003')
-    # keep_last 1: the step-2 checkpoint was pruned after step 3 was saved.
-    assert sorted(os.listdir(tmp_path / 'runs' / 'tiny' / 'ckpt')) == [
-        'step_0000003']
+    # Every checkpoint survives; keep_optimizer 1 dropped the moments of
+    # the older one, so only the newest can be resumed from.
+    ckpt_dir = tmp_path / 'runs' / 'tiny' / 'ckpt'
+    assert sorted(os.listdir(ckpt_dir)) == ['step_0000002', 'step_0000003']
+    assert not (ckpt_dir / 'step_0000002' / 'optim.pt').exists()
+    assert (ckpt_dir / 'step_0000003' / 'optim.pt').exists()
+    assert checkpoint.load(str(ckpt_dir / 'step_0000002'))['optimizer'] == {}
     # A new trainer resumes from the latest complete checkpoint.
     t2 = trainer_lib.Trainer(config)
     assert t2.step == 3

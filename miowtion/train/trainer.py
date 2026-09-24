@@ -73,7 +73,7 @@ class TrainConfig:
     ref_keep_ratio: float | None = None
     tile_conditions: bool = False
     teacher_q_tiles: float = 1.0
-    recall_every: int = 4
+    recall_every: int = 1  # mask diagnostics on every n-th layer
     accum: int = 4
     steps: int = 400
     lr: float = 1e-4
@@ -86,7 +86,7 @@ class TrainConfig:
     out_dir: str = 'runs'
     persistent_dir: str | None = None
     save_every: int = 50
-    keep_last: int | None = None  # newest local checkpoints kept
+    keep_optimizer: int = 2  # newest checkpoints keeping Adam moments
     init_from: str | None = None
     init_drop_prefixes: list[str] = dataclasses.field(default_factory=list)
     lora_rank: int = 64
@@ -211,7 +211,7 @@ class Trainer:
         self.ema = checkpoint.Ema(self.opt_params, config.ema)
         self.ckpt = checkpoint.CheckpointManager(
             os.path.join(self.run_dir, 'ckpt'), config.persistent_dir,
-            self.env, config.keep_last)
+            self.env, config.keep_optimizer)
 
         self.geometries = data.GeometrySampler(
             config.geometries, config.seed, config.geometry_sampling)
@@ -315,8 +315,11 @@ class Trainer:
             video_t, audio_t = self.model(traj.clip, inputs.video_rows,
                                           inputs.audio_rows, inputs.timestep,
                                           collector, table)
-        stats['kl'].append(sum(collector.stats.kl) / num_layers)
-        stats['recall'] += collector.stats.recall
+        resolved = collector.stats.resolve()  # one device transfer
+        stats['kl'].append(sum(resolved['kl']) / num_layers)
+        stats['kl_layers'].append(resolved['kl'])
+        for name in ('logit_std', 'recall', 'heat_kept', 'heat_ceiling'):
+            stats[name] += resolved[name]
         progress.log(f'  update {self.step + 1}/{self.config.steps} micro '
                      f'{len(stats["kl"])}/{self.config.accum}: traj step '
                      f'{traj.step + 1}/{self.schedule.num_steps}, '
@@ -338,7 +341,9 @@ class Trainer:
         self._updates = progress.Progress('updates', config.steps - self.step)
         while self.step < config.steps:
             start = time.time()
-            stats = {'kl': [], 'recall': [], 'mse': []}
+            stats = {name: [] for name in
+                     ('kl', 'kl_layers', 'logit_std', 'recall', 'heat_kept',
+                      'heat_ceiling', 'mse')}
             for _ in range(config.accum):
                 self._micro_step(stats)
             replicated = [p for n, p in self.trainable
@@ -405,6 +410,16 @@ class Trainer:
                   if torch.cuda.is_available() else 0.0}
         if stats['mse']:
             record['mse'] = self._reduce_mean(stats['mse'])
+        for name in ('heat_kept', 'heat_ceiling', 'logit_std'):
+            if stats[name]:
+                record[name] = round(self._reduce_mean(stats[name]), 5)
+        # Per-layer KL is rank 0's own micro-steps: it says where in depth
+        # the predictor is behind, and averaging it across ranks would only
+        # hide that they saw different geometries.
+        if stats['kl_layers']:
+            columns = list(zip(*stats['kl_layers']))
+            record['kl_layers'] = [float(f'{sum(c) / len(c):.4g}')
+                                   for c in columns]
         record.update(diagnostics)
         self._last_record = record
         self._log(record)

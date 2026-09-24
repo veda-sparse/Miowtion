@@ -18,13 +18,12 @@ num_steps: 8
 teacher_adapter: weights/turbo_lora/minimax_h3_turbo_v4_step600_ema.safetensors
 init_from: runs/stage1_turbo8_4090/ckpt/step_0000050
 keep_ratio: 0.1
-teacher_q_tiles: 0.25
+teacher_q_tiles: 1.0   # supervise every query tile
 accum: 2
 steps: 2000
 lr: 1.0e-3
 warmup: 20
-save_every: 10
-keep_last: 2
+save_every: 50
 out_dir: runs
 offload_blocks: 44
 prefetch: 1
