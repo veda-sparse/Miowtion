@@ -20,6 +20,7 @@ _TORCH_TO_MX = {
     torch.int32: mx.int32,
     torch.int64: mx.int64,
     torch.uint8: mx.uint8,
+    torch.bool: mx.bool_,
 }
 
 

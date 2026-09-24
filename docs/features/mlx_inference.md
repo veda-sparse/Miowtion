@@ -57,8 +57,11 @@ attention：kernel 看到的问题宽度就真的是 `budget * k_block` 而不�
   tile 本来就是几千行这个量级。
 - 不变量：结果必须与"等价块掩码下的稠密 attention"**逐位相等**——两条路径看到的是
   同一批 key、同样的顺序，没有理由不等。单测用 `mx.array_equal` 卡死这一点。
-- `used` 必须同时是 `q_block` 和 `k_block` 的整数倍，否则 padding 行会被卷进 attention。
-  不满足时直接报错，不静默回退到稠密。
+- 稀疏的 query 行数（`used - dense_rows`）必须是 `q_block` 的整数倍、`used` 必须是
+  `k_block` 的整数倍，否则 padding 行会被卷进 attention。不满足时直接报错，不静默
+  回退到稠密。
+- 真实的 Veda 选择并不是"预算严格相同"，见下面「接上真实的 Veda 选择」：短的行用
+  `keep` 补齐并掩掉，全局行走 `dense_rows`，partial tile 走 `key_valid`。
 
 ### 数值
 
@@ -75,6 +78,7 @@ round 到 bf16：RMSNorm 的统计量和乘权重在 fp32 里算、只 round 一
 |---|---|
 | `miowtion/mlx/block.py` | 一个 trunk block 的前向；`BlockWeights`（发布 layout，含量化）、`BlockOptions`（head / row 分块） |
 | `miowtion/mlx/sparse_attention.py` | Veda 块稀疏：`SparsePlan`、gather 版 `block_sparse_attention`、稠密参考、代价模型 |
+| `miowtion/mlx/veda_plan.py` | 把 `veda.mask.Selection` 转成 `SparsePlan`（真实 Veda 掩码的唯一入口） |
 | `miowtion/mlx/interop.py` | torch ↔ MLX 的逐位转换（numpy 没有 bf16，按 16 bit 原始位走） |
 | `miowtion/mlx/slab.py` | slab 格式、`SlabReader`（pread 进预分配 buffer）、`BlockPrefetcher`、`convert_checkpoint` |
 | `miowtion/mlx/offload.py` | 不转换的替代方案：直接读发布的 safetensors（`mx.load` 惰性加载 / 每个分片一个 mmap） |
@@ -219,6 +223,36 @@ Neural Engine 同样不是出路。用 CoreML 把同一个 fc1 形状的 fp16 GE
 的前提正是按 block 从 NVMe 换权重——上表里一个 4 次 matmul 的模型编译加载就要
 33.8 s，400 次换权重的代价远超任何收益。ANE 还只有 fp16，会破坏与 torch 的数值对齐。
 
+### 接上真实的 Veda 选择
+
+前面的数字用的是"每个 query tile 预算相同、tile 是均匀 128×128 网格"的理想 plan。
+真实的 Veda 选择有三处不均匀，`miowtion/mlx/veda_plan.py` 把它们各映射到
+`SparsePlan` 的一个字段，而不是去近似掉：
+
+| Veda 的事实 | plan 里的对应 | 为什么不能忽略 |
+|---|---|---|
+| 预算按 Bresenham 逐 query tile ±1，且分摊在 reference / target 两个列块上 | `keep`：把短的行补齐到统一宽度后掩掉 | 补位不能靠重复已选的 tile，重复的 key 会在 softmax 里算两次 |
+| 全局（文本 / 音频）的行和列是稠密的 | 列并进每行的预算；行是排列后序列的末尾，走 `dense_rows` 单独一次稠密调用 | 全局 query 行看所有列，无法和视频行共用同一个预算 |
+| tile 只填了一部分（partial tile） | `key_valid`（来自 `layout.slot_valid`） | 掩码是逐行的，不是逐 tile 的 |
+
+另外 Veda 的 top-k 是**逐头**做的，所以 `index` 支持 `[heads, n_q, budget]`：gather
+时把 (head, tile) 压成一个轴，仍然只是一次 `mx.take`。把 `index` 按 tile 号排序之后，
+gather 出来的 key 顺序和稠密路径一致，结果**逐位相等**（单测钉死）。
+
+代价是 `q_block` 必须等于 Veda 的 tile（128），而前面测过 `q_block` 越小 gather 越
+贵。S=38912、密度 10 %、整个 block：
+
+| 配置 | 每 block | 其中 attention | 进程峰值 |
+|---|---|---|---|
+| 稠密 | 14.52 s | 8.95 s | — |
+| 理想 plan（`q_block=2048`，`head_chunk=8`） | 6.46 s | 0.95 s | 4.43 GB |
+| Veda 原生（`q_block=128`，`head_chunk=4`） | 8.01 s | 2.70 s | 8.78 GB |
+| Veda 原生（`q_block=128`，`head_chunk=2`，`row_chunk=4096`） | **7.70 s** | 2.43 s | **5.99 GB** |
+
+也就是说真实 plan 比理想 plan 慢 19 %、仍然比稠密快 1.89 倍。`q_block=128` 时
+gather 量是 `q_block=2048` 的 16 倍（S=38912 下一遍 33 GB），所以 `head_chunk`
+必须调小到 2：head_chunk=4 会多花 2.8 GB 峰值，还因为内存压力更慢。
+
 ### 18 GB 上的序列长度上限
 
 开了稀疏和 `eval_chunks`（`head_chunk=8, row_chunk=4096, q_block=2048`，
@@ -306,13 +340,26 @@ Neural Engine 同样不是出路。用 CoreML 把同一个 fc1 形状的 fp16 GE
 - 满预算的稀疏 plan 与稠密一致；部分预算确实改变结果；tile 不整除 `used` 或 plan 的
   query tile 数不对时报错。
 
-`tests/unit/test_mlx_sparse_attention.py`（8 个）：
+`tests/unit/test_mlx_veda_plan.py`（4 个）：
+
+- plan 展开出来的逐行掩码与 `veda.mask.dense_block_mask`（再按 `slot_valid` 掩掉
+  padding 行）**逐位相等**（`torch.equal`）。
+- 用该 plan 跑 gather 版，与同一掩码下的稠密 attention 逐位相等。
+- 满预算时各头选择相同，head 轴会被收起来（一次 gather 服务整组头）。
+- 选择没有覆盖全部视频 query tile 时报错。
+
+`tests/unit/test_mlx_sparse_attention.py`（13 个）：
 
 - gather 版与"等价块掩码下的稠密 attention"**逐位相等**（`mx.array_equal`）；
   `head_chunk` 不改变结果（同样逐位）。
 - 满预算等于稠密；没选中的 key tile 改掉 V 也不影响输出。
 - `block_mask_from_index` 标记的正是选中的 tile；非法 tile / 预算 / `head_chunk`
   一律报错；FLOP 与 gather 字节数的代价模型按密度和 `q_block` 正确缩放。
+- `keep` 掩掉的补位槽完全惰性：把补位槽指到别的 tile，输出一个 bit 都不变；
+  `key_valid` 掩掉的 padding 行同理（改掉它们的 V 不影响输出）。
+- 逐头 `index` 与逐头稠密参考逐位相等，且 `head_chunk` 不会把头和它的选择错位。
+- `dense_rows` 的尾部行等于普通稠密 attention；某个 query tile 一行 key 都不留时
+  报错（否则 softmax 是 NaN）。
 
 `tests/unit/test_mlx_slab.py`（6 个）：
 
@@ -371,8 +418,11 @@ Neural Engine 同样不是出路。用 CoreML 把同一个 fc1 形状的 fp16 GE
 - 接上 `miowtion/infer` 的去噪循环（目前只有 block 级前向，没有时间步循环、
   文本条件和 VAE 解码）。
 - AdaLN 表的预计算目前还在 torch 侧，MLX 侧只消费表；考虑一并搬过来。
-- 稀疏的 `index` 目前是测速用的随机选择；接上 Veda 打分器产出的真实 plan 还没做。
-  难点是 Veda 的三处非均匀性：tile 几何按头组不同、Bresenham 预算逐 query tile
-  ±1 且分摊在两个列块上、全局文本 / 音频的行列是稠密的且不出现在 `Selection.index`
-  里。gather 版要求每个 query tile 的预算相同，所以需要一层左对齐补齐（可以参考
-  `kernels/fa4.index_lists` 已有的 `full_idx` / `partial_idx` 打包）。
+- `veda_plan` 只覆盖"一个头组、一个排列"。`TilePlan` 允许每层有两种 tile 形状，
+  也就是两个排列、两个 plan；`block_forward` 目前只接受一个 plan，且不做排列 /
+  反排列。要跑真实模型还需要：按头组切分 QKV、各自 gather 排列、算完再 scatter
+  回去。
+- `q_block=128` 的 gather 量是 `q_block=2048` 的 16 倍。可以把 16 个相邻 query
+  tile 的选择取并集，共享一次 gather，再对每个 tile 单独调一次 SDPA（掩码仍然按
+  tile）。并集能省多少取决于相邻 query tile 的选择有多重合，随机打分器上并集≈全集，
+  所以这件事必须等真实打分器的选择出来再测。

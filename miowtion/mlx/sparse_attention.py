@@ -34,28 +34,57 @@ class SparsePlan:
     """The key tiles every query tile attends to.
 
     Attributes:
-        index: [seq_len // q_block, budget] int32, selected key-tile ids.
-            Every query tile carries the same budget, which is what lets the
-            gathered problem stay rectangular.
+        index: [n_query_tiles, budget] int32 selected key-tile ids, shared
+            by every head, or [heads, n_query_tiles, budget] with one
+            selection per head (Veda runs its top-k per head). Every query
+            tile carries the same budget, which is what lets the gathered
+            problem stay rectangular.
         q_block: Rows per query tile.
         k_block: Rows per key tile.
+        keep: Bool of index's shape, or None. False marks a slot
+            that only pads the budget out to a common width, so that a
+            selection with a per-row budget (Veda spreads the fractional
+            part of the budget with a Bresenham pattern) still fits the
+            rectangular gather. Padding slots must be masked, not repeated:
+            a repeated key tile would enter the softmax twice.
+        key_valid: [seq_len] bool or None. False marks a key row that is
+            padding inside its tile. Veda's permuted layout leaves partial
+            tiles, so validity is per row, not per tile.
+        dense_rows: Trailing query rows that attend to every key. Veda keeps
+            the global (text / audio) query tiles dense, and they sit at the
+            end of the permuted sequence; they cannot share a uniform budget
+            with the video rows, so they get their own dense call. They are
+            few, so it stays cheap.
     """
 
     index: mx.array
     q_block: int
     k_block: int
+    keep: mx.array | None = None
+    key_valid: mx.array | None = None
+    dense_rows: int = 0
 
     @property
     def budget(self) -> int:
-        return self.index.shape[1]
+        return self.index.shape[-1]
+
+    @property
+    def n_query_tiles(self) -> int:
+        return self.index.shape[-2]
 
     def density(self, seq_len: int) -> float:
-        """Fraction of the full attention matrix that is kept."""
+        """Fraction of the full attention matrix that is kept.
+
+        Counts padding slots, i.e. it is the density the kernel pays for,
+        not the density of the selection.
+        """
         return self.budget / (seq_len / self.k_block)
 
 
 def block_mask_from_index(index: mx.array, q_block: int, k_block: int,
-                          seq_len: int) -> mx.array:
+                          seq_len: int, keep: mx.array | None = None,
+                          key_valid: mx.array | None = None,
+                          dense_rows: int = 0) -> mx.array:
     """Dense boolean mask of a block-sparse selection (reference path).
 
     Args:
@@ -63,57 +92,99 @@ def block_mask_from_index(index: mx.array, q_block: int, k_block: int,
         q_block: Rows per query tile.
         k_block: Rows per key tile.
         seq_len: Padded sequence length (multiple of both tile sizes).
+        keep: Bool of index's shape, or None; see SparsePlan.
+        key_valid: [seq_len] bool or None; see SparsePlan.
+        dense_rows: Trailing query rows that are kept everywhere.
 
     Returns:
-        [seq_len, seq_len] bool; True where attention is kept.
+        [seq_len, seq_len] bool, or [heads, seq_len, seq_len] for a per-head
+        index; True where attention is kept.
     """
-    n_q, budget = index.shape
+    n_q, budget = index.shape[-2:]
     n_k = seq_len // k_block
-    if n_q * q_block != seq_len or n_k * k_block != seq_len:
+    sparse_rows = seq_len - dense_rows
+    if n_q * q_block != sparse_rows or n_k * k_block != seq_len:
         raise ValueError(f'index has {n_q} query tiles of {q_block} rows, '
-                         f'which does not tile seq_len {seq_len} (k_block '
-                         f'{k_block})')
-    tiles = mx.zeros((n_q, n_k), dtype=mx.bool_)
+                         f'which does not tile the {sparse_rows} sparse rows '
+                         f'of seq_len {seq_len} (k_block {k_block})')
+    if index.ndim == 3:
+        return mx.stack([block_mask_from_index(
+            index[h], q_block, k_block, seq_len,
+            None if keep is None else keep[h], key_valid, dense_rows)
+            for h in range(index.shape[0])])
+    # One spare column absorbs the padding slots, so that they cannot switch
+    # on a tile; it is dropped again before the mask is expanded.
+    tiles = mx.zeros((n_q, n_k + 1), dtype=mx.bool_)
     rows = mx.repeat(mx.arange(n_q), budget)
-    tiles[rows, index.reshape(-1)] = True
-    return mx.repeat(mx.repeat(tiles, q_block, axis=0), k_block, axis=1)
+    columns = index.reshape(-1)
+    if keep is not None:
+        columns = mx.where(keep.reshape(-1), columns, n_k)
+    tiles[rows, columns] = True
+    mask = mx.repeat(mx.repeat(tiles[:, :n_k], q_block, axis=0), k_block,
+                     axis=1)
+    if dense_rows:
+        mask = mx.concatenate(
+            [mask, mx.ones((dense_rows, seq_len), dtype=mx.bool_)], axis=0)
+    if key_valid is not None:
+        mask = mask & key_valid[None, :]
+    return mask
 
 
 def block_sparse_attention(q: mx.array, k: mx.array, v: mx.array,
                            index: mx.array, *, q_block: int, k_block: int,
                            scale: float | None = None,
-                           head_chunk: int | None = None) -> mx.array:
+                           head_chunk: int | None = None,
+                           keep: mx.array | None = None,
+                           key_valid: mx.array | None = None,
+                           dense_rows: int = 0) -> mx.array:
     """Attention restricted to the selected key tiles.
 
     Args:
         q: [heads, seq_len, head_dim], seq_len a multiple of q_block.
         k: [heads, seq_len, head_dim], seq_len a multiple of k_block.
         v: Same shape as k.
-        index: [seq_len // q_block, budget] int32, the key tiles each query
-            tile attends to. Every query tile must have the same budget.
+        index: [n_query_tiles, budget] int32 shared by all heads, or
+            [heads, n_query_tiles, budget] with one selection per head
+            (Veda's top-k is per head). n_query_tiles is
+            (seq_len - dense_rows) // q_block, and every query tile must
+            have the same budget.
         q_block: Rows per query tile.
         k_block: Rows per key tile.
         scale: Query scale; defaults to head_dim ** -0.5.
         head_chunk: Heads processed at once (bounds the gather buffer).
             None processes every head in one call.
+        keep: Bool of index's shape, or None; see SparsePlan.
+        key_valid: [seq_len] bool or None; see SparsePlan.
+        dense_rows: Trailing query rows that attend to every key; see
+            SparsePlan.
 
     Returns:
         [heads, seq_len, head_dim] in q's dtype.
 
     Raises:
-        ValueError: On shape or tiling mismatches.
+        ValueError: On shape or tiling mismatches, or if a query tile keeps
+            no key row at all (its softmax would be NaN).
     """
     heads, seq_len, head_dim = q.shape
     if k.shape != q.shape or v.shape != q.shape:
         raise ValueError(f'q, k, v must agree, got {q.shape}, {k.shape}, '
                          f'{v.shape}')
-    if seq_len % q_block or seq_len % k_block:
-        raise ValueError(f'seq_len {seq_len} must be a multiple of q_block '
-                         f'{q_block} and k_block {k_block}')
-    n_q, budget = index.shape
-    if n_q != seq_len // q_block:
+    sparse_rows = seq_len - dense_rows
+    if dense_rows < 0 or sparse_rows <= 0:
+        raise ValueError(f'dense_rows {dense_rows} must be in [0, {seq_len})')
+    if sparse_rows % q_block or seq_len % k_block:
+        raise ValueError(f'{sparse_rows} sparse rows must be a multiple of '
+                         f'q_block {q_block}, and seq_len {seq_len} of '
+                         f'k_block {k_block}')
+    if index.ndim not in (2, 3):
+        raise ValueError(f'index must be 2-D or 3-D, got {index.shape}')
+    if index.ndim == 3 and index.shape[0] != heads:
+        raise ValueError(f'per-head index has {index.shape[0]} heads, '
+                         f'expected {heads}')
+    n_q, budget = index.shape[-2:]
+    if n_q != sparse_rows // q_block:
         raise ValueError(f'index has {n_q} query tiles, expected '
-                         f'{seq_len // q_block}')
+                         f'{sparse_rows // q_block}')
     if budget > seq_len // k_block:
         raise ValueError(f'budget {budget} exceeds {seq_len // k_block} key '
                          'tiles')
@@ -122,35 +193,99 @@ def block_sparse_attention(q: mx.array, k: mx.array, v: mx.array,
     if head_chunk is not None and head_chunk < 1:
         raise ValueError(f'head_chunk must be >= 1, got {head_chunk}')
     step = head_chunk or heads
+    if keep is not None and keep.shape != index.shape:
+        raise ValueError(f'keep {keep.shape} must match index {index.shape}')
+    if key_valid is not None and key_valid.shape != (seq_len,):
+        raise ValueError(f'key_valid must be [{seq_len}], got '
+                         f'{key_valid.shape}')
+    dense_mask = None if key_valid is None else key_valid[None, None, None]
 
     out = []
     for start in range(0, heads, step):
         stop = min(start + step, heads)
-        out.append(_chunk(q[start:stop], k[start:stop], v[start:stop], index,
-                          q_block, k_block, scale))
+        kc, vc = k[start:stop], v[start:stop]
+        idx = index if index.ndim == 2 else index[start:stop]
+        sub_keep = None if keep is None else (
+            keep if keep.ndim == 2 else keep[start:stop])
+        mask = _gathered_mask(idx, k_block, seq_len, sub_keep, key_valid)
+        chunk = _chunk(q[start:stop, :sparse_rows], kc, vc, idx, q_block,
+                       k_block, scale, mask)
+        if dense_rows:
+            tail = mx.fast.scaled_dot_product_attention(
+                q[start:stop, sparse_rows:][None], kc[None], vc[None],
+                scale=scale, mask=dense_mask)[0]
+            chunk = mx.concatenate([chunk, tail], axis=1)
+        out.append(chunk)
     return mx.concatenate(out, axis=0) if len(out) > 1 else out[0]
 
 
+def _gathered_mask(index: mx.array, k_block: int, seq_len: int,
+                   keep: mx.array | None,
+                   key_valid: mx.array | None) -> mx.array | None:
+    """Boolean mask over the gathered key axis, or None if nothing is masked.
+
+    The mask is the same for every query row of a tile, so it stays a
+    [n_q, heads_or_1, 1, budget * k_block] broadcast operand: it costs memory
+    proportional to the gathered *tile* count, not to the gathered rows. It
+    is applied by the kernel after the Q@K.T tile matmul, which is why it
+    buys correctness and never FLOPs -- the gather already bought those.
+
+    Args:
+        index: [n_q, budget] or [heads, n_q, budget] int32.
+        k_block: Rows per key tile.
+        seq_len: Key rows.
+        keep: Bool of index's shape, or None.
+        key_valid: [seq_len] bool, or None.
+    """
+    n_q, budget = index.shape[-2:]
+    parts = []
+    if keep is not None:
+        parts.append(mx.repeat(keep, k_block, axis=-1))
+    if key_valid is not None:
+        tiles = key_valid.reshape(seq_len // k_block, k_block)
+        parts.append(mx.take(tiles, index, axis=0)
+                     .reshape(*index.shape[:-2], n_q, budget * k_block))
+    if not parts:
+        return None
+    mask = parts[0] if len(parts) == 1 else parts[0] & parts[1]
+    if not mx.all(mx.any(mask, axis=-1)).item():
+        raise ValueError('every query tile must keep at least one key row')
+    # [n_q, 1, 1, L] shared, or [n_q, heads, 1, L] per head.
+    if mask.ndim == 2:
+        return mask[:, None, None, :]
+    return mask.transpose(1, 0, 2)[:, :, None, :]
+
+
 def _chunk(q: mx.array, k: mx.array, v: mx.array, index: mx.array,
-           q_block: int, k_block: int, scale: float) -> mx.array:
-    """block_sparse_attention for one group of heads."""
-    heads, seq_len, head_dim = q.shape
-    n_q, budget = index.shape
+           q_block: int, k_block: int, scale: float,
+           mask: mx.array | None = None) -> mx.array:
+    """block_sparse_attention for one group of heads (sparse rows only)."""
+    heads, seq_len, head_dim = k.shape
+    n_q, budget = index.shape[-2:]
+    n_k = seq_len // k_block
+    if index.ndim == 3:
+        # Flatten (head, tile) into one axis so that a per-head selection is
+        # still a single gather.
+        index = (index + (mx.arange(heads) * n_k).reshape(heads, 1, 1))
+
+    gathered = []
+    for source in (k, v):
+        if index.ndim == 2:
+            tiles = source.reshape(heads, n_k, k_block, head_dim)
+            picked = mx.take(tiles, index, axis=1)
+        else:
+            tiles = source.reshape(heads * n_k, k_block, head_dim)
+            picked = mx.take(tiles, index.reshape(-1), axis=0)
+        # [heads, n_q, budget, k_block, head_dim] -> one flat key axis.
+        gathered.append(picked.reshape(heads, n_q, budget * k_block, head_dim)
+                        .transpose(1, 0, 2, 3))
 
     # [n_q, heads, q_block, head_dim]: batch over query tiles.
     queries = q.reshape(heads, n_q, q_block, head_dim).transpose(1, 0, 2, 3)
 
-    gathered = []
-    for source in (k, v):
-        tiles = source.reshape(heads, seq_len // k_block, k_block, head_dim)
-        # [heads, n_q, budget, k_block, head_dim] -> one flat key axis.
-        picked = mx.take(tiles, index, axis=1)
-        gathered.append(picked.reshape(heads, n_q, budget * k_block, head_dim)
-                        .transpose(1, 0, 2, 3))
-
     out = mx.fast.scaled_dot_product_attention(
-        queries, gathered[0], gathered[1], scale=scale, mask=None)
-    return out.transpose(1, 0, 2, 3).reshape(heads, seq_len, head_dim)
+        queries, gathered[0], gathered[1], scale=scale, mask=mask)
+    return out.transpose(1, 0, 2, 3).reshape(heads, n_q * q_block, head_dim)
 
 
 def dense_reference(q: mx.array, k: mx.array, v: mx.array,

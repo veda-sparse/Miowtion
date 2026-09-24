@@ -317,14 +317,23 @@ def _check_inputs(x, adaln, adaln_index, rope, used, config, options):
         # must be rectangular, so the real rows have to tile exactly. Veda's
         # geometries are tile-aligned by construction; refuse rather than
         # silently attend to padding.
-        if used % plan.q_block or used % plan.k_block:
+        sparse_rows = used - plan.dense_rows
+        if (sparse_rows <= 0 or sparse_rows % plan.q_block
+                or used % plan.k_block):
             raise ValueError(
-                f'used {used} must be a multiple of q_block {plan.q_block} '
-                f'and k_block {plan.k_block} for sparse attention')
-        if plan.index.shape[0] != used // plan.q_block:
+                f'{sparse_rows} sparse rows of used {used} must be a positive '
+                f'multiple of q_block {plan.q_block}, and used a multiple of '
+                f'k_block {plan.k_block}')
+        if plan.index.shape[0] != sparse_rows // plan.q_block:
             raise ValueError(
                 f'sparse index has {plan.index.shape[0]} query tiles, '
-                f'expected {used // plan.q_block}')
+                f'expected {sparse_rows // plan.q_block}')
+        if plan.keep is not None and plan.keep.shape != plan.index.shape:
+            raise ValueError(f'sparse keep {plan.keep.shape} must match '
+                             f'index {plan.index.shape}')
+        if plan.key_valid is not None and plan.key_valid.shape != (used,):
+            raise ValueError(f'sparse key_valid must be [{used}], got '
+                             f'{plan.key_valid.shape}')
 
 
 def block_forward(x: mx.array, weights: BlockWeights,
@@ -406,7 +415,10 @@ def block_forward(x: mx.array, weights: BlockWeights,
                 q[:used].transpose(1, 0, 2), k[:used].transpose(1, 0, 2),
                 v[:used].transpose(1, 0, 2), options.sparse.index,
                 q_block=options.sparse.q_block,
-                k_block=options.sparse.k_block, scale=scale)
+                k_block=options.sparse.k_block, scale=scale,
+                keep=options.sparse.keep,
+                key_valid=options.sparse.key_valid,
+                dense_rows=options.sparse.dense_rows)
         out = out.transpose(1, 0, 2)  # [used, head_chunk, D]
         del q, k, v
         outs.append(out)

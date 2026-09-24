@@ -124,3 +124,116 @@ def test_flop_and_byte_models_scale_as_expected():
     large = sa.gathered_bytes(4096, 8, 128, q_block=1024, density=0.1)
     # A larger query tile gathers proportionally fewer rows.
     assert large == pytest.approx(small / 2)
+
+
+def test_keep_mask_matches_dense_and_ignores_padding_slots():
+    # Veda's budget varies by +-1 per query tile, so short rows are padded
+    # out to the common width and masked. The padded slots must be exactly
+    # as inert as if they had never been selected.
+    q, k, v = _qkv(seed=3)
+    n_q, n_k = _SEQ // _QB, _SEQ // _KB
+    index = sa.random_index(n_q, n_k, budget=5)
+    keep = mx.arange(5)[None, :] < (4 + mx.arange(n_q)[:, None] % 2)
+    mx.eval(index, keep)
+    got = sa.block_sparse_attention(q, k, v, index, q_block=_QB, k_block=_KB,
+                                    keep=keep)
+    want = sa.dense_reference(
+        q, k, v, mask=sa.block_mask_from_index(index, _QB, _KB, _SEQ, keep))
+    mx.eval(got, want)
+    assert mx.array_equal(got, want).item()
+
+    # Pointing a padded slot at a different tile changes nothing.
+    other = mx.where(keep, index, (index + 3) % n_k)
+    mx.eval(other)
+    assert mx.array_equal(
+        got, sa.block_sparse_attention(q, k, v, other, q_block=_QB,
+                                       k_block=_KB, keep=keep)).item()
+
+
+def test_key_valid_masks_padding_rows_inside_a_tile():
+    # Veda's permuted layout leaves partial tiles, whose padding rows must
+    # not enter the softmax even though their tile is selected.
+    q, k, v = _qkv(seed=4)
+    index = sa.random_index(_SEQ // _QB, _SEQ // _KB, budget=4)
+    valid = mx.arange(_SEQ) % _KB < _KB - 3
+    mx.eval(index, valid)
+    got = sa.block_sparse_attention(q, k, v, index, q_block=_QB, k_block=_KB,
+                                    key_valid=valid)
+    want = sa.dense_reference(
+        q, k, v,
+        mask=sa.block_mask_from_index(index, _QB, _KB, _SEQ,
+                                      key_valid=valid))
+    mx.eval(got, want)
+    assert mx.array_equal(got, want).item()
+
+    # Changing V on the padding rows must not move the output.
+    v2 = mx.where(valid[None, :, None], v, v + 100.0)
+    assert mx.array_equal(
+        got, sa.block_sparse_attention(q, k, v2, index, q_block=_QB,
+                                       k_block=_KB, key_valid=valid)).item()
+
+
+def test_empty_query_tile_is_rejected():
+    q, k, v = _qkv(seed=5)
+    index = sa.random_index(_SEQ // _QB, _SEQ // _KB, budget=4)
+    keep = mx.ones(index.shape, dtype=mx.bool_)
+    keep[0] = False
+    mx.eval(index, keep)
+    with pytest.raises(ValueError):
+        sa.block_sparse_attention(q, k, v, index, q_block=_QB, k_block=_KB,
+                                  keep=keep)
+    with pytest.raises(ValueError):
+        sa.block_sparse_attention(q, k, v, index, q_block=_QB, k_block=_KB,
+                                  keep=keep[:-1])
+    with pytest.raises(ValueError):
+        sa.block_sparse_attention(q, k, v, index, q_block=_QB, k_block=_KB,
+                                  key_valid=mx.ones(_SEQ + 1, dtype=mx.bool_))
+
+
+def test_dense_rows_attend_everywhere():
+    # Veda keeps the global (text / audio) query tiles dense; they sit at
+    # the end of the permuted sequence and get their own dense call.
+    q, k, v = _qkv(seed=6)
+    dense_rows = 2 * _QB
+    index = sa.random_index((_SEQ - dense_rows) // _QB, _SEQ // _KB, budget=4)
+    mx.eval(index)
+    got = sa.block_sparse_attention(q, k, v, index, q_block=_QB, k_block=_KB,
+                                    dense_rows=dense_rows)
+    want = sa.dense_reference(
+        q, k, v, mask=sa.block_mask_from_index(index, _QB, _KB, _SEQ,
+                                               dense_rows=dense_rows))
+    mx.eval(got, want)
+    assert got.shape == q.shape
+    assert mx.array_equal(got, want).item()
+    # The tail rows see everything, so they equal plain dense attention.
+    assert mx.array_equal(got[:, -dense_rows:],
+                          sa.dense_reference(q, k, v)[:, -dense_rows:]).item()
+
+
+def test_per_head_index_matches_dense():
+    # Veda runs its top-k per head, so the gather has to follow a different
+    # selection for every head of the chunk.
+    q, k, v = _qkv(seed=7)
+    n_q, n_k = _SEQ // _QB, _SEQ // _KB
+    index = mx.stack([sa.random_index(n_q, n_k, budget=4, seed=h)
+                      for h in range(_HEADS)])
+    keep = mx.arange(4)[None, None, :] < 3 + mx.arange(n_q)[None, :, None] % 2
+    keep = mx.broadcast_to(keep, index.shape)
+    mx.eval(index, keep)
+    got = sa.block_sparse_attention(q, k, v, index, q_block=_QB, k_block=_KB,
+                                    keep=keep)
+    want = mx.stack([
+        sa.dense_reference(
+            q[h:h + 1], k[h:h + 1], v[h:h + 1],
+            mask=sa.block_mask_from_index(index[h], _QB, _KB, _SEQ,
+                                          keep[h]))[0]
+        for h in range(_HEADS)])
+    mx.eval(got, want)
+    assert mx.array_equal(got, want).item()
+    # Head chunking must not move a bit, and it must keep the heads aligned
+    # with their own selection.
+    for chunk in (1, 2):
+        assert mx.array_equal(
+            got, sa.block_sparse_attention(q, k, v, index, q_block=_QB,
+                                           k_block=_KB, keep=keep,
+                                           head_chunk=chunk)).item()

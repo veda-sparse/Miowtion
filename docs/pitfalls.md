@@ -86,4 +86,6 @@
 | 块稀疏开了反而吃内存、加速不明显 | `q_block` 太小，gather 量正比于 `S/q_block` | `q_block` 取 2048 以上，再用 `head_chunk` 压峰值 | [mlx_inference](features/mlx_inference.md) |
 | 分了块，峰值内存却没下来（S=38912 仍然 6.44 GB） | MLX 的图是惰性的，不在 chunk 之间 eval，所有 chunk 的中间量活到最后 | `BlockOptions.eval_chunks` 默认 True，每个 chunk 算完就 `mx.eval`；峰值降到 4.43 GB 且更快 | [mlx_inference](features/mlx_inference.md) |
 | 想靠 GEMM 优化 / ANE 再提速 | MLX GEMM 已跑到 5.9 TFLOPS（理论峰值的 92%），ANE 只有 3.3 TFLOPS 且权重被编译进模型 | 不要在这两条路上花时间，瓶颈只能靠稀疏度和序列长度解决 | [mlx_inference](features/mlx_inference.md) |
+| 真实 Veda plan 下 `q_block` 只能取 128，内存和时间都变差 | Veda 的选择是逐 128 行 query tile 的，gather 量正比于 `S/q_block` | `head_chunk` 降到 2（S=38912：8.78 → 5.99 GB 峰值，8.01 → 7.70 s） | [mlx_inference](features/mlx_inference.md) |
+| 预算不齐的行用"重复已选 tile"补齐，结果不对 | 重复的 key 会在 softmax 里被算两次 | 补位槽用 `SparsePlan.keep` 掩掉，不要重复 | [mlx_inference](features/mlx_inference.md) |
 | torch ↔ MLX 转换后 bf16 精度变差 | numpy 没有 bfloat16，默认路径经过 fp32 | 两边 view 成 int16，按原始 16 bit 搬运 | [mlx_inference](features/mlx_inference.md) |
