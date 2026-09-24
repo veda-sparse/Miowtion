@@ -5,13 +5,16 @@
 
 ## 项目简介
 
-Miowtion 基于 [MiniMax-H3](https://github.com/MiniMax-AI/MiniMax-H3)（33B 音视频
-DiT），提供：
+Miowtion 的主旨：**在资源受限的机器上实现 [MiniMax-H3](https://github.com/MiniMax-AI/MiniMax-H3)
+（33B 音视频 DiT）的稀疏加速（Veda）和 LoRA 微调**，例如 24 GB 显存的消费级 GPU（权重放在主机
+内存、按 block 流式拷贝），以及正在探索的 Apple silicon + NVMe offloading。取舍时优先考虑显存 /
+主机内存上限、H2D 与通信开销，再考虑多卡规模的吞吐。提供：
 
 - `miowtion/h3`：H3 DiT 的训练侧实现（请求几何、打包布局、调度、权重加载）。
 - `miowtion/veda`：Veda 块稀疏注意力（tile 排列、打分器、掩码、教师热力图、FA4 CuTe
   kernel 整合、tile 方案搜索）。
 - `miowtion/train`：基于 FSDP2 的训练框架（打分器训练、可选 LoRA 恢复）。
+- `miowtion/infer`：推理（少步 LoRA 教师，稠密或 Veda 稀疏，单卡 / 多卡）。
 
 ## 1. 基本规则（必须遵守）
 

@@ -4,18 +4,29 @@
 
 # Miowtion
 
-**Block-sparse attention training for [MiniMax-H3](https://github.com/MiniMax-AI/MiniMax-H3) audio-video DiTs.**
+**Sparse acceleration and LoRA fine-tuning of [MiniMax-H3](https://github.com/MiniMax-AI/MiniMax-H3) on resource-constrained machines.**
 
 | <a href="docs/INDEX.md"><b>Documentation</b></a> | <a href="#getting-started"><b>Quick Start</b></a> | <a href="docs/pitfalls.md"><b>Pitfalls</b></a> | <a href="AGENTS.md"><b>Contributing</b></a> |
 
 </div>
 
-Miowtion trains **Veda**, a learned block-sparse attention for the 33B MiniMax-H3
-DiT: video tokens are permuted into 3D tiles of 128 tokens, a tiny per-head
-predictor scores (query tile, key tile) pairs, and only the top-scoring blocks are
-computed by a FlashAttention-4 (CuTe DSL) block-sparse kernel. Both H3 checkpoints
-are supported: **FL2VA** (t2va / fl2va) and **Ref2VA** (ref2va), with the base
-50-step teacher or a merged few-step (4 / 8-step Turbo) LoRA teacher.
+Miowtion makes the 33B MiniMax-H3 audio-video DiT fast to run and cheap to adapt
+on hardware it was not built for: consumer GPUs with 24 GB (verified on 2x / 1x
+RTX 4090), with the weights streamed from host memory, and, as work in progress,
+Apple silicon with NVMe offloading.
+
+- **Sparse acceleration (Veda).** Video tokens are permuted into 3D tiles of 128
+  tokens, a small per-head predictor scores (query tile, key tile) pairs, and only
+  the top-scoring blocks are computed by a FlashAttention-4 (CuTe DSL) block-sparse
+  kernel (vendored SM8x patch for RTX 30/40). At 90% sparsity one RTX 4090 runs a
+  14.4 s 16:9 clip ~3.1x faster end to end than dense attention.
+- **LoRA fine-tuning.** FSDP2 training with partial CPU offload, stream-overlapped
+  weight copies, precomputed AdaLN tables and memory-bounded (chunked) kernels:
+  stage 1 trains the predictor, stage 2 recovers quality with LoRA.
+
+Both H3 checkpoints are supported: **FL2VA** (t2va / fl2va) and **Ref2VA**
+(ref2va), with the base 50-step teacher or a merged few-step (4 / 8-step Turbo)
+LoRA teacher.
 
 ## NEWS
 
