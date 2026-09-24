@@ -99,10 +99,16 @@ class ClipTiling:
         return max(1, min(n_video, count))
 
 
-# Bound on one tile-ordered q or k copy in TeacherCollector (heads are
-# processed in chunks under it), and the bytes of one bf16 head_dim-128 row.
+# Bound on one tile-ordered q / k / v / out copy in TeacherCollector and
+# SparseStudent (heads are processed in chunks under it), and the bytes of
+# one bf16 head_dim-128 row.
 _COLLECT_BYTES = 512 * 2**20
 _HEAD_DIM_BYTES = 128 * 2
+
+
+def _chunk_heads(tile_layout: tiling.TileLayout) -> int:
+    """Heads per chunk so one tile-ordered copy stays under _COLLECT_BYTES."""
+    return max(1, _COLLECT_BYTES // (tile_layout.num_slots * _HEAD_DIM_BYTES))
 
 
 def _fused(x: torch.Tensor) -> bool:
@@ -189,7 +195,7 @@ class TeacherCollector:
             # Heads are independent, so a group is processed in chunks of
             # heads: the tile-ordered q / k copies of a whole group (1.5 GB
             # each at 103k tokens) would not fit next to the trunk.
-            for heads in group.heads.split(self._chunk_heads(tile_layout)):
+            for heads in group.heads.split(_chunk_heads(tile_layout)):
                 q_tiles, feats_q = _gather_and_pool(q, tile_layout, heads)
                 k_tiles, feats_k = _gather_and_pool(k, tile_layout, heads)
                 heat = heatmap.teacher_heat(
@@ -210,11 +216,7 @@ class TeacherCollector:
         self.stats.kl.append(layer_kl)
         return out
 
-    @staticmethod
-    def _chunk_heads(tile_layout: tiling.TileLayout) -> int:
-        """Heads per chunk so one tile-ordered copy stays under the bound."""
-        per_head = tile_layout.num_slots * _HEAD_DIM_BYTES
-        return max(1, _COLLECT_BYTES // per_head)
+
 
 
 class SparseStudent:
@@ -256,27 +258,35 @@ class SparseStudent:
         out = q.new_zeros(seq_len + 1, *q.shape[1:])
         for group in self.plan.head_groups(layer_index, self.clip.device):
             tile_layout = self.clip.get(group.shape)
-            q_tiles, feats_q = _gather_and_pool(q, tile_layout, group.heads)
-            k_tiles, feats_k = _gather_and_pool(k, tile_layout, group.heads)
-            v_tiles = _gather(v, tile_layout, group.heads)
-            with torch.no_grad():
-                logits = self.predictor.layers[layer_index](
-                    feats_q, feats_k, group.heads)
-                # Only video query tiles are selected; global rows are dense.
-                selection = veda_mask.select_video_blocks(
-                    logits[:, :tile_layout.n_video_tiles], tile_layout,
-                    self.clip.blocks(tile_layout))
-                block_mask = veda_mask.dense_block_mask(selection,
-                                                        tile_layout)
-            if self.use_fa4:
-                o_tiles = fa4.block_sparse_attention(
-                    q_tiles, k_tiles, v_tiles, block_mask, tile_layout)
-            else:
-                o_tiles = reference.block_sparse_attention(
-                    q_tiles, k_tiles, v_tiles, block_mask,
-                    tile_layout.valid_count)
-            _scatter_(out, o_tiles, tile_layout, group.heads)
+            # Chunks of heads bound the tile-ordered q / k / v / out copies
+            # (heads are independent throughout, so this is exact).
+            for heads in group.heads.split(_chunk_heads(tile_layout)):
+                self._attend(q, k, v, layer_index, tile_layout, heads, out)
         out = out[:seq_len]
         if used < seq_len:
             out[used:] = 0
         return out
+
+    def _attend(self, q, k, v, layer_index: int,
+                tile_layout: tiling.TileLayout, heads: torch.Tensor,
+                out: torch.Tensor) -> None:
+        """Sparse attention of some heads of one group, scattered to out."""
+        q_tiles, feats_q = _gather_and_pool(q, tile_layout, heads)
+        k_tiles, feats_k = _gather_and_pool(k, tile_layout, heads)
+        v_tiles = _gather(v, tile_layout, heads)
+        with torch.no_grad():
+            logits = self.predictor.layers[layer_index](feats_q, feats_k,
+                                                        heads)
+            # Only video query tiles are selected; global rows are dense.
+            selection = veda_mask.select_video_blocks(
+                logits[:, :tile_layout.n_video_tiles], tile_layout,
+                self.clip.blocks(tile_layout))
+            block_mask = veda_mask.dense_block_mask(selection, tile_layout)
+        if self.use_fa4:
+            o_tiles = fa4.block_sparse_attention(q_tiles, k_tiles, v_tiles,
+                                                 block_mask, tile_layout)
+        else:
+            o_tiles = reference.block_sparse_attention(
+                q_tiles, k_tiles, v_tiles, block_mask,
+                tile_layout.valid_count)
+        _scatter_(out, o_tiles, tile_layout, heads)

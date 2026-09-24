@@ -40,7 +40,7 @@
   v 的 gather 和输出的 scatter 也有对应 kernel。gather / scatter / max / min 与 torch 逐位相同，
   mean 的 fp32 求和顺序不同（容差）。训练（TeacherCollector）和推理（SparseStudent）用同一个
   kernel。4090 上 14 个头的一组：gather + 池化 1.30 → 0.34 ms。
-- TeacherCollector 按头分块处理一个头组（每块 tile 顺序的 q 或 k 副本不超过 512 MiB）：整组 56 个头
+- TeacherCollector 与 SparseStudent 都按头分块处理一个头组（每块 tile 顺序的 q 或 k 副本不超过 512 MiB）：整组 56 个头
   的副本在 103k token 时各 1.5 GB，放不进 trunk 旁边。各头独立、KL 按块内头数加权，所以每个头的梯度
   不变（只有浮点舍入可能不同）；抽样的 query 行对整组只抽一次。
 - seer KL：student logits 在空列上填 −inf 后做 log-softmax；teacher 热力图按行归一化；

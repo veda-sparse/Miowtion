@@ -72,7 +72,9 @@ def main():
                         help='output directory; with several samples, one '
                         'subdirectory per sample')
     parser.add_argument('--decode-only', action='store_true',
-                        help='decode <mode>_latents.pt of an earlier run')
+                        help='decode <mode>_latents.pt of an earlier run '
+                        '(without it, existing latents are reused and only '
+                        'missing (sample, mode) pairs are denoised)')
     args = parser.parse_args()
 
     env = parallel.init_distributed()
@@ -144,6 +146,12 @@ def _denoise_all(args, env, cache, jobs) -> list[dict]:
                                            if plan else ''))
         results = {}
         for mode in args.attention:
+            saved = os.path.join(out_dir, f'{mode}_latents.pt')
+            if os.path.exists(saved):
+                # Resume: a finished (sample, mode) of an earlier run.
+                results[mode] = pipeline.Generated(**torch.load(saved))
+                progress.log(f'{mode}: reusing {saved}')
+                continue
             results[mode] = pipeline.generate(
                 tch.model, tch.schedule, tch.tables, cache, sample, geometry,
                 args.seed, env.device, mode, plan, predictor, veda_config,

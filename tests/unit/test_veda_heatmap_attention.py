@@ -179,3 +179,27 @@ def test_teacher_collector_head_chunks_match_whole_groups(monkeypatch):
     assert chunked[1] == pytest.approx(whole[1], rel=1e-6)
     for a, b in zip(chunked[2], whole[2]):
         torch.testing.assert_close(a, b, rtol=1e-5, atol=1e-12)
+
+
+def test_sparse_student_head_chunks_are_exact(monkeypatch):
+    from miowtion.h3 import geometry
+    from miowtion.h3 import layout as h3_layout
+    from miowtion.veda import plan as veda_plan
+    geo = geometry.Geometry('16:9', 512, 256, 39, 12, 16, 32, 20)
+    lay = h3_layout.pack(torch.ones(300, dtype=torch.long), geo)
+    q, k, v = (t.float() for t in _qkv(lay.seq_len, heads=4))
+    plan = veda_plan.TilePlan(geo.name, geo.video_grid,
+                              [tiling.TileShape(4, 4, 8),
+                               tiling.TileShape(2, 8, 8)],
+                              [[0, 1, 1, 0]])
+    torch.manual_seed(0)
+    pred = veda_predictor.TileScorePredictor(1, 4, 32)
+    clip = veda_attention.ClipTiling(lay, veda_attention.VedaConfig(
+        target_budget=veda_mask.Budget(ratio=0.2)), torch.device('cpu'))
+    student = veda_attention.SparseStudent(clip, plan, pred,
+                                           allow_reference_kernel=True)
+    with torch.no_grad():
+        whole = student(q, k, v, 0)
+        monkeypatch.setattr(veda_attention, '_COLLECT_BYTES', 1)
+        chunked = student(q, k, v, 0)
+    assert torch.equal(chunked, whole)

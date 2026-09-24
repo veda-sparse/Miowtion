@@ -48,6 +48,9 @@ prompt 先用 `scripts/encode_samples.py` 编码进样本缓存。`--sample-id` 
   写满 N 帧视频就结束整个输出，而原始视频从管道进来比音频编码快得多，音频被截在当时的位置。稠密和
   稀疏都受影响，本机较新的 ffmpeg 不出现。去掉 `-frames:v`（管道 EOF 自然结束），单测用满尺寸
   噪声帧检查两条音轨的时长（在 4.4 上修复前失败、修复后通过）。
+- **单卡推理 16:9 14.4 s（104k token）在 Veda 的 FA4 输出分配处 OOM**：SparseStudent 一次处理整个
+  头组（q/k/v/out 的 tile 顺序副本各约 1 GB）。改为与 TeacherCollector 一样按头分块，结果逐位不变。
+  多样本生成改为可续跑：已存在的 `<mode>_latents.pt` 直接复用，只补缺的 (样本, 模式)。
 - 第 0 步包含 FA4 / Triton kernel 的编译（Veda 第 0 步 22.1 s，之后每步 15.0 s），计时和加速比
   必须按 warmup 之后的步折算。
 
