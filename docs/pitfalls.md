@@ -43,6 +43,8 @@
 | `SparseStudent` 报张量行数不匹配（330 vs 336） | 把包含全局行的 logits 交给只要视频行的 `select_video_blocks` | 只取视频行；CPU 测试用带全局 tile 的布局 | [training](features/training.md) |
 | 长 clip（78k+ token）在 `apply_rope` 处 OOM | eager RoPE 链的每一步都是整张 [S, H, D] 临时张量 | 按行分块（逐位相同）；训练 offload 40 个 block | [h3_model](features/h3_model.md) |
 | 单卡推理 104k token 时 Veda 在 FA4 输出分配处 OOM | SparseStudent 一次处理整个头组 | 与 collector 一样按头分块（逐位不变） | [inference](features/inference.md) |
+| 解码一个 14.4 s 的片段要 2.7 分钟 | 视频 VAE 的解码端是 2.42B 的 ViT3D，权重 fp32，用不上 tensor core | 视频 VAE 转 bf16（3.2×，51.3 dB） | [inference](features/inference.md) |
+| 关掉 VAE tiling 后画质崩坏（19.7 dB）且更慢 | token id 是 tile 局部坐标，ViT 的 RoPE 没在整帧坐标上训练过 | tiling 是设计前提，不要关 | [inference](features/inference.md) |
 | 解码 14.4 s 16:9 时 OOM | `revert_tensor` 要 345 帧 1344×768 的 fp32 副本（约 4 GB） | 按帧分块（32 帧，逐位相同） | [inference](features/inference.md) |
 | 两个单卡推理进程被 host OOM killer 杀掉 | 每个进程为 offload 的 block 各 pin ~35 GB | 一个进程驱动多张卡，共享 pinned slab | [inference](features/inference.md) |
 | 16:9 14.4 s（103k token）训练在 TeacherCollector 里 OOM | 整个头组的 tile 顺序 q / k 副本各 1.5 GB | 按头分块（≤ 512 MiB），梯度不变 | [predictor_mask](features/veda_predictor_mask.md) |

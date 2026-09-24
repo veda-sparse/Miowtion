@@ -16,6 +16,15 @@
   → 发布版 VAE 的 `decode_base(z, frame_num)` → `processor.revert_tensor`（[0,1]）；音频行是
   按声道优先的 `[2·audio_t, 32]`，反归一化后按两个单声道的 batch 送进 mono 音频 VAE（32 kHz，每个
   latent 帧 800 个采样点）。响度保护与 Turbo 参考生成器相同：std×5 > 1 时整体缩小。
+- **视频 VAE 的解码端是 2.42 B 参数的 ViT3D**（`use_vit_decoder`，36 层、dim 2048、32 头、gated
+  SiLU FFN；编码端才是 3D CNN），权重是 fp32，所以解码本身是分钟级的工作量，不是 bug。
+  默认把它转成 bf16（`--decode-dtype`）：fp32 既用不上 tensor core，SDPA 也退出 flash 路径。
+  音频 VAE 太小，保持 fp32。
+- **tile 解码不能关**：`create_token_ids` 给的是 **tile 局部坐标**，ViT 的 RoPE 只在 256 px tile
+  的坐标范围内训练过；整帧解码时坐标跑到 84×48，属于分布外（实测 PSNR 只有 19.7 dB），而且因为
+  attention 变成 S=20160 的 O(S²)，总时间反而更长。所以 tiling 是这个 decoder 的设计前提。
+- **不值得在 VAE 里上稀疏**：tiled + bf16 时 attention 只占解码时间的 9%（S=1280），上限太低。
+  只有整帧那条（错误的）路上 attention 才占 51%。
 - 先释放 DiT 再加载 VAE。视频 VAE 开启空间 tile 解码（256，重叠 64）。反归一化
   （`revert_tensor`）按帧分块（`_REVERT_CHUNK_FRAMES = 32`）：它是逐元素的，分块结果逐位相同，
   只为避免 345 帧 1344×768 的 fp32 副本（4 GB）撑爆 24 GB 卡。
@@ -69,6 +78,15 @@ prompt 先用 `scripts/encode_samples.py` 编码进样本缓存。`--sample-id` 
   125 GB 的机器上两个进程就只剩十几 GB。改成一个进程驱动多张卡、共享 pinned slab。
 
 ## 验证记录
+- 2026-09-24，RTX 4090 单卡，解码 14.4 s 16:9（345 帧 1344×768）的同一批 latent：
+
+  | 配置 | 时间 | attention 占比 | 峰值显存 | vs fp32 的 PSNR |
+  |---|---|---|---|---|
+  | fp32 + tiling | 165.3 s | 20%（32.6 s，20160 次调用） | 16.1 GiB | — |
+  | **bf16 + tiling（默认）** | **50.9 s** | 9%（4.5 s） | 9.3 GiB | **51.3 dB** |
+  | bf16 + 整帧 | 59.2 s | 51%（30.0 s，720 次调用） | 9.9 GiB | 19.7 dB |
+
+
 - 2026-09-24，RTX 4090 单卡（40 个 block offload），FL2VA + Turbo v4_step600_ema 8 步，16:9
   5.17 s（38k token），prompt `search5s_0000`（不在打分器训练集中），seed 0，打分器为阶段 1 第 50 次
   update 的 EMA，保留 10%：

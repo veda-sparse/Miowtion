@@ -66,7 +66,20 @@ def audio_latent(rows: torch.Tensor, mean: torch.Tensor,
 class Decoder:
     """Video and audio VAE decoders of one release variant."""
 
-    def __init__(self, variant_dir: str, device: torch.device):
+    def __init__(self, variant_dir: str, device: torch.device,
+                 dtype: torch.dtype = torch.bfloat16):
+        """Loads both VAEs on `device`.
+
+        Args:
+            variant_dir: Release variant directory (FL2VA / Ref2VA).
+            device: Where the decoders run.
+            dtype: Video VAE weight dtype. The checkpoints are fp32, but
+                the video
+                decoder is a 2.4B-parameter ViT3D: fp32 leaves the tensor
+                cores idle and SDPA falls back off its flash kernel, so
+                decoding a 14.4 s 16:9 clip takes 165 s and 16.1 GiB
+                against 50.9 s and 9.3 GiB in bf16, at 51.3 dB PSNR.
+        """
         self.device = device
         video_pkg = encode.import_release_package(
             variant_dir, 'video_vae.minimax_h3_video_vae')
@@ -75,7 +88,9 @@ class Decoder:
         video_dir = os.path.join(variant_dir, 'video_vae')
         audio_dir = os.path.join(variant_dir, 'audio_vae')
         self.video_vae = video_pkg.MiniMaxH3VideoVAE.from_pretrained(
-            video_dir).to(device).eval()
+            video_dir).to(device=device, dtype=dtype).eval()
+        # The audio VAE stays fp32: it is small enough that its dtype does
+        # not show up in the decode time, so there is nothing to trade.
         self.audio_vae = audio_pkg.MiniMaxH3AudioVAE.from_pretrained(
             audio_dir).to(device).eval()
         self.video_mean, self.video_std = _latent_stats(video_dir)
