@@ -12,6 +12,7 @@
 | transformers + accelerate | pip，`encode` extra | 已验证 5.17 / 1.15 | 离线 prompt 编码（Qwen3-VL） | `Qwen3VLForConditionalGeneration`、`model.model.language_model.norm`（替换为 Identity） |
 | torchvision | pip | 与 torch 匹配 | transformers 的 Qwen3-VL 处理器 | — |
 | diffusers | pip，`encode` extra | `0.32.2`（发布版 `model_index.json` 的版本） | 发布版视频 VAE 的代码依赖它（`ModelMixin` / `ConfigMixin`）：推理解码、fl2va 条件编码 | 只经由发布版 VAE 包间接使用 |
+| mlx | pip，`mlx` extra | ≥0.32（已验证 0.32.2） | Apple silicon 推理（`miowtion/mlx`）：block 前向、NVMe offloading | `mx.quantize` / `mx.dequantize` / `mx.quantized_matmul`（affine，`group_size`、`bits`）；`mx.fast.scaled_dot_product_attention`；`mx.load` 对 safetensors 的惰性加载；`mx.array` 的 buffer 可经 `np.asarray` 拿到可写视图（slab 直接读入）；`mx.synchronize` / `mx.get_peak_memory` / `mx.set_cache_limit` |
 | safetensors / numpy / pyyaml | pip | 见 pyproject | IO | — |
 
 升级规则：每次升级都作为独立提交，并重跑 unit + gpu 测试和对齐检查（见 AGENTS.md）。

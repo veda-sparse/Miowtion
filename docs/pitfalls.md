@@ -72,3 +72,14 @@
 | DeepSeek `reasoning_effort: "medium"` 被接受，但没有中档效果 | 档位只有 none/low/high/max，medium 会被映射成 high | 记录请求值并注明实际等于 high；要更低只能用 low | [prompt_expansion](features/prompt_expansion.md) |
 | PE 输出 shot 之间有空行，或字段重复 | LLM 输出格式漂移 | 要求每个字段单段；`check_expansion` 拒收；repair 轮重试 | [prompt_expansion](features/prompt_expansion.md) |
 | PE 输出里出现 "landscape shot" / "16:9 frame" | user 消息里的几何描述泄漏进了正文 | user 消息只写 "16:9 (width:height)"；checker 拒收宽高比字符串 | [prompt_expansion](features/prompt_expansion.md) |
+
+## Apple silicon（MLX）
+
+| 现象 | 原因 | 对策 | 链接 |
+|---|---|---|---|
+| mmap 读 checkpoint 只有 0.84 GB/s，比 pread 慢 7.8 倍 | 缺页同步、一次一页，SSD 队列始终是空的 | 用并发 `pread` 读进预分配 buffer（或 `mx.load`），不要用 mmap 做大块顺序读 | [mlx_inference](features/mlx_inference.md) |
+| SSD 吞吐只有标称的一半 | 每次读 1 MiB 太小 | 16 MiB 一块、4 线程并发，才跑满 ~6.4 GB/s | [mlx_inference](features/mlx_inference.md) |
+| 长序列进程峰值接近内存上限 | 未分块时 QKV 与 MLP 的中间量按整个序列物化 | 默认开 `head_chunk` / `row_chunk`；S=16384 峰值从 6.21 降到 3.56 GB，还更快 | [mlx_inference](features/mlx_inference.md) |
+| 量化到 4 bit 后不但没变快，反而慢了 | M3 Pro 上这些 GEMM 是算力受限而非带宽受限 | 量化只用来省磁盘和内存，不要指望提速 | [mlx_inference](features/mlx_inference.md) |
+| 逐 block 读完后内存持续增长 | `mx.load` 惰性，但 evaluate 过的 array 会一直持有数据 | 每个 block 用完即丢掉返回的 dict，不要缓存 | [mlx_inference](features/mlx_inference.md) |
+| torch ↔ MLX 转换后 bf16 精度变差 | numpy 没有 bfloat16，默认路径经过 fp32 | 两边 view 成 int16，按原始 16 bit 搬运 | [mlx_inference](features/mlx_inference.md) |
