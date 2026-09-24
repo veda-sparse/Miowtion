@@ -24,6 +24,7 @@ from miowtion.h3 import config as h3_config
 from miowtion.mlx import block as mlx_block
 from miowtion.mlx import offload
 from miowtion.mlx import slab
+from miowtion.mlx import sparse_attention
 from miowtion.utils import progress
 
 GB = 1e9
@@ -377,14 +378,92 @@ def load_latency(source: str, directory: str, blocks: Sequence[int],
 # Compute benchmarks.
 
 
-def block_flops(config: h3_config.H3Config, seq_len: int) -> dict[str, float]:
-    """Matmul FLOPs of one block forward (dense attention)."""
+def block_flops(config: h3_config.H3Config, seq_len: int,
+                density: float = 1.0) -> dict[str, float]:
+    """Matmul FLOPs of one block forward; density 1.0 is dense attention."""
     params = (config.hidden_size * 3 * config.inner_dim
               + config.inner_dim * config.hidden_size
               + config.hidden_size * 2 * config.ffn_dim
               + config.ffn_dim * config.hidden_size)
     return {'gemm': 2.0 * seq_len * params,
-            'attention': 4.0 * seq_len * seq_len * config.inner_dim}
+            'attention': (4.0 * seq_len * seq_len * config.inner_dim
+                          * density)}
+
+
+def sparse_plan(seq_len: int, density: float, q_block: int,
+                k_block: int, seed: int = 0) -> sparse_attention.SparsePlan:
+    """A random Veda-shaped plan of the requested density (for timings).
+
+    Which key tiles are selected does not change the cost, only how many, so
+    a random selection with the real budget is enough to time the path.
+
+    Raises:
+        ValueError: If the tiles do not divide seq_len or the density rounds
+            to an empty budget.
+    """
+    if seq_len % q_block or seq_len % k_block:
+        raise ValueError(f'seq_len {seq_len} must be a multiple of q_block '
+                         f'{q_block} and k_block {k_block}')
+    n_k = seq_len // k_block
+    budget = round(density * n_k)
+    if not 1 <= budget <= n_k:
+        raise ValueError(f'density {density} gives budget {budget} of {n_k} '
+                         'key tiles')
+    index = sparse_attention.random_index(seq_len // q_block, n_k, budget,
+                                          seed=seed)
+    mx.eval(index)
+    return sparse_attention.SparsePlan(index, q_block, k_block)
+
+
+def attention_only(config: h3_config.H3Config, seq_len: int,
+                   plan: sparse_attention.SparsePlan | None,
+                   head_chunk: int | None = None, reps: int = 3) -> dict:
+    """Times attention alone, dense (plan=None) or block-sparse.
+
+    Isolating attention is what tells us whether the sparse path is worth its
+    gather: the block forward mixes in GEMMs that sparsity cannot help.
+    """
+    heads = config.inner_dim // config.head_dim
+    key = mx.random.key(0)
+    q, k, v = [mx.random.normal((heads, seq_len, config.head_dim),
+                                key=sub).astype(mx.bfloat16)
+               for sub in mx.random.split(key, 3)]
+    mx.eval(q, k, v)
+    mx.reset_peak_memory()
+
+    def run():
+        if plan is None:
+            out = mx.fast.scaled_dot_product_attention(
+                q[None], k[None], v[None],
+                scale=config.head_dim ** -0.5)[0]
+        else:
+            out = sparse_attention.block_sparse_attention(
+                q, k, v, plan.index, q_block=plan.q_block,
+                k_block=plan.k_block, scale=config.head_dim ** -0.5,
+                head_chunk=head_chunk)
+        mx.eval(out)
+
+    run()
+    times = []
+    for _ in range(reps):
+        start = time.perf_counter()
+        run()
+        times.append(time.perf_counter() - start)
+    seconds = min(times)
+    density = 1.0 if plan is None else plan.density(seq_len)
+    flops = 4.0 * heads * seq_len * seq_len * config.head_dim * density
+    return {
+        'seq_len': seq_len, 'density': density,
+        'q_block': None if plan is None else plan.q_block,
+        'k_block': None if plan is None else plan.k_block,
+        'budget': None if plan is None else plan.budget,
+        'head_chunk': head_chunk, 'seconds': seconds,
+        'tflops': flops / seconds / 1e12,
+        'gathered_gb': 0.0 if plan is None else sparse_attention.
+        gathered_bytes(seq_len, heads, config.head_dim, plan.q_block,
+                       density) / GB,
+        'mlx_peak_gb': mx.get_peak_memory() / GB,
+    }
 
 
 def compute_block(config: h3_config.H3Config, seq_len: int, bits: int,
@@ -434,10 +513,12 @@ def compute_block(config: h3_config.H3Config, seq_len: int, bits: int,
                                       seq_len, config, options,
                                       profile=stages)
         mx.eval(out)
-    flops = block_flops(config, seq_len)
+    density = (1.0 if options.sparse is None
+               else options.sparse.density(seq_len))
+    flops = block_flops(config, seq_len, density)
     seconds = min(times)
     return {
-        'seq_len': seq_len, 'bits': bits, 'qmm': qmm,
+        'seq_len': seq_len, 'bits': bits, 'qmm': qmm, 'density': density,
         'head_chunk': options.head_chunk, 'row_chunk': options.row_chunk,
         'eval_chunks': options.eval_chunks, 'seconds': seconds,
         'tflops': (flops['gemm'] + flops['attention']) / seconds / 1e12,

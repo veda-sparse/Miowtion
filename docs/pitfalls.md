@@ -82,4 +82,6 @@
 | 长序列进程峰值接近内存上限 | 未分块时 QKV 与 MLP 的中间量按整个序列物化 | 默认开 `head_chunk` / `row_chunk`；S=16384 峰值从 6.21 降到 3.56 GB，还更快 | [mlx_inference](features/mlx_inference.md) |
 | 量化到 4 bit 后不但没变快，反而慢了 | M3 Pro 上这些 GEMM 是算力受限而非带宽受限 | 量化只用来省磁盘和内存，不要指望提速 | [mlx_inference](features/mlx_inference.md) |
 | 逐 block 读完后内存持续增长 | `mx.load` 惰性，但 evaluate 过的 array 会一直持有数据 | 每个 block 用完即丢掉返回的 dict，不要缓存 | [mlx_inference](features/mlx_inference.md) |
+| 给 MLX 的融合 attention 上 90 % 稀疏的块掩码，时间只降到 0.97 倍 | 掩码在 Q@K.T 矩阵乘之后才施加，只有内置 `"causal"` 会缩短 key 循环上界 | 按固定预算把选中的 key tile gather 成规整批量问题，走一次稠密 kernel，拿到 9–10 倍 | [mlx_inference](features/mlx_inference.md) |
+| 块稀疏开了反而吃内存、加速不明显 | `q_block` 太小，gather 量正比于 `S/q_block` | `q_block` 取 2048 以上，再用 `head_chunk` 压峰值 | [mlx_inference](features/mlx_inference.md) |
 | torch ↔ MLX 转换后 bf16 精度变差 | numpy 没有 bfloat16，默认路径经过 fp32 | 两边 view 成 int16，按原始 16 bit 搬运 | [mlx_inference](features/mlx_inference.md) |

@@ -28,6 +28,7 @@ from collections.abc import Mapping, Sequence
 import mlx.core as mx
 
 from miowtion.h3 import config as h3_config
+from miowtion.mlx import sparse_attention
 
 # Release names of the trunk tensors of one block, relative to `blocks.{i}.`.
 # The AdaLN projection is absent: inference uses precomputed tables.
@@ -194,11 +195,14 @@ class BlockOptions:
         eval_chunks: Evaluate every chunk before building the next one, so
             that at most one chunk's temporaries are alive (bounds peak
             unified memory on long clips; costs one GPU sync per chunk).
+        sparse: Veda block-sparse attention plan; None runs dense attention.
+            Requires `used` to be a multiple of both tile sizes.
     """
 
     head_chunk: int | None = None
     row_chunk: int = DEFAULT_ROW_CHUNK
     eval_chunks: bool = False
+    sparse: sparse_attention.SparsePlan | None = None
 
 
 class _Stages:
@@ -304,6 +308,20 @@ def _check_inputs(x, adaln, adaln_index, rope, used, config, options):
                          f'{config.num_heads}')
     if options.row_chunk < 1:
         raise ValueError(f'row_chunk must be >= 1, got {options.row_chunk}')
+    plan = options.sparse
+    if plan is not None:
+        # Padding rows must stay out of attention, and the gathered problem
+        # must be rectangular, so the real rows have to tile exactly. Veda's
+        # geometries are tile-aligned by construction; refuse rather than
+        # silently attend to padding.
+        if used % plan.q_block or used % plan.k_block:
+            raise ValueError(
+                f'used {used} must be a multiple of q_block {plan.q_block} '
+                f'and k_block {plan.k_block} for sparse attention')
+        if plan.index.shape[0] != used // plan.q_block:
+            raise ValueError(
+                f'sparse index has {plan.index.shape[0]} query tiles, '
+                f'expected {used // plan.q_block}')
 
 
 def block_forward(x: mx.array, weights: BlockWeights,
@@ -375,11 +393,18 @@ def block_forward(x: mx.array, weights: BlockWeights,
         v = qkv[:, :, 2]
         del qkv
         stages.mark('qk_norm_rope', q, k)
-        out = mx.fast.scaled_dot_product_attention(
-            q[:used].transpose(1, 0, 2)[None],
-            k[:used].transpose(1, 0, 2)[None],
-            v[:used].transpose(1, 0, 2)[None], scale=scale)
-        out = out[0].transpose(1, 0, 2)  # [used, head_chunk, D]
+        if options.sparse is None:
+            out = mx.fast.scaled_dot_product_attention(
+                q[:used].transpose(1, 0, 2)[None],
+                k[:used].transpose(1, 0, 2)[None],
+                v[:used].transpose(1, 0, 2)[None], scale=scale)[0]
+        else:
+            out = sparse_attention.block_sparse_attention(
+                q[:used].transpose(1, 0, 2), k[:used].transpose(1, 0, 2),
+                v[:used].transpose(1, 0, 2), options.sparse.index,
+                q_block=options.sparse.q_block,
+                k_block=options.sparse.k_block, scale=scale)
+        out = out.transpose(1, 0, 2)  # [used, head_chunk, D]
         del q, k, v
         outs.append(out)
         maybe_eval(out)

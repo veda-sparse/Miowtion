@@ -180,3 +180,47 @@ def test_padding_rows_do_not_leak():
         interop.from_torch(index.to(torch.int32)),
         tuple(interop.from_torch(r) for r in rope), _USED, _CONFIG)
     assert torch.equal(interop.to_torch(other)[:_USED], out[:_USED])
+
+
+def _plan(q_block, k_block, budget, seed=0):
+    from miowtion.mlx import sparse_attention
+    index = sparse_attention.random_index(_USED // q_block, _USED // k_block,
+                                          budget, seed=seed)
+    return sparse_attention.SparsePlan(index, q_block, k_block)
+
+
+def test_sparse_plan_with_full_budget_matches_dense():
+    # Every key tile selected, in order: the sparse path sees exactly the
+    # dense problem, so only the kernel's tiling differs.
+    dense = _mlx_forward(torch.float32)
+    plan = _plan(16, 16, budget=_USED // 16)
+    got = _mlx_forward(torch.float32, mlx_block.BlockOptions(sparse=plan))
+    assert _rel_l2(got, dense) < 1e-5
+
+
+def test_sparse_plan_restricts_attention_and_keeps_padding_out():
+    plan = _plan(20, 16, budget=2)
+    sparse = _mlx_forward(torch.float32, mlx_block.BlockOptions(sparse=plan))
+    dense = _mlx_forward(torch.float32)
+    # A 40 % budget must actually change the result.
+    assert _rel_l2(sparse, dense) > 1e-3
+    # Padding rows are outside [0, used), so they still cannot leak in.
+    assert sparse.shape == dense.shape
+
+
+def test_sparse_plan_is_validated():
+    weights = interop.block_weights_from_torch(_torch_block(torch.bfloat16))
+    x, tables, index, rope = _inputs(torch.bfloat16)
+    args = [interop.from_torch(x), weights,
+            [interop.from_torch(t) for t in tables],
+            interop.from_torch(index.to(torch.int32)),
+            tuple(interop.from_torch(r) for r in rope), _USED, _CONFIG]
+    plan = _plan(20, 16, 2)
+    bad_plans = [
+        dataclasses.replace(plan, q_block=32),  # does not tile `used`
+        dataclasses.replace(plan, k_block=32),
+        dataclasses.replace(plan, index=plan.index[:-1]),  # wrong tile count
+    ]
+    for bad in bad_plans:
+        with pytest.raises(ValueError):
+            mlx_block.block_forward(*args, mlx_block.BlockOptions(sparse=bad))

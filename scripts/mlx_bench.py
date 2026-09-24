@@ -10,6 +10,7 @@ Examples:
     python scripts/mlx_bench.py load --source slab \
         --dir artifacts/mlx/slabs_bf16 --blocks 8
     python scripts/mlx_bench.py compute --seq-len 4096 16384 --bits 0
+    python scripts/mlx_bench.py attention --seq-len 38912 --density 1.0 0.1
     python scripts/mlx_bench.py stream --dir artifacts/mlx/slabs_bf16 \
         --blocks 8 --passes 1 --seq-len 4096
 """
@@ -33,10 +34,14 @@ def _emit(result: dict, out: str | None) -> None:
             f.write(line + '\n')
 
 
-def _options(args) -> mlx_block.BlockOptions:
+def _options(args, seq_len: int) -> mlx_block.BlockOptions:
+    plan = None
+    if args.density < 1.0:
+        plan = bench.sparse_plan(seq_len, args.density, args.q_block,
+                                 args.k_block)
     return mlx_block.BlockOptions(head_chunk=args.head_chunk,
                                   row_chunk=args.row_chunk,
-                                  eval_chunks=args.eval_chunks)
+                                  eval_chunks=args.eval_chunks, sparse=plan)
 
 
 def main():
@@ -77,9 +82,21 @@ def main():
     p = sub.add_parser('residency', help='page-cache residency of files')
     p.add_argument('--paths', nargs='+', required=True)
 
+    p = sub.add_parser('attention', help='attention alone, dense vs sparse')
+    p.add_argument('--seq-len', type=int, nargs='+', required=True)
+    p.add_argument('--density', type=float, nargs='+', default=[1.0])
+    p.add_argument('--q-block', type=int, nargs='+', default=[2048])
+    p.add_argument('--k-block', type=int, default=128)
+    p.add_argument('--head-chunk', type=int, default=None)
+    p.add_argument('--reps', type=int, default=3)
+
     for name in ('compute', 'stream'):
         p = sub.add_parser(name)
         p.add_argument('--head-chunk', type=int, default=None)
+        p.add_argument('--density', type=float, default=1.0,
+                       help='Veda block-sparse density (1.0 = dense)')
+        p.add_argument('--q-block', type=int, default=2048)
+        p.add_argument('--k-block', type=int, default=128)
         p.add_argument('--row-chunk', type=int,
                        default=mlx_block.DEFAULT_ROW_CHUNK)
         p.add_argument('--eval-chunks', action='store_true')
@@ -128,11 +145,27 @@ def main():
         result = {'cmd': 'residency',
                   'resident': [bench.file_resident_fraction(p)
                                for p in args.paths]}
+    elif args.cmd == 'attention':
+        for seq_len in args.seq_len:
+            for density in args.density:
+                blocks = args.q_block if density < 1.0 else [args.q_block[0]]
+                for q_block in blocks:
+                    bench.require_headroom(args.min_available_gb)
+                    plan = (None if density >= 1.0 else
+                            bench.sparse_plan(seq_len, density, q_block,
+                                              args.k_block))
+                    result = bench.attention_only(config, seq_len, plan,
+                                                  head_chunk=args.head_chunk,
+                                                  reps=args.reps)
+                    result['cmd'] = 'attention'
+                    _emit(result, args.out)
+                    mx.clear_cache()
+        return
     elif args.cmd == 'compute':
         for seq_len in args.seq_len:
             bench.require_headroom(args.min_available_gb)
             result = bench.compute_block(config, seq_len, args.bits,
-                                         args.qmm, _options(args),
+                                         args.qmm, _options(args, seq_len),
                                          reps=args.reps,
                                          profile=not args.no_profile)
             result['cmd'] = 'compute'
@@ -141,7 +174,8 @@ def main():
         return
     else:
         result = bench.streamed_run(args.dir, args.blocks, args.passes,
-                                    args.seq_len, config, _options(args),
+                                    args.seq_len, config,
+                                    _options(args, args.seq_len),
                                     depth=args.depth, nocache=not args.cache,
                                     dequantize=args.dequantize)
         result['cmd'] = 'stream'

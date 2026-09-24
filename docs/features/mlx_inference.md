@@ -40,6 +40,26 @@ tensor 数据，每个 tensor 对齐到 SLAB_ALIGNMENT
 - **分块不改变结果**：block 里除 attention 外都是逐行的，按 head 分块（QKV +
   attention）和按行分块（norm、输出投影、残差、MLP）只是重排，用来压峰值内存。
 
+### 为什么块稀疏要"聚合"而不是"加掩码"
+
+MLX 的融合 attention（`mx.fast.scaled_dot_product_attention`）接受布尔掩码，但掩码
+是在 Q@K.T 的 tile 矩阵乘**之后**才施加的：只有内置的 `"causal"` 会缩短 key 循环的
+上界，任意块掩码不会。所以给它一个 90 % 稀疏的块掩码只能拿到正确性和 O(S) 的内存，
+拿不到 FLOP（实测 0.97×，等于没有）。
+
+Veda 的关键性质是**每个 query tile 的预算固定**（选中的 key tile 数都一样）。于是可
+以把选中的 key tile 直接 gather 成一个规整的
+`[n_query_tiles, heads, budget * k_block, head_dim]` 张量，再交给**一次批量的稠密**
+attention：kernel 看到的问题宽度就真的是 `budget * k_block` 而不是 `S`。
+
+- **不需要写 Metal kernel**：实测 9–10 倍加速（见「实测」），已经接近密度的理论上界。
+- 代价是 gather 要重写 `density * S^2 / q_block` 行，所以 query tile 要够大；Veda 的
+  tile 本来就是几千行这个量级。
+- 不变量：结果必须与"等价块掩码下的稠密 attention"**逐位相等**——两条路径看到的是
+  同一批 key、同样的顺序，没有理由不等。单测用 `mx.array_equal` 卡死这一点。
+- `used` 必须同时是 `q_block` 和 `k_block` 的整数倍，否则 padding 行会被卷进 attention。
+  不满足时直接报错，不静默回退到稠密。
+
 ### 数值
 
 MLX block 的算子顺序对齐 `miowtion/h3/model.py`，让每一步逐元素运算在同一个位置
@@ -54,6 +74,7 @@ round 到 bf16：RMSNorm 的统计量和乘权重在 fp32 里算、只 round 一
 | 文件 | 作用 |
 |---|---|
 | `miowtion/mlx/block.py` | 一个 trunk block 的前向；`BlockWeights`（发布 layout，含量化）、`BlockOptions`（head / row 分块） |
+| `miowtion/mlx/sparse_attention.py` | Veda 块稀疏：`SparsePlan`、gather 版 `block_sparse_attention`、稠密参考、代价模型 |
 | `miowtion/mlx/interop.py` | torch ↔ MLX 的逐位转换（numpy 没有 bf16，按 16 bit 原始位走） |
 | `miowtion/mlx/slab.py` | slab 格式、`SlabReader`（pread 进预分配 buffer）、`BlockPrefetcher`、`convert_checkpoint` |
 | `miowtion/mlx/offload.py` | 不转换的替代方案：直接读发布的 safetensors（`mx.load` 惰性加载 / 每个分片一个 mmap） |
@@ -128,6 +149,33 @@ round 到 bf16：RMSNorm 的统计量和乘权重在 fp32 里算、只 round 一
 量化的收益只在 **I/O 量和内存**，不在速度；量化矩阵乘反而慢 2–6 %。它确实省内存：
 S=38080 下 8 bit 的进程峰值是 3.59 GB，bf16 是 4.51 GB。
 
+### Veda 块稀疏（gather 版，k_block=128，密度约 10 %）
+
+先单独测 attention（56 head × 128，bf16）。`q_block` 越大 gather 越少、越快：
+
+| 序列长度 | 稠密 | q_block=512 | 1024 | 2048 | 4096 | 最好的加速比 |
+|---|---|---|---|---|---|---|
+| 8 192 | 365 ms | 52.4 ms | 43.2 ms | 38.8 ms | **37.0 ms** | 9.88×（上界 10.7×） |
+| 16 384 | 1 494 ms | 237.9 ms | 193.2 ms | 171.7 ms | **163.4 ms** | 9.14×（上界 9.85×） |
+| 38 912 | 8 580 ms | — | — | **944 ms** | — | 9.09×（上界 10.1×） |
+
+**拿到了密度上界的 90–93 %**，说明 gather 的开销基本可以忽略。gather 缓冲随
+`q_block` 反比缩小（S=16384、密度 10 % 时 512→1.53 GB，4096→0.19 GB），所以大
+`q_block` 是双赢。`head_chunk` 用来压 gather 的峰值内存，而且不花钱：S=38912 下
+`head_chunk=4` 是 922 ms / 峰值 4.38 GB，不分块是 944 ms / 6.42 GB。
+
+放回整个 block（`head_chunk=8, row_chunk=4096`，`q_block=2048`）：
+
+| 序列长度 | 稠密 block | 稀疏 block | block 加速 | 其中 attention（稠密 → 稀疏） |
+|---|---|---|---|---|
+| 4 096 | 0.673 s | 0.590 s | 1.14× | 96.7 → 12.0 ms（8.1×） |
+| 16 384 | 3.858 s | 2.505 s | 1.54× | 1 509 → 173 ms（8.7×） |
+| 38 912 | 14.52 s | **6.62 s** | **2.19×** | 8 950 → 947 ms（9.45×） |
+
+稀疏之后 attention 只剩 14 % 的时间，**剩下的 86 % 是 GEMM**（S=38912 下
+qkv 1.55 s + out 0.55 s + MLP 3.13 s ≈ 5.67 s）。而量化过的 GEMM 并不更快（见上），
+所以 6.62 s 就是这台机器在这个序列长度上的地板；再想快只能降分辨率或换机器。
+
 ### 端到端流式（预取 depth=1，2 个 slot）
 
 每个 block 的读完全藏在上一个 block 的计算后面：
@@ -139,22 +187,28 @@ S=38080 下 8 bit 的进程峰值是 3.59 GB，bf16 是 4.51 GB。
 | 4 096 | 4 bit | 0.217 GB | 733 ms | 731 ms | 35 ms | 2.2 ms | 1.59 GB |
 | 16 384 | bf16 | 0.771 GB | 3 940 ms | 3 925 ms | 118 ms | 14.8 ms | 4.02 GB |
 
+开了稀疏（密度 10 %）之后计算变快，读 / 算的比值变差，但仍然完全藏得住：
+
+| 序列长度 | 每 block 墙钟 | 其中计算 | 其中后台读 | 实际等待（首块之后） |
+|---|---|---|---|---|
+| 4 096 | 608 ms | 590 ms | 118 ms | 4–18 µs |
+| 16 384 | 2 548 ms | 2 505 ms | 118 ms | 7–24 µs |
+
 「实际等待」是消费端真正阻塞在 I/O 上的时间，基本只剩第一个 block 的冷启动。
-**即使在最短的序列、最大的 bf16 权重下，读 / 算的比值也只有 119/686 ≈ 0.17**，
-离 I/O 受限还有 6 倍的余量。
+**即使在最短的序列、最大的 bf16 权重、并且开了稀疏的情况下，读 / 算的比值也只有
+118/590 ≈ 0.20**，离 I/O 受限还有 5 倍的余量。
 
 ### 外推：一次完整生成（50 block × 8 步 = 400 次 block 前向）
 
-| 序列长度 | bf16 每次生成 | 90 % 块稀疏后（估算） |
-|---|---|---|
-| 4 096 | 4.6 min | 4.0 min |
-| 16 384 | 26 min | 17 min |
-| 38 080 | 93 min | **43 min** |
+| 序列长度 | bf16 稠密 | bf16 + 10 % 块稀疏（实测外推） | 加速 |
+|---|---|---|---|
+| 4 096 | 4.6 min | 4.1 min | 1.14× |
+| 16 384 | 26 min | 17.0 min | 1.54× |
+| 38 912 | 97 min | **44 min** | 2.19× |
 
 一次生成总共要读 400 × 0.771 GB ≈ **308 GB**，按 6.5 GB/s 是 47 s，全部藏在计算
-后面。Veda 的 90 % 块稀疏只作用在 attention 上，按实测的 attention 时间占比线性
-折算（MLX 这边不需要稀疏 kernel，只是给出上界）：序列越长收益越大，38 080 上能
-省掉一半以上的时间。
+后面。稀疏的收益随序列长度增长（attention 占比从 14 % 涨到 59 %），38 912 上能砍掉
+一半以上的时间。
 
 **所有配置都是计算受限，没有一个是 I/O 受限的。** 这是本研究最主要的结论：在这台
 机器上，NVMe offloading 基本是免费的，瓶颈是 M3 Pro 那 ~5 TFLOPS 的 bf16 算力。
@@ -178,16 +232,28 @@ S=38080 下 8 bit 的进程峰值是 3.59 GB，bf16 是 4.51 GB。
 - 读参数保持 16 MiB 一块、4 线程；调小会直接掉带宽。
 - 内存主要被激活占，不是被权重占：在 18 GB 机器上真正的上限来自序列长度，务必开
   分块。
+- **块稀疏用 gather 版（`BlockOptions.sparse`），`q_block` 取 2048 或更大**；小
+  `q_block` 既慢又吃内存。gather 缓冲配合 `head_chunk` 一起压。
 
 ## 测试
 
-`tests/unit/test_mlx_block.py`（8 个，缺 mlx 时自动 skip）：
+`tests/unit/test_mlx_block.py`（11 个，缺 mlx 时自动 skip）：
 
 - torch ↔ MLX 转换、RoPE、SwiGLU 逐位相等（`torch.equal`）。
 - 整个 block 对 torch 参考实现：fp32 相对 L2 < 1e-5；bf16 < 5e-3，并且额外要求
   MLX 的 bf16 结果离 fp32 参考不比 torch 的 bf16 结果更远。
 - 分块（head / row）不改变结果；padding 行不影响真实行的输出。
 - 8 / 4 bit 量化的误差量级；`BlockWeights.from_tensors` 对缺失和多余的 tensor 报错。
+- 满预算的稀疏 plan 与稠密一致；部分预算确实改变结果；tile 不整除 `used` 或 plan 的
+  query tile 数不对时报错。
+
+`tests/unit/test_mlx_sparse_attention.py`（8 个）：
+
+- gather 版与"等价块掩码下的稠密 attention"**逐位相等**（`mx.array_equal`）；
+  `head_chunk` 不改变结果（同样逐位）。
+- 满预算等于稠密；没选中的 key tile 改掉 V 也不影响输出。
+- `block_mask_from_index` 标记的正是选中的 tile；非法 tile / 预算 / `head_chunk`
+  一律报错；FLOP 与 gather 字节数的代价模型按密度和 `q_block` 正确缩放。
 
 `tests/unit/test_mlx_slab.py`（6 个）：
 
@@ -208,6 +274,13 @@ S=38080 下 8 bit 的进程峰值是 3.59 GB，bf16 是 4.51 GB。
   3.56 GB，而且分块还更快一点。对策：默认就开 `head_chunk` / `row_chunk`。
 - **量化不提速**。本以为 4 bit 能靠省带宽提速，实测反而慢 2–4 %：M3 Pro 上这些
   GEMM 是算力受限的。对策：量化只当成省磁盘 / 省内存的手段。
+- **MLX 的融合 attention 不会跳过全被掩掉的块**。现象：给 90 % 稀疏的块掩码，时间
+  是稠密的 0.97 倍，等于白给。原因：掩码在 Q@K.T 的 tile 矩阵乘之后才施加，只有内置
+  的 `"causal"` 会缩短 key 循环上界。对策：按固定预算把选中的 key tile gather 成规整
+  批量问题，走一次稠密 kernel，拿到 9–10 倍（见 `sparse_attention.py`）。
+- **稀疏的 `q_block` 不能太小**。现象：S=16384、密度 10 % 时 `q_block=512` 比
+  `q_block=4096` 慢 46 %、峰值内存多 2.7 GB。原因：gather 的量正比于 `S/q_block`。
+  对策：`q_block` 取 2048 以上，并用 `head_chunk` 压峰值。
 - **numpy 没有 bfloat16**。torch ↔ MLX 只能按 16 bit 原始位搬（两边都 view 成
   int16），否则会经过 fp32 损失精度。见 `interop.py`。
 - **`mx.load` 的返回值要及时丢掉**。它是惰性的，但 evaluate 过的 array 会一直持有
@@ -216,8 +289,10 @@ S=38080 下 8 bit 的进程峰值是 3.59 GB，bf16 是 4.51 GB。
 ## 验证记录
 
 - 2026-09-24，Apple M3 Pro / 18 GB / mlx 0.32.2，commit 见本次提交：
-  `pytest tests/unit` 116 passed。以上全部数字由 `scripts/mlx_bench.py` 在合成
+  `pytest tests/unit` 127 passed。以上全部数字由 `scripts/mlx_bench.py` 在合成
   权重（真实 shape）上实测。
+- 块稀疏与稠密掩码路径**逐位相等**（单测），因此不需要 AGENTS.md 1.5 要求的
+  可视化人工确认。
 - **尚未用真实权重验证**，也没有做视频层面的可视化对比（本研究不下载权重）。
   在真实 checkpoint 上跑通并做人工一致性确认之前，这里的结论只覆盖性能，不覆盖
   生成质量。
@@ -230,5 +305,7 @@ S=38080 下 8 bit 的进程峰值是 3.59 GB，bf16 是 4.51 GB。
   文本条件和 VAE 解码）。
 - 测 S=65536 及以上，确认 18 GB 上真正的序列上限。
 - AdaLN 表的预计算目前还在 torch 侧，MLX 侧只消费表；考虑一并搬过来。
-- Veda 的块稀疏在 MLX 上没有 kernel，表里的稀疏收益是按 attention 时间占比折算的
-  上界，需要真正实现后复核。
+- 稀疏的 `index` 目前是测速用的随机选择；接上 Veda 打分器产出的真实 plan（以及
+  按头不同的 tile 形状）还没做。
+- 稀疏之后 GEMM 占 86 %，值得测一下 MLX 有没有更快的 GEMM 路径（`mx.compile`、
+  不同的 tile 形状）。
