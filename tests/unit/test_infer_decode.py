@@ -1,5 +1,6 @@
 """Tests for miowtion.infer.decode (latent layout and helpers)."""
 
+import math
 import shutil
 import subprocess
 
@@ -83,3 +84,37 @@ def test_mp4_keeps_the_full_audio(tmp_path):
     assert abs(durations['video'][0] - seconds) < 0.05
     assert len(durations['audio']) == 2
     assert all(abs(d - seconds) < 0.1 for d in durations['audio'])
+
+
+def test_video_frame_chunking_is_exact(monkeypatch):
+    """The de-normalization is elementwise, so chunking must not change it."""
+    class _Processor:
+        @staticmethod
+        def revert_tensor(x):
+            return (x * 0.5 + 0.25).clamp(0, 1)
+
+    class _Vae:
+        processor = _Processor()
+
+        @staticmethod
+        def parameters():
+            yield torch.zeros(1)
+
+        @staticmethod
+        def decode_base(z, frame_num):
+            del frame_num
+            gen = torch.Generator().manual_seed(z.shape[2])
+            return torch.randn(1, 3, 70, 8, 12, generator=gen)
+
+    decoder = decode.Decoder.__new__(decode.Decoder)
+    decoder.device = torch.device('cpu')
+    decoder.video_vae = _Vae()
+    decoder.video_mean, decoder.video_std = torch.zeros(24), torch.ones(24)
+    geo = geometry.geometry_from_latent_t('1:1', 37)
+    rows = torch.randn(geo.latent_t * (geo.latent_h // 2)
+                       * (geo.latent_w // 2), 96)
+    monkeypatch.setattr(decode, '_REVERT_CHUNK_FRAMES', 1000)
+    whole = decoder.video(rows, geo)
+    monkeypatch.setattr(decode, '_REVERT_CHUNK_FRAMES', 7)
+    assert np.array_equal(decoder.video(rows, geo), whole)
+    assert whole.shape == (70, 8, 12, 3)

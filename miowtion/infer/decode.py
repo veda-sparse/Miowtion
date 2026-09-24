@@ -28,6 +28,10 @@ _TITLE_BAR_FRACTION = 0.08
 _TITLE_FONT = 'DejaVuSans-Bold.ttf'
 # Separator between side-by-side videos, in pixels (even, for yuv420p).
 _SEPARATOR = 8
+# Frames whose de-normalization runs at once. The step is elementwise per
+# frame, so chunking is exact; unchunked, the fp32 copy of a 14.4 s 16:9
+# clip (345 frames of 1344x768) is 4 GB and exhausts a 24 GB GPU.
+_REVERT_CHUNK_FRAMES = 32
 # The Turbo LoRA's reference generator scales the waveform down only when
 # its std exceeds 1/5, to avoid clipping on loud outputs.
 _LOUDNESS_STD_FACTOR = 5.0
@@ -87,9 +91,15 @@ class Decoder:
         dtype = next(self.video_vae.parameters()).dtype
         recon = self.video_vae.decode_base(z.to(self.device, dtype),
                                            frame_num=geometry.frame_count)
-        pixels = self.video_vae.processor.revert_tensor(recon.float())
-        frames = pixels[0].permute(1, 2, 3, 0).mul(255).round()
-        return frames.to(torch.uint8).cpu().numpy()
+        out = np.empty((recon.shape[2], recon.shape[3], recon.shape[4], 3),
+                       np.uint8)
+        for start in range(0, recon.shape[2], _REVERT_CHUNK_FRAMES):
+            rows_ = slice(start, start + _REVERT_CHUNK_FRAMES)
+            pixels = self.video_vae.processor.revert_tensor(
+                recon[:, :, rows_].float())
+            frames = pixels[0].permute(1, 2, 3, 0).mul(255).round()
+            out[rows_] = frames.to(torch.uint8).cpu().numpy()
+        return out
 
     @torch.no_grad()
     def audio(self, rows: torch.Tensor) -> torch.Tensor:

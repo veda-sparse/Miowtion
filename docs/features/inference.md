@@ -16,12 +16,9 @@
   → 发布版 VAE 的 `decode_base(z, frame_num)` → `processor.revert_tensor`（[0,1]）；音频行是
   按声道优先的 `[2·audio_t, 32]`，反归一化后按两个单声道的 batch 送进 mono 音频 VAE（32 kHz，每个
   latent 帧 800 个采样点）。响度保护与 Turbo 参考生成器相同：std×5 > 1 时整体缩小。
-- 先释放 DiT 再加载 VAE。视频 VAE 开启空间 tile 解码（256，重叠 64）。
-- **标准对比方式**（以后所有稠密 / 稀疏对比都按这个来）：每种模式单独一个 `<mode>.mp4`；另有
-  `dense_vs_veda.mp4`，左右拼接，顶部标题栏分别是 "Dense" 和 "Veda <S>% Sparsity"
-  （S = 100 × (1 − 保留比例)），带两条音轨（稠密在前）；`summary.json` 记录每步耗时、注意力 GPU
-  时间（CUDA event，Veda 包括打分、选块和 gather）、端到端与注意力加速比、逐帧 PSNR。第 0 步包含
-  kernel 编译，不计入加速比。还会保存 `<mode>_latents.pt`。
+- 先释放 DiT 再加载 VAE。视频 VAE 开启空间 tile 解码（256，重叠 64）。反归一化
+  （`revert_tensor`）按帧分块（`_REVERT_CHUNK_FRAMES = 32`）：它是逐元素的，分块结果逐位相同，
+  只为避免 345 帧 1344×768 的 fp32 副本（4 GB）撑爆 24 GB 卡。
 
 ## 用法
 ```bash
@@ -53,6 +50,8 @@ prompt 先用 `scripts/encode_samples.py` 编码进样本缓存。`--sample-id` 
   多样本生成改为可续跑：已存在的 `<mode>_latents.pt` 直接复用，只补缺的 (样本, 模式)。
 - 第 0 步包含 FA4 / Triton kernel 的编译（Veda 第 0 步 22.1 s，之后每步 15.0 s），计时和加速比
   必须按 warmup 之后的步折算。
+- **解码 14.4 s 16:9 时 OOM**：`revert_tensor(recon.float())` 要把 [1,3,345,768,1344] 转成 fp32
+  （约 4 GB）再加上输出，单卡放不下。按帧分块后峰值有界，单测检查分块与不分块逐位相同。
 
 ## 验证记录
 - 2026-09-24，RTX 4090 单卡（40 个 block offload），FL2VA + Turbo v4_step600_ema 8 步，16:9
