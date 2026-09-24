@@ -99,6 +99,15 @@ class AdalnTables:
         self._tables.update(tables)
         return consumed
 
+    def to(self, device: torch.device) -> 'AdalnTables':
+        """A copy on `device` (one storage per block, like build)."""
+        copy = AdalnTables()
+        for key, table in self._tables.items():
+            copy._tables[key] = [  # pylint: disable=protected-access
+                tuple(torch.cat(block, dim=-1).to(device).chunk(6, dim=-1))
+                for block in table]
+        return copy
+
     def num_bytes(self) -> int:
         """Device memory held by the tables (6 chunks share one storage)."""
         return sum(block[0].untyped_storage().nbytes()

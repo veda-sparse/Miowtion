@@ -141,6 +141,12 @@
   FSDP，参数放 pinned host 内存，前向 pre-hook 在独立的 copy stream 上用 non_blocking 拷贝预取下一
   个 block，计算流只等自己 block 的 event；`record_stream` 防止显存被提前复用。输出与 FSDP 路径
   逐位相同。
+- **H2D 带宽受限于 GPU 的 PCIe 链路**：x4 链路上 pinned、pageable、整块 slab 的拷贝都是约 6 GB/s，
+  拷贝方式无关，链路才是上限。所以 `BlockStreamer` 的改进目标是"藏在计算后面"和"不让分配器抖动"，
+  而不是提高单次拷贝的带宽：offload 的 block 打包进 pinned `HostSlabs`（每个 block 每种 dtype 一个
+  连续缓冲区，一次 DMA），设备端用 `prefetch + 1` 个预分配的环形缓冲区（不经过 caching allocator），
+  环形槽位只在计算流用完上一个 block 后才被覆盖（event）。`parallel.replicate` 在另一张卡上复制
+  常驻参数，offload 的 block 与源模型共用同一份 pinned 主机内存，多卡推理不增加主机内存。
 - 显存太满时 caching allocator 反复 "memory mapping failed" 并重试（会同步），预取的重叠就被抵消了
   （稠密推理 40 个 block offload 时只快了 0.3 s）。常驻 block 要给预取的拷贝留出余量。
 - **`SparseStudent` 把全部 tile 的 logits 交给了只接受视频 query 行的 `select_video_blocks`**：

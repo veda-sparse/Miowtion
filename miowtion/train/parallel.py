@@ -16,6 +16,8 @@ need every row of a sequence on one device.
 
 from __future__ import annotations
 
+import collections
+import copy as copy_lib
 import dataclasses
 import datetime
 import functools
@@ -123,55 +125,119 @@ def shard_trunk(model: h3_model.H3DiT, mesh: dm.DeviceMesh,
             block.set_modules_to_forward_prefetch(ahead)
 
 
+class HostSlabs:
+    """Offloaded blocks' parameters packed into pinned host slabs.
+
+    One contiguous pinned buffer per (block, dtype): a block reaches the GPU
+    with one DMA per dtype instead of one copy per parameter. The parameters
+    become views into their slab, so the host holds exactly one copy, which
+    any number of devices (BlockStreamer per GPU) can stream from.
+    """
+
+    def __init__(self, blocks: Sequence[nn.Module], offload: set[int]):
+        self.order = sorted(offload)
+        self.slabs: dict[int, dict[torch.dtype, torch.Tensor]] = {}
+        # Per block: (name, dtype, offset, shape) of every parameter.
+        self.entries: dict[int, list[tuple[str, torch.dtype, int,
+                                           torch.Size]]] = {}
+        self.max_numel: dict[torch.dtype, int] = {}
+        for i in self.order:
+            named = list(blocks[i].named_parameters())
+            sizes: dict[torch.dtype, int] = {}
+            entries = []
+            for name, p in named:
+                if p.device.type != 'cpu':
+                    raise ValueError(f'block {i} is not on the host')
+                entries.append((name, p.dtype, sizes.get(p.dtype, 0),
+                                p.shape))
+                sizes[p.dtype] = sizes.get(p.dtype, 0) + p.numel()
+            slabs = {dt: torch.empty(n, dtype=dt, pin_memory=True)
+                     for dt, n in sizes.items()}
+            for (name, dt, offset, shape), (_, p) in zip(entries, named):
+                view = slabs[dt][offset:offset + p.numel()].view(shape)
+                view.copy_(p.data)
+                p.data = view
+            self.slabs[i] = slabs
+            self.entries[i] = entries
+            for dt, n in sizes.items():
+                self.max_numel[dt] = max(self.max_numel.get(dt, 0), n)
+
+    def host_views(self, index: int) -> dict[str, torch.Tensor]:
+        """Parameter name -> its view in the block's host slab."""
+        return {name: self.slabs[index][dt][offset:offset + shape.numel()]
+                .view(shape)
+                for name, dt, offset, shape in self.entries[index]}
+
+
 class BlockStreamer:
-    """Streams CPU-offloaded blocks to the GPU ahead of use (one process).
+    """Streams CPU-offloaded blocks to one GPU ahead of use.
 
     FSDP2 skips its all-gather path at world size 1: its prefetch does
     nothing and an offloaded block is copied to the GPU on the compute
     stream when the block starts (2.4 s of a 16 s denoising step on RTX
     4090). Single-process runs therefore keep offloaded blocks as plain
-    modules with parameters in pinned host memory. A forward pre-hook on
-    block i waits for the copy event of its own weights, then issues
-    non-blocking copies of the next `prefetch` offloaded blocks on a
-    dedicated stream (wrapping around to the next forward), so copies
-    overlap compute. Device copies are released after the block's forward;
-    record_stream keeps the allocator from reusing them before the compute
-    stream is done.
+    modules whose parameters are views into pinned HostSlabs. A forward
+    pre-hook on block i waits for the copy event of its own weights, then
+    issues the copies of the next `prefetch` offloaded blocks (wrapping around
+    to the next forward) on a dedicated stream, one DMA per slab into a ring
+    of `prefetch + 1` preallocated device buffers, so copies overlap compute
+    and the caching allocator never churns. A ring slot is reused only after
+    the compute stream has finished the block that used it.
 
-    Offloaded blocks must be frozen: their device copies are temporary.
+    Several streamers (one per GPU, each on its own module replica) can share
+    one HostSlabs. Offloaded blocks must be frozen.
     """
 
     def __init__(self, blocks: Sequence[nn.Module], offload: set[int],
-                 device: torch.device, prefetch: int = 1):
+                 device: torch.device, prefetch: int = 1,
+                 host: HostSlabs | None = None):
         if prefetch < 1:
             raise ValueError(f'prefetch must be >= 1, got {prefetch}')
         self.device = device
         self.prefetch = prefetch
         self.order = sorted(offload)
+        self.host = host if host is not None else HostSlabs(blocks, offload)
+        if self.host.order != self.order:
+            raise ValueError('HostSlabs cover other blocks')
         self.stream = torch.cuda.Stream(device)
-        self.params = {i: list(blocks[i].parameters()) for i in self.order}
-        self._inflight: dict[int, tuple[torch.cuda.Event,
-                                        list[torch.Tensor]]] = {}
-        self._host: dict[int, list[torch.Tensor]] = {}
+        self.params = {i: dict(blocks[i].named_parameters())
+                       for i in self.order}
         for i in self.order:
-            for p in self.params[i]:
-                if p.device.type != 'cpu':
-                    raise ValueError(f'block {i} is not on the host')
-                if not p.data.is_pinned():
-                    p.data = p.data.pin_memory()
+            for name, view in self.host.host_views(i).items():
+                self.params[i][name].data = view
+        slots = prefetch + 1
+        self.ring = [{dt: torch.empty(n, dtype=dt, device=device)
+                      for dt, n in self.host.max_numel.items()}
+                     for _ in range(slots)]
+        self._released: list[torch.cuda.Event | None] = [None] * slots
+        self._inflight: dict[int, tuple[int, torch.cuda.Event]] = {}
+        self._running: dict[int, int] = {}
+        for i in self.order:
             blocks[i].register_forward_pre_hook(
                 functools.partial(self._before, i))
             blocks[i].register_forward_hook(functools.partial(self._after, i))
 
+    def _free_slot(self) -> int:
+        busy = set(self._running.values()) | {
+            slot for slot, _ in self._inflight.values()}
+        for slot in range(len(self.ring)):
+            if slot not in busy:
+                return slot
+        raise RuntimeError('no free ring slot (prefetch accounting bug)')
+
     def _fetch(self, index: int) -> None:
-        if index in self._inflight:
+        if index in self._inflight or index in self._running:
             return
+        slot = self._free_slot()
         with torch.cuda.stream(self.stream):
-            copies = [p.data.to(self.device, non_blocking=True)
-                      for p in self.params[index]]
+            if self._released[slot] is not None:
+                self.stream.wait_event(self._released[slot])
+            for dt, host in self.host.slabs[index].items():
+                self.ring[slot][dt][:host.numel()].copy_(host,
+                                                         non_blocking=True)
             event = torch.cuda.Event()
             event.record(self.stream)
-        self._inflight[index] = (event, copies)
+        self._inflight[index] = (slot, event)
 
     def _following(self, index: int) -> list[int]:
         k = self.order.index(index)
@@ -182,23 +248,68 @@ class BlockStreamer:
     def _before(self, index: int, module: nn.Module, args) -> None:
         del module, args
         params = self.params[index]
-        if torch.is_grad_enabled() and any(p.requires_grad for p in params):
+        if torch.is_grad_enabled() and any(p.requires_grad
+                                           for p in params.values()):
             raise RuntimeError(f'offloaded block {index} must be frozen')
         self._fetch(index)
-        event, copies = self._inflight.pop(index)
-        stream = torch.cuda.current_stream(self.device)
-        stream.wait_event(event)
-        self._host[index] = [p.data for p in params]
-        for p, copy in zip(params, copies):
-            copy.record_stream(stream)
-            p.data = copy
+        slot, event = self._inflight.pop(index)
+        torch.cuda.current_stream(self.device).wait_event(event)
+        for name, dt, offset, shape in self.host.entries[index]:
+            params[name].data = self.ring[slot][dt][
+                offset:offset + shape.numel()].view(shape)
+        self._running[index] = slot
         for following in self._following(index):
             self._fetch(following)
 
     def _after(self, index: int, module: nn.Module, args, output) -> None:
         del module, args, output
-        for p, host in zip(self.params[index], self._host.pop(index)):
-            p.data = host
+        slot = self._running.pop(index)
+        released = torch.cuda.Event()
+        released.record(torch.cuda.current_stream(self.device))
+        self._released[slot] = released
+        for name, view in self.host.host_views(index).items():
+            self.params[index][name].data = view
+
+
+def replicate(model: h3_model.H3DiT, device: torch.device,
+              prefetch: int = 1) -> h3_model.H3DiT:
+    """A copy of a single-process model on another GPU.
+
+    Resident parameters and buffers are copied to `device`; offloaded blocks
+    keep pointing at the source model's pinned HostSlabs (no second host
+    copy) and get their own BlockStreamer on `device`. The source must not
+    be running a forward.
+    """
+    source = getattr(model, 'block_streamer', None)
+    offload = set(source.order) if source is not None else set()
+    offloaded = {id(p) for i in offload for p in model.blocks[i].parameters()}
+    memo = {}
+    for p in model.parameters():
+        data = p.data if id(p) in offloaded else p.data.to(device)
+        memo[id(p)] = nn.Parameter(data, requires_grad=p.requires_grad)
+    for b in model.buffers():
+        memo[id(b)] = b.to(device)
+    # The streamer's hooks and stream belong to the source device: detach
+    # them for the copy.
+    hooks = [(block._forward_pre_hooks, block._forward_hooks)  # pylint: disable=protected-access
+             for block in model.blocks]
+    for block in model.blocks:
+        block._forward_pre_hooks = collections.OrderedDict()  # pylint: disable=protected-access
+        block._forward_hooks = collections.OrderedDict()  # pylint: disable=protected-access
+    if source is not None:
+        del model.block_streamer
+    try:
+        copy = copy_lib.deepcopy(model, memo)
+    finally:
+        for block, (pre, post) in zip(model.blocks, hooks):
+            block._forward_pre_hooks = pre  # pylint: disable=protected-access
+            block._forward_hooks = post  # pylint: disable=protected-access
+        if source is not None:
+            model.block_streamer = source
+    if source is not None:
+        copy.block_streamer = BlockStreamer(copy.blocks, offload, device,
+                                            prefetch, host=source.host)
+    return copy
 
 
 def build_model(transformer_dir: str, env: DistEnv, drop_adaln: bool,

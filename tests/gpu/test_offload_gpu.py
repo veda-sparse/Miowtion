@@ -55,3 +55,25 @@ def test_trainable_offloaded_block_is_rejected():
         block.cuda()
     with pytest.raises(RuntimeError, match='frozen'):
         model(torch.randn(4, 256, device='cuda'))
+
+
+def test_replica_shares_host_slabs_and_matches():
+    resident = _stack().cuda().requires_grad_(False)
+    streamed = copy.deepcopy(resident).cpu()
+    offload = {0, 2, 3, 5}
+    for i, block in enumerate(streamed.blocks):
+        if i not in offload:
+            block.cuda()
+    streamed.block_streamer = parallel.BlockStreamer(
+        streamed.blocks, offload, torch.device('cuda'), prefetch=1)
+    replica = parallel.replicate(streamed, torch.device('cuda'))
+    x = torch.randn(64, 256, device='cuda')
+    with torch.no_grad():
+        for _ in range(2):
+            assert torch.equal(streamed(x), resident(x))
+            assert torch.equal(replica(x), resident(x))
+    for i in offload:  # one host copy: the replica views the same slab
+        for a, b in zip(streamed.blocks[i].parameters(),
+                        replica.blocks[i].parameters()):
+            assert a.data_ptr() == b.data_ptr() and a.is_pinned()
+    assert replica.block_streamer.host is streamed.block_streamer.host
