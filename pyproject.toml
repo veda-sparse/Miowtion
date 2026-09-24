@@ -24,6 +24,8 @@ gpu = [
   "triton>=3.3",
   "flash-attn-4 @ git+https://github.com/Dao-AILab/flash-attention@d15f1531a460ba456f41b01a774f33ab2db8febf#subdirectory=flash_attn/cute",
 ]
+# Apple silicon inference with NVMe offloading (miowtion/mlx).
+mlx = ["mlx>=0.32"]
 # Offline prompt encoding (Qwen3-VL text tower, the release's VAEs).
 encode = ["transformers>=4.57", "accelerate", "torchvision", "pillow",
           "diffusers==0.32.2"]
