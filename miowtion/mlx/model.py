@@ -19,7 +19,7 @@ packed positions, the RoPE tables -- is built once by clip_inputs.
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 
 import mlx.core as mx
 import numpy as np
@@ -119,35 +119,97 @@ def clip_inputs(weights: dit.NonTrunkWeights, config: h3_config.H3Config,
     )
 
 
+def timestep_key(timesteps: np.ndarray) -> tuple[int, ...]:
+    """Exact (bit-level) key of an fp32 timestep set.
+
+    Mirrors miowtion.train.adaln.timestep_key without pulling in torch: a
+    table is only valid for the exact timesteps it was built from, so the
+    key must not round.
+    """
+    values = np.asarray(timesteps, dtype=np.float32).reshape(-1)
+    return tuple(int(v) for v in values.view(np.uint32))
+
+
+class AdalnTables:
+    """Per-block AdaLN tables, keyed by timestep set.
+
+    A schedule uses a handful of distinct timestep sets, and the AdaLN
+    projections are 26 GB, so every set a run can need is computed in one
+    pass over the checkpoint (see precompute_adaln) and looked up by its
+    exact fp32 key afterwards.
+    """
+
+    def __init__(self, tables: Mapping[tuple[int, ...],
+                                       list[tuple[mx.array, ...]]]):
+        self._tables = dict(tables)
+
+    def __contains__(self, timesteps: np.ndarray) -> bool:
+        return timestep_key(timesteps) in self._tables
+
+    def __len__(self) -> int:
+        return len(self._tables)
+
+    def get(self, timesteps: np.ndarray) -> list[tuple[mx.array, ...]]:
+        """The per-block tables of one set.
+
+        Raises:
+            KeyError: When the set was not precomputed.
+        """
+        key = timestep_key(timesteps)
+        if key not in self._tables:
+            raise KeyError(f'no AdaLN table for timesteps '
+                           f'{np.asarray(timesteps).tolist()}; precompute '
+                           'every set of the schedule')
+        return self._tables[key]
+
+    @property
+    def nbytes(self) -> int:
+        return sum(t.nbytes for tables in self._tables.values()
+                   for block in tables for t in block)
+
+
 def precompute_adaln(reader: mlx_convert.ReleaseReader,
-                     weights: dit.NonTrunkWeights, timesteps: np.ndarray,
-                     ) -> list[tuple[mx.array, ...]]:
-    """The per-block AdaLN tables of one distinct-timestep set.
+                     weights: dit.NonTrunkWeights,
+                     timestep_sets: Iterable[np.ndarray]) -> AdalnTables:
+    """The per-block AdaLN tables of every distinct timestep set.
 
     One pass over the 26 GB of AdaLN projections, holding one 520 MB
     projection at a time; what stays is 6 tables of [M * 3, hidden] per
-    block, a few megabytes for the whole trunk.
+    block and per set, a few megabytes for the whole trunk. Doing one pass
+    per set instead would re-read those 26 GB for every step of the
+    schedule.
 
     Args:
         reader: An open ReleaseReader over `<variant>/transformer`.
         weights: The non-trunk weights (for the time embedder).
-        timesteps: [M] fp32 distinct timesteps.
+        timestep_sets: Distinct sorted fp32 timestep sets (duplicates are
+            dropped by their exact key).
 
     Returns:
-        One 6-tuple of [M * MODALITY_NUM, hidden] bf16 tables per block.
+        The tables of every set.
+
+    Raises:
+        ValueError: When no set is given.
     """
     config = reader.config
-    adaln_input = dit.adaln_input(weights, timesteps)
-    counter = progress.Progress('precompute adaln', config.num_layers)
-    tables = []
+    sets = {timestep_key(t): np.asarray(t, dtype=np.float32)
+            for t in timestep_sets}
+    if not sets:
+        raise ValueError('timestep_sets is empty')
+    inputs = {key: dit.adaln_input(weights, t) for key, t in sets.items()}
+    tables = {key: [] for key in sets}
+    counter = progress.Progress(f'precompute adaln ({len(sets)} sets)',
+                                config.num_layers)
     for index in range(config.num_layers):
         tensors = mlx_convert.adaln_tensors(reader, index)
-        block_tables = dit.block_adaln_tables(tensors, adaln_input, config)
-        mx.eval(*block_tables)
+        for key, adaln_input in inputs.items():
+            block_tables = dit.block_adaln_tables(tensors, adaln_input,
+                                                  config)
+            mx.eval(*block_tables)
+            tables[key].append(block_tables)
         del tensors
-        tables.append(block_tables)
         counter.update(f'block {index}')
-    return tables
+    return AdalnTables(tables)
 
 
 def velocity(weights: dit.NonTrunkWeights, blocks: BlockSource,

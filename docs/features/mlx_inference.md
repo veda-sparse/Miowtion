@@ -69,6 +69,11 @@ MLX block 的算子顺序对齐 `miowtion/h3/model.py`，让每一步逐元素�
 round 到 bf16：RMSNorm 的统计量和乘权重在 fp32 里算、只 round 一次；AdaLN 调制和
 门控残差在 bf16 里算；SiLU 在 fp32 里算、round 一次。
 
+Euler 步是个例外：torch 的 `add_(v, alpha=)` 发的是 fused multiply-add（只 round
+一次），MLX 只能分开乘和加（round 两次），差最多 1 ulp（实测 2.4e-07，数量级为 1 的
+值上）。MLX 既没有 fma 算子，GPU 上也没有 fp64；唯一能复现 torch 的办法是把这一步
+走一次 GEMM，把轨迹钉死在 matmul 的累加顺序上，不值得。
+
 结果：**调制、RoPE、SwiGLU 与 torch 逐位相等**；整个 block 不是——RMSNorm 的统计
 量、GEMM、attention 的归约顺序不同（见「踩坑记录」）。
 
@@ -93,6 +98,7 @@ trunk 之外同样的做法：两张超越函数表（RoPE 的 cos/sin、时间�
 | `miowtion/mlx/offload.py` | 不转换的替代方案：直接读发布的 safetensors（`mx.load` 惰性加载 / 每个分片一个 mmap） |
 | `miowtion/mlx/model.py` | 一次速度评估：`clip_inputs`（一条轨迹算一次）、`precompute_adaln`（一遍扫过 26 GB 的 AdaLN 投影，只留下表）、`velocity`（trunk 流式过一遍 block） |
 | `miowtion/mlx/dit.py` | trunk 之外的部分：`NonTrunkWeights`（常驻）、RoPE / 时间步表、AdaLN 表预计算、token refiner、embed、final layer |
+| `miowtion/mlx/pipeline.py` | 去噪循环：`Trajectory`（Euler 步）、`generate`（每步重新流式读一遍 trunk）、`schedule_timestep_sets` |
 | `miowtion/mlx/convert.py` | 读发布的 checkpoint（mmap safetensors → MLX array），融合 q/k/v、写 trunk slab |
 | `miowtion/mlx/bench.py` | 测量用：合成权重、进程与系统内存统计、各项 benchmark |
 | `scripts/mlx_bench.py` | 命令行入口，每项测量单独一个进程，结果按 JSON 行输出 |
@@ -469,8 +475,9 @@ block 一个 plan"，而是 `LayerPlan`：每个头组带自己的 `gather` / `s
 - 2026-09-24，Apple M3 Pro / 18 GB / mlx 0.32.2，commit 见本次提交：
   `pytest tests/unit` 127 passed。以上全部数字由 `scripts/mlx_bench.py` 在合成
   权重（真实 shape）上实测。
-- 2026-09-25，同一台机器：加上 `dit.py`（trunk 之外）、`model.py`（一次速度评估）
-  与其 torch 对照测试后 `pytest tests/unit` 177 passed。同日用真实发布的
+- 2026-09-25，同一台机器：加上 `dit.py`（trunk 之外）、`model.py`（一次速度评估）、
+  `pipeline.py`（去噪循环）与其 torch 对照测试后 `pytest tests/unit` 186 passed。
+  两步 turbo schedule 的端到端轨迹与同一个 torch 循环相对 L2 < 5e-3。同日用真实发布的
   `diffusion_pytorch_model.safetensors.index.json`（638 个键，50 层 + 2 层 refiner）
   核对 `h3/release.py` 的名字表：完全覆盖。
 - 块稀疏与稠密掩码路径**逐位相等**（单测），因此不需要 AGENTS.md 1.5 要求的

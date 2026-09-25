@@ -96,3 +96,4 @@
 | 训练跑着时另起教师进程，权重刚载完就被静默 kill | 不是显存：再开一份 33B 教师要约 66 GB pinned 主机内存（`HostSlabs`），训练已经占掉了大部分，内核 OOM killer 不留回溯 | 离线探针和训练错开跑；判断依据是日志停在 `load weights ... done` 且进程无回溯地消失 | [quant_scoring](features/quant_scoring.md) |
 | 换了一份发布 checkpoint，config 照样能读出来但模型可能是错的 | `from_pretrained` 对认不出的键静默退回默认值，而上游 diffusers 移植版把键全改名了 | `CONFIG_KEYS` 登记两套拼写，缺字段直接报错 | [h3_model](features/h3_model.md) |
 | 主机侧 numpy 算的时间步正弦表与 torch 差 1 ulp，位级对齐的测试挂掉 | numpy 与 torch 的 fp32 `exp` 在 128 个频率里有 14 个最后一位不同（指数的自变量本身逐位相等） | 记录误差（max abs 2.98e-08）、测试改钉"≤1 ulp"；RoPE 的表仍然逐位相等 | [mlx_inference](features/mlx_inference.md) |
+| MLX 的 Euler 步与 torch 差 1 ulp | torch 的 `add_(v, alpha=)` 是 fused multiply-add（单次 round），MLX 分开乘加 | 记录误差（2.4e-07）、测试钉 ≤1 ulp；不要为此把这一步改成 GEMM | [mlx_inference](features/mlx_inference.md) |

@@ -148,14 +148,39 @@ def test_precompute_adaln_reads_every_block(tmp_path):
     model = _torch_model()
     weights = _non_trunk(model)
     timesteps = np.array([0.2, 0.7], dtype=np.float32)
+    other = np.array([0.5], dtype=np.float32)
     with convert.ReleaseReader(str(tmp_path)) as reader:
-        tables = mlx_model.precompute_adaln(reader, weights, timesteps)
+        tables = mlx_model.precompute_adaln(reader, weights,
+                                            [timesteps, other, timesteps])
         want = mlx_dit.block_adaln_tables(
             convert.adaln_tensors(reader, 1),
             mlx_dit.adaln_input(weights, timesteps), reader.config)
-    assert len(tables) == _CONFIG.num_layers
+    assert len(tables) == 2  # the repeated set is computed once
+    assert timesteps in tables and other in tables
+    blocks = tables.get(timesteps)
+    assert len(blocks) == _CONFIG.num_layers
     rows = len(timesteps) * h3_config.MODALITY_NUM
-    for table in tables[1]:
+    for table in blocks[1]:
         assert table.shape == (rows, _CONFIG.hidden_size)
-    for got, expected in zip(tables[1], want):
+    for got, expected in zip(blocks[1], want):
         assert mx.array_equal(got, expected)
+    assert tables.get(other)[0][0].shape == (h3_config.MODALITY_NUM,
+                                             _CONFIG.hidden_size)
+    with pytest.raises(KeyError, match='no AdaLN table'):
+        tables.get(np.array([0.25], dtype=np.float32))
+
+
+def test_timestep_key_does_not_round():
+    a = np.array([0.1, 0.2], dtype=np.float32)
+    b = np.array([0.1, np.nextafter(np.float32(0.2), np.float32(1.0))],
+                 dtype=np.float32)
+    assert mlx_model.timestep_key(a) != mlx_model.timestep_key(b)
+    assert mlx_model.timestep_key(a) == mlx_model.timestep_key(a.copy())
+
+
+def test_precompute_adaln_needs_a_set(tmp_path):
+    _write_release(tmp_path, cfg=_CONFIG)
+    weights = _non_trunk(_torch_model())
+    with convert.ReleaseReader(str(tmp_path)) as reader:
+        with pytest.raises(ValueError, match='timestep_sets is empty'):
+            mlx_model.precompute_adaln(reader, weights, [])
