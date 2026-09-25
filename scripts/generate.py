@@ -8,15 +8,17 @@ with the titles "Dense" / "Veda <S>% Sparsity" and both audio tracks, plus
 timing (per step, attention only, speedups; step 0 of each mode includes
 kernel compilation and is excluded) and the per-frame PSNR in summary.json.
 
-Example (one GPU):
-    CUDA_VISIBLE_DEVICES=0 torchrun --nproc_per_node 1 scripts/generate.py \\
-        --root weights/MiniMax-H3 --schedule turbo --num-steps 8 \\
-        --adapter weights/turbo_lora/minimax_h3_turbo_v4_step600_ema.safetensors \\
-        --sample-cache artifacts/samples/search_2x3 --sample-id search5s_0000 \\
-        --geometry 16:9@37 --attention dense veda \\
-        --plan-dir runs/search_turbo8_4090/plans \\
-        --checkpoint runs/stage1_turbo8_4090/ckpt/step_0000075 \\
-        --out-dir artifacts/generate/search5s_0000
+One process drives every visible GPU; set CUDA_VISIBLE_DEVICES to choose.
+
+The launch parameters belong in a versioned config (see configs/infer_*.yaml
+and miowtion/infer/config.py); any of them can still be overridden on the
+command line:
+    CUDA_VISIBLE_DEVICES=0,1 python scripts/generate.py \\
+        --config configs/infer_holdout20_step600.yaml
+
+The predictor comes either from a deployable bundle (--predictor, which
+carries its own tile plans) or from a training checkpoint plus its plan
+directory (--checkpoint --plan-dir).
 """
 
 import argparse
@@ -28,6 +30,7 @@ import os
 
 import torch
 
+from miowtion.infer import config as infer_config
 from miowtion.infer import decode
 from miowtion.infer import pipeline
 from miowtion.train import data
@@ -35,6 +38,7 @@ from miowtion.train import parallel
 from miowtion.train import teacher
 from miowtion.utils import progress
 from miowtion.veda import attention as veda_attention
+from miowtion.veda import bundle as veda_bundle
 from miowtion.veda import mask as veda_mask
 from miowtion.veda import plan as veda_plan
 
@@ -47,17 +51,18 @@ def _title(mode: str, keep_ratio: float) -> str:
     return f'Veda {100.0 * (1.0 - keep_ratio):g}% Sparsity'
 
 
-def main():
+def build_parser() -> argparse.ArgumentParser:
+    """Every option of the script; also what a --config may set."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--root', required=True, help='checkpoint root')
+    parser.add_argument('--root', help='checkpoint root')
     parser.add_argument('--variant', default='FL2VA')
     parser.add_argument('--schedule', default='turbo')
     parser.add_argument('--num-steps', type=int, default=8)
     parser.add_argument('--adapter', default=None, help='few-step LoRA')
-    parser.add_argument('--sample-cache', required=True)
-    parser.add_argument('--sample-id', nargs='+', required=True,
+    parser.add_argument('--sample-cache')
+    parser.add_argument('--sample-id', nargs='+',
                         help='one or more samples (the model loads once)')
-    parser.add_argument('--geometry', nargs='+', required=True,
+    parser.add_argument('--geometry', nargs='+',
                         help="e.g. '16:9@37'; one per sample, or one for all")
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--attention', nargs='+', default=['dense'],
@@ -65,13 +70,19 @@ def main():
     parser.add_argument('--plan-dir', default=None)
     parser.add_argument('--checkpoint', default=None,
                         help='training checkpoint with the predictor')
-    parser.add_argument('--keep-ratio', type=float, default=0.1)
+    parser.add_argument('--predictor', default=None,
+                        help='predictor bundle (.safetensors) written by '
+                        'scripts/export_predictor.py; brings its own plans, '
+                        'so it replaces --checkpoint and --plan-dir')
+    parser.add_argument('--keep-ratio', type=float, default=None,
+                        help='block budget; defaults to the bundle\'s own '
+                        'ratio, else 0.1')
     parser.add_argument('--dense-steps', type=int, nargs='*', default=[],
                         help='denoising steps that stay dense in veda runs')
     parser.add_argument('--offload-blocks', type=int, default=40)
     parser.add_argument('--prefetch', type=int, default=1)
     parser.add_argument('--mlp-chunk-rows', type=int, default=8192)
-    parser.add_argument('--out-dir', required=True,
+    parser.add_argument('--out-dir',
                         help='output directory; with several samples, one '
                         'subdirectory per sample')
     parser.add_argument('--decode-dtype', default='bf16',
@@ -82,8 +93,37 @@ def main():
                         help='decode <mode>_latents.pt of an earlier run '
                         '(without it, existing latents are reused and only '
                         'missing (sample, mode) pairs are denoised)')
-    args = parser.parse_args()
+    parser.add_argument('--config', default=None,
+                        help='YAML of these same options (see configs/'
+                        'infer_*.yaml); the command line overrides it')
+    return parser
 
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Merges --config into the defaults, then validates what is required.
+
+    Raises:
+        ValueError: If the config holds an unknown key, or an option that
+            has no default is set neither in it nor on the command line.
+    """
+    parser = build_parser()
+    config_only, _ = parser.parse_known_args(argv)
+    if config_only.config:
+        infer_config.merge_into(parser, config_only.config)
+    args = parser.parse_args(argv)
+    infer_config.require(args, ['root', 'sample_cache', 'sample_id',
+                                'geometry', 'out_dir'])
+    if args.keep_ratio is None:
+        # A bundle records the ratio its predictor trained with; without one
+        # there is nothing to inherit and the stage-1 default applies.
+        args.keep_ratio = (
+            float(veda_bundle.read_metadata(args.predictor)['keep_ratio'])
+            if args.predictor else 0.1)
+    return args
+
+
+def main():
+    args = parse_args()
     env = parallel.init_distributed()
     cache = data.SampleCache(args.sample_cache)
     by_id = {s.id: s for s in cache.samples}
@@ -154,17 +194,23 @@ def _denoise_all(args, env, cache, jobs, devices, assigned) -> list[dict]:
         mlp_chunk_rows=args.mlp_chunk_rows)
     plans = predictor = veda_config = None
     if 'veda' in args.attention:
-        if not (args.plan_dir and args.checkpoint):
-            raise ValueError('veda needs --plan-dir and --checkpoint')
-        plans = veda_plan.PlanTable.load_dir(args.plan_dir)
-        cfg = tch.model.config
-        predictor = pipeline.load_predictor(
-            args.checkpoint, cfg.num_layers, cfg.num_heads, cfg.head_dim,
-            devices[0])
+        if args.predictor:
+            loaded = veda_bundle.load(args.predictor, devices[0])
+            plans, predictor = loaded.plans, loaded.predictor
+            source = f'bundle {args.predictor} ({loaded.metadata["source"]})'
+        elif args.plan_dir and args.checkpoint:
+            plans = veda_plan.PlanTable.load_dir(args.plan_dir)
+            cfg = tch.model.config
+            predictor = pipeline.load_predictor(
+                args.checkpoint, cfg.num_layers, cfg.num_heads, cfg.head_dim,
+                devices[0])
+            source = f'plans {args.plan_dir}, checkpoint {args.checkpoint}'
+        else:
+            raise ValueError('veda needs --predictor, or --plan-dir with '
+                             '--checkpoint')
         veda_config = veda_attention.VedaConfig(
             target_budget=veda_mask.Budget(ratio=args.keep_ratio))
-        progress.log(f'veda: plans {args.plan_dir}, predictor '
-                     f'{args.checkpoint}, keep {args.keep_ratio}, dense '
+        progress.log(f'veda: {source}, keep {args.keep_ratio}, dense '
                      f'steps {args.dense_steps}')
     replicas = [(tch.model, tch.tables, predictor)]
     for device in devices[1:]:

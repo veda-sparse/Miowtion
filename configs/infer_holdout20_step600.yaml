@@ -1,0 +1,33 @@
+# 20-clip dense-vs-Veda comparison on the holdout prompts, stage-1 predictor
+# at update 600. Mixed geometries: 5.17 / 10.1 / 14.4 s (latent_t 37 / 72 /
+# 102) across all four aspect ratios, one process over every visible GPU.
+#
+# offload_blocks 50 (not 40) and mlp_chunk_rows 4096: at 24 GB the short
+# geometries run fine with 40 offloaded blocks and then t102 dies of OOM an
+# hour into the run. See docs/pitfalls.md.
+root: weights/MiniMax-H3
+variant: FL2VA
+schedule: turbo
+num_steps: 8
+adapter: weights/turbo_lora/minimax_h3_turbo_v4_step600_ema.safetensors
+sample_cache: artifacts/samples/moviegen_holdout20
+sample_id: [holdout5s_0000, holdout5s_0001, holdout5s_0002, holdout5s_0003,
+            holdout5s_0004, holdout10s_0000, holdout10s_0001, holdout10s_0002,
+            holdout10s_0003, holdout10s_0004, holdout10s_0005,
+            holdout10s_0006, holdout10s_0007, holdout14s_0000,
+            holdout14s_0001, holdout14s_0002, holdout14s_0003,
+            holdout14s_0004, holdout14s_0005, holdout14s_0006]
+geometry: ['4:3@37', '1:1@37', '4:3@37', '1:1@37', '9:16@37',
+           '9:16@72', '16:9@72', '16:9@72', '4:3@72', '4:3@72', '1:1@72',
+           '16:9@72', '1:1@72', '16:9@102', '4:3@102', '4:3@102',
+           '16:9@102', '9:16@102', '4:3@102', '4:3@102']
+seed: 0
+attention: [dense, veda]
+plan_dir: runs/search_turbo8_multigeo_4090/plans
+checkpoint: runs/stage1_fast_t37_4090/ckpt/step_0000600
+keep_ratio: 0.1
+offload_blocks: 50
+prefetch: 1
+mlp_chunk_rows: 4096
+decode_dtype: bf16
+out_dir: artifacts/generate/holdout20_step600

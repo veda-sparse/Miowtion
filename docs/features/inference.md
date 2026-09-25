@@ -10,8 +10,20 @@
   （`veda/attention.SparseStudent`），`--dense-steps` 指定的步保持稠密。
 - 音频速度：Turbo LoRA 的参考生成器在前向里把音频速度乘上 dσ_audio/dσ_video，采样时再除回去，
   净效果是"音频 σ 增量 × 原始速度"，与我们轨迹的做法一致，不需要额外缩放。
-- 打分器从训练 checkpoint 严格加载（默认 EMA 权重），方案表按几何用 `PlanTable.select` 选，必须与
-  训练时同一个方案目录。
+- 打分器有两种来源：训练 checkpoint（`--checkpoint` + `--plan-dir`，默认 EMA 权重），或者**部署用的
+  bundle**（`--predictor`，`miowtion/veda/bundle.py`）。方案表按几何用 `PlanTable.select` 选，
+  必须与训练时同一套方案。
+- **bundle：权重和 tile 方案打包在一起**（`scripts/export_predictor.py` 生成）。训练 checkpoint
+  不是部署件：它带着 EMA 影子（推理永远不读，却占一倍体积）、是 `torch.load` 的 pickle，而且
+  **完全没有记录自己是在哪套 tile 形状上训练的**——那些在另一个方案目录里，要单独带上并且名字要对。
+  配错是静默的：打分器照样出分，只是那是它没见过的 tiling 的分。bundle 是一个 safetensors 文件，
+  张量是 live（非 EMA）权重，`__metadata__`（safetensors 定义为 str→str）里放整张方案表的 JSON
+  以及 `keep_ratio` / 来源 checkpoint / step，于是几何、tile 形状和权重一起走，配错在构造上就不可能。
+  导出时选 live 还是 EMA 只决定一次，记在 `source_weights` 里。
+- **启动参数放在版本化的配置里**（`configs/infer_*.yaml` + `miowtion/infer/config.py`）：推理的
+  旋钮和训练一样多（offload 深度、chunk 行数、方案、保留比例），而配错不会立刻失败——24 GB 卡上
+  短几何跑得好好的，一小时后到第一条 14.4 s 的 clip 才 OOM。配置合并进 argparse 的默认值，
+  命令行仍然可以覆盖任何一项；配置里出现未知 key 直接报错。
 - 解码是编码（`train/encode.py`）的逆过程：视频行 `unpatchify` → `× latents_std + latents_mean`
   → 发布版 VAE 的 `decode_base(z, frame_num)` → `processor.revert_tensor`（[0,1]）；音频行是
   按声道优先的 `[2·audio_t, 32]`，反归一化后按两个单声道的 batch 送进 mono 音频 VAE（32 kHz，每个
@@ -43,20 +55,30 @@
   kernel 编译，不计入加速比。还会保存 `<mode>_latents.pt`。
 
 ## 用法
+一个进程用掉所有可见的卡，用 `CUDA_VISIBLE_DEVICES` 选卡：
 ```bash
-CUDA_VISIBLE_DEVICES=0 torchrun --nproc_per_node 1 scripts/generate.py \
-    --root weights/MiniMax-H3 --schedule turbo --num-steps 8 \
-    --adapter weights/turbo_lora/minimax_h3_turbo_v4_step600_ema.safetensors \
-    --sample-cache artifacts/samples/search_2x3 --sample-id search5s_0000 \
-    --geometry 16:9@37 --attention dense veda \
-    --plan-dir runs/search_turbo8_4090/plans \
-    --checkpoint runs/stage1_turbo8_4090/ckpt/step_0000050 \
-    --out-dir artifacts/generate/search5s_0000
+CUDA_VISIBLE_DEVICES=0,1 python scripts/generate.py \
+    --config configs/infer_holdout20_step600.yaml
 ```
+导出一个部署用的 bundle（live 权重 + 方案表）：
+```bash
+python scripts/export_predictor.py \
+    --checkpoint runs/<run>/ckpt/step_0000600 \
+    --plan-dir runs/<search>/plans --keep-ratio 0.1 \
+    --out weights/veda/<run>_step600.safetensors
+```
+之后推理只要 `--predictor weights/veda/<run>_step600.safetensors`，不再需要
+`--checkpoint` / `--plan-dir`；`--keep-ratio` 不给时用 bundle 自己记的那个。
+
 prompt 先用 `scripts/encode_samples.py` 编码进样本缓存。`--sample-id` / `--geometry` 可以给多个
-（模型只加载一次，每个样本一个子目录，另有汇总的 `summary.json`）。
+（模型只加载一次，每个样本一个子目录，另有汇总的 `summary.json`）。同一个输出目录再跑一次时，
+已经完成的 `<mode>_latents.pt` 会被复用，只补缺的 (样本, 模式) 组合。
 
 ## 测试
+`tests/unit/test_veda_bundle.py`：bundle 往返逐位相等、方案随权重一起走并且能按几何选出来、
+只读 metadata 不读张量、外来的 safetensors 文件被拒、metadata 与张量形状不符被拒。
+`tests/unit/test_configs.py`：`configs/` 下每个 yaml 都能解析成可运行的参数（`infer_*` 进
+`scripts/generate.py` 的 parser，`search_*` 进 `SearchConfig`，其余进 `TrainConfig`）。
 `tests/unit/test_infer_decode.py`：视频 latent 的反归一化是编码的逆（恒等统计量时逐位相等）、
 音频行按声道优先、PSNR。端到端只有 GPU 上的实际生成（见验证记录）。
 
