@@ -93,3 +93,4 @@
 | 解码阶段 worker 卡死、100% CPU 却不出文件 | `psnr_per_frame` 一次性造两份 4.3 GB fp32，三个 worker 38 GB，内存吃紧后每次触页走 direct reclaim | 生成路径不算 PSNR；取栈要注意 ptrace_scope=1 只允许 attach 自己的后代进程 | [inference](features/inference.md) |
 | 换成只训最长几何后，分配器报 OOM 告警（free 0.6 GiB 却要 3.4 GiB） | 混训时 t102 每 12 条轨迹才来一次，只训 t102 时每次几何切换都是大张量换大张量，缺的是连续性不是总量 | `offload_blocks` 44 → 48，并用 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`；`mlp_chunk_rows` 不能动（影响数值） | [training](features/training.md) |
 | 104k token 时报 `expandable_segments: memory mapping failed ... (free: 20 MB)` | 和碎片无关，是显存真的用尽：收集器同时持有 q / k 两份 512 MiB 的 tile 序副本 | `_COLLECT_BYTES` 512 → 256 MiB、`offload_blocks` → 50、启动加 `garbage_collection_threshold:0.8`；头之间独立，chunk 大小不改结果 | [training](features/training.md) |
+| 训练跑着时另起教师进程，权重刚载完就被静默 kill | 不是显存：再开一份 33B 教师要约 66 GB pinned 主机内存（`HostSlabs`），训练已经占掉了大部分，内核 OOM killer 不留回溯 | 离线探针和训练错开跑；判断依据是日志停在 `load weights ... done` 且进程无回溯地消失 | [quant_scoring](features/quant_scoring.md) |
