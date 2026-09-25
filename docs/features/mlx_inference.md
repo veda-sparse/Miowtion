@@ -91,6 +91,7 @@ trunk 之外同样的做法：两张超越函数表（RoPE 的 cos/sin、时间�
 | `miowtion/mlx/interop.py` | torch ↔ MLX 的逐位转换（numpy 没有 bf16，按 16 bit 原始位走） |
 | `miowtion/mlx/slab.py` | slab 格式、`SlabReader`（pread 进预分配 buffer）、`BlockPrefetcher`、`convert_checkpoint` |
 | `miowtion/mlx/offload.py` | 不转换的替代方案：直接读发布的 safetensors（`mx.load` 惰性加载 / 每个分片一个 mmap） |
+| `miowtion/mlx/model.py` | 一次速度评估：`clip_inputs`（一条轨迹算一次）、`precompute_adaln`（一遍扫过 26 GB 的 AdaLN 投影，只留下表）、`velocity`（trunk 流式过一遍 block） |
 | `miowtion/mlx/dit.py` | trunk 之外的部分：`NonTrunkWeights`（常驻）、RoPE / 时间步表、AdaLN 表预计算、token refiner、embed、final layer |
 | `miowtion/mlx/convert.py` | 读发布的 checkpoint（mmap safetensors → MLX array），融合 q/k/v、写 trunk slab |
 | `miowtion/mlx/bench.py` | 测量用：合成权重、进程与系统内存统计、各项 benchmark |
@@ -104,7 +105,7 @@ trunk 之外同样的做法：两张超越函数表（RoPE 的 cos/sin、时间�
 输出层也改了名（`proj_in`、`context_embedder`、`norm_out`…）。名字映射集中在
 `miowtion/h3/release.py`（只管名字，不碰张量），`ReleaseReader` 从权重名自动判断是哪一套，
 `check_complete()` 在转换前把缺失的键一次性报出来——少一个层只会在深处炸 shape，或者更糟，
-根本不炸。
+根本不炸。名字表已经用真实 checkpoint 的 index（638 个键）核对过：0 个缺失、0 个没被认领。
 
 权重的 fused QKV 保持发布的 **per-head 交错行序**（`[h0: q k v, h1: q k v, ...]`），
 这样 block 可以直接从 checkpoint 流式读入而不用做行置换，而且连续的一组 head 正好是
@@ -468,8 +469,10 @@ block 一个 plan"，而是 `LayerPlan`：每个头组带自己的 `gather` / `s
 - 2026-09-24，Apple M3 Pro / 18 GB / mlx 0.32.2，commit 见本次提交：
   `pytest tests/unit` 127 passed。以上全部数字由 `scripts/mlx_bench.py` 在合成
   权重（真实 shape）上实测。
-- 2026-09-25，同一台机器：加上 `dit.py`（trunk 之外）与其 torch 对照测试后
-  `pytest tests/unit` 172 passed。
+- 2026-09-25，同一台机器：加上 `dit.py`（trunk 之外）、`model.py`（一次速度评估）
+  与其 torch 对照测试后 `pytest tests/unit` 177 passed。同日用真实发布的
+  `diffusion_pytorch_model.safetensors.index.json`（638 个键，50 层 + 2 层 refiner）
+  核对 `h3/release.py` 的名字表：完全覆盖。
 - 块稀疏与稠密掩码路径**逐位相等**（单测），因此不需要 AGENTS.md 1.5 要求的
   可视化人工确认。
 - **尚未用真实权重验证**，也没有做视频层面的可视化对比。在真实 checkpoint 上
