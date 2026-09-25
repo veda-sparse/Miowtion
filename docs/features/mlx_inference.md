@@ -102,6 +102,7 @@ trunk 之外同样的做法：两张超越函数表（RoPE 的 cos/sin、时间�
 | `miowtion/mlx/convert.py` | 读发布的 checkpoint（mmap safetensors → MLX array），融合 q/k/v、写 trunk slab |
 | `miowtion/mlx/bench.py` | 测量用：合成权重、进程与系统内存统计、各项 benchmark |
 | `scripts/mlx_bench.py` | 命令行入口，每项测量单独一个进程，结果按 JSON 行输出 |
+| `scripts/mlx_convert.py` | 把发布的 transformer 目录转成 per-block slab（可指定 block 区间与量化位宽） |
 
 ### 两套发布命名
 
