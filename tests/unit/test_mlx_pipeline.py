@@ -219,8 +219,8 @@ def test_build_plans_follows_the_budget():
     """The plans keep roughly the requested fraction of the tiles."""
     geometry = h3_geometry.resolve_geometry('16:9', 1.0, 448)
     lay = h3_layout.pack(torch.ones(_TEXT_LEN, dtype=torch.long), geometry)
-    plans = pipeline.build_plans(pipeline.SparseRequest(), geometry, lay,
-                                 _CONFIG)
+    plans = pipeline.build_plans(pipeline.SparseRequest(scorer='random'),
+                                 geometry, lay, _CONFIG)
     assert len(plans) == _CONFIG.num_layers
     for plan in plans:
         assert plan.num_heads == _CONFIG.num_heads
@@ -229,12 +229,35 @@ def test_build_plans_follows_the_budget():
         assert 0.1 <= plan.density() <= 0.2
 
 
+def test_build_plans_with_the_pooled_scorer_returns_planners():
+    # The pooled scorer reads the layer's q and k, so build_plans can only
+    # hand back the planners; the selection happens inside the block.
+    from miowtion.mlx import veda_plan  # noqa: PLC0415
+
+    geometry = h3_geometry.resolve_geometry('16:9', 1.0, 448)
+    lay = h3_layout.pack(torch.ones(_TEXT_LEN, dtype=torch.long), geometry)
+    plans = pipeline.build_plans(pipeline.SparseRequest(), geometry, lay,
+                                 _CONFIG)
+    assert len(plans) == _CONFIG.num_layers
+    assert all(isinstance(p, veda_plan.ActivationPlanner) for p in plans)
+    assert [p.layer for p in plans] == list(range(_CONFIG.num_layers))
+
+
+def test_build_plans_rejects_an_unknown_scorer():
+    geometry = h3_geometry.resolve_geometry('16:9', 1.0, 448)
+    lay = h3_layout.pack(torch.ones(_TEXT_LEN, dtype=torch.long), geometry)
+    with pytest.raises(ValueError, match='unknown scorer'):
+        pipeline.build_plans(pipeline.SparseRequest(scorer='trained'),
+                             geometry, lay, _CONFIG)
+
+
 def test_build_plans_keeps_the_dense_layers_dense():
     geometry = h3_geometry.resolve_geometry('16:9', 1.0, 448)
     lay = h3_layout.pack(torch.ones(_TEXT_LEN, dtype=torch.long), geometry)
     veda = veda_attention.VedaConfig(dense_layers=frozenset([1]))
-    plans = pipeline.build_plans(pipeline.SparseRequest(veda=veda), geometry,
-                                 lay, _CONFIG)
+    plans = pipeline.build_plans(
+        pipeline.SparseRequest(veda=veda, scorer='random'), geometry, lay,
+        _CONFIG)
     assert plans[1] is None and plans[0] is not None
 
 

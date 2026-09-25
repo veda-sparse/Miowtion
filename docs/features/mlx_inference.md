@@ -120,7 +120,8 @@ mrope 分段都不会执行；三个 mrope 轴此时携带同一个 position，
 |---|---|
 | `miowtion/mlx/block.py` | 一个 trunk block 的前向；`BlockWeights`（发布 layout，含量化）、`BlockOptions`（head / row 分块） |
 | `miowtion/mlx/sparse_attention.py` | Veda 块稀疏：`SparsePlan`、`HeadGroupPlan` / `LayerPlan`（每层两个头组、各自的排列）、gather 版 `block_sparse_attention`、稠密参考、代价模型 |
-| `miowtion/mlx/veda_plan.py` | 把 `veda.mask.Selection` 转成 `SparsePlan` / `LayerPlan`；`layer_plan_from_scores` 从 `TilePlan` + `ClipTiling` + 打分直接得到一层的 plan（真实 Veda 掩码的唯一入口）；`clip_plans`（整个 trunk 一次建好）、`uniform_tile_plan`（没有搜索过的方案表时的 baseline）、`random_scores`（替身打分器，**只能用来测速**） |
+| `miowtion/mlx/veda_plan.py` | 把 `veda.mask.Selection` 转成 `SparsePlan` / `LayerPlan`；`layer_plan_from_scores` 从 `TilePlan` + `ClipTiling` + 打分直接得到一层的 plan（真实 Veda 掩码的唯一入口）；`clip_plans`（静态打分器，整个 trunk 一次建好）、`ActivationPlanner` / `clip_planners`（读激活的打分器，block 在自己的 head chunk 里调用）、`tile_geometry`、`uniform_tile_plan`（没有搜索过的方案表时的 baseline）、`random_scores`（替身打分器，**只能用来测速**） |
+| `miowtion/mlx/veda_predictor.py` | Veda 打分器的 MLX 版：`gather_tiles` / `pool_tiles`（mean/max/min）、`tile_logits`、`score_tiles`（一层一个 head chunk 的 q/k → tile 分数）；投影可选，缺省即 mean-pooled QK |
 | `miowtion/mlx/interop.py` | torch ↔ MLX 的逐位转换（numpy 没有 bf16，按 16 bit 原始位走） |
 | `miowtion/mlx/slab.py` | slab 格式、`SlabReader`（pread 进预分配 buffer）、`BlockPrefetcher`、`convert_checkpoint` |
 | `miowtion/mlx/offload.py` | 不转换的替代方案：直接读发布的 safetensors（`mx.load` 惰性加载 / 每个分片一个 mmap） |
@@ -136,7 +137,7 @@ mrope 分段都不会执行；三个 mrope 轴此时携带同一个 position，
 | `scripts/mlx_convert.py` | 把发布的 transformer 目录（`--transformer`）或文本编码器（`--text-encoder`）转成 per-block / per-layer slab（可指定区间与量化位宽） |
 | `scripts/mlx_check.py` | 真实权重的对照，一行一个序列长度（`--out` 另存 JSON 行）；`--transformer` 对 trunk block，`--text-encoder` 对文本塔的一层 |
 | `scripts/mlx_encode_text.py` | 用真实 prompt 跑文本塔，写出 DiT 条件用的 hidden states（`--slabs` 走 slab 快路径） |
-| `scripts/mlx_generate.py` | 生成一个片段：prompt（或已编码的 hidden states）→ 去噪后的 video / audio latent 行（`.npy` + `meta.json`）；`--sparse-ratio` 打开 Veda 稀疏 |
+| `scripts/mlx_generate.py` | 生成一个片段：prompt（或已编码的 hidden states）→ 去噪后的 video / audio latent 行（`.npy` + `meta.json`）；`--sparse-ratio` 打开 Veda 稀疏，`--sparse-scorer` 选打分器 |
 | `scripts/mlx_decode.py` | 把上面那些行交给两个 VAE（torch/MPS），写出 mp4 |
 
 ### 两套发布命名
@@ -343,20 +344,51 @@ block 一个 plan"，而是 `LayerPlan`：每个头组带自己的 `gather` / `s
 2.0 ms，每个头组每 block 要做 4 次（q / k / v 和反排列），56 个头 28 个 chunk 就是
 0.22 s。这是随机排列的上界，Veda 的排列在 tile 内是连续的，只会更快。
 
-### Veda 接进去噪循环：plan 一条轨迹只建一次
+### Veda 接进去噪循环：plan 按层传，谁建取决于打分器
 
-选择只取决于几何和打分，不取决于去噪步，所以 50 层的 `LayerPlan` 在第一步之前
-一次建好（`pipeline.build_plans`），8 步共用。权重则相反：每步都要重新流式读一遍。
-两者的生命周期不同，这也是 plan 不放进 `BlockOptions` 常量、而是按层传给
-`model.velocity` 的原因——`BlockOptions.sparse` 只能表达"每层同一个选择"，而真实
-的 Veda 每层选的 tile 不一样。`velocity` 里按层 `dataclasses.replace(options,
-sparse=plans[index])`，`plans[i] is None` 的层走稠密（`VedaConfig.dense_layers`）。
+plan 不放进 `BlockOptions` 常量、而是按层传给 `model.velocity`：
+`BlockOptions.sparse` 只能表达"每层同一个选择"，而真实的 Veda 每层选的 tile
+不一样。`velocity` 里按层 `dataclasses.replace(options, sparse=plans[index])`，
+`plans[i] is None` 的层走稠密（`VedaConfig.dense_layers`）。
 
-**打分器**：`layer_plan_from_scores` 要的是 `[H', rows, n_tiles]` 的 tile 分数，
-训练好的 predictor 给的就是这个。手头没有 predictor checkpoint 时用
-`veda_plan.random_scores`：它产生的选择在形状、预算、逐头分布上都和真的一样，
+plan 什么时候建，取决于打分器读不读激活：
+
+- **不读**（`random_scores`，或任何静态回调）：选择只取决于几何和打分，50 层的
+  `LayerPlan` 在第一步之前一次建好（`pipeline.build_plans`），8 步共用。
+- **读**（默认的 `pooled`）：一层的选择要等到这一步算出这一层的 q/k 才存在，
+  所以 `build_plans` 返回的是 50 个 `ActivationPlanner`，block 在自己的 head
+  chunk 循环里调用它（`BlockOptions.sparse` 接受一个可调用对象）。
+
+`veda_plan.random_scores` 产生的选择在形状、预算、逐头分布上都和真的一样，
 kernel 干的活一模一样，**但保留哪些 tile 是随机的**。所以它只能用来测速，用它生成
 的片段没有任何质量意义，文档里凡是用它测出来的数字都必须标明。
+
+### 打分器移到 MLX：每层用自己的 q/k 选 tile
+
+`miowtion/mlx/veda_predictor.py` 是 `veda/predictor.py` 的 MLX 版：每个 tile 按
+真实行做 [mean | max | min] 池化，逐头的残差投影把 3D 特征映射回 D 维
+（`q_hat = pool_q @ P_q[h] + mean_q`），logits 是 `q_hat · k_hat / sqrt(D)`。
+
+**分工按代价切**：池化要读整块 q 和 k（一个 head chunk 约 26 MB），留在 MLX；
+top-k、Bresenham 预算切分和 plan 构造只在 tile 网格上动，一层的 logits 对 12k
+token 的片子只有约 2 MB，继续用 torch 侧已经验证过的 `select_video_blocks`
+（`veda_plan.ActivationPlanner`）。这样既不用把 mask.py 重写一遍，往返的也不是
+激活而是分数。
+
+**没有训练好的 predictor checkpoint**，所以 `proj_q` / `proj_k` 传的是 `None`，
+`embed` 退化成池化的 mean——这正是参考实现在初始化时算的东西
+（`P ~ N(0, 1e-4)`），也就是 Veda 用来起步的 mean-pooled QK 块分数。它是**跟内容
+走的**，和随机打分器有本质区别，但它**不是训练过的选择**：真接上 checkpoint 只需
+给 `ActivationPlanner(projections=...)` 传一个"层号 + 头号 → (proj_q, proj_k)"的
+回调。
+
+**对齐**：max / min 池化与 torch 参考**逐位相等**，gather 也是；mean、投影和
+logits 的矩阵乘是规约，两边累加顺序不同（实测 1e-6 量级）。真正要求相等的是
+**选出来的 tile**，单测里用真实几何比较 `index` / `keep` 逐位相等
+（`tests/unit/test_mlx_veda_predictor.py`）。
+
+**代价**（真实权重，S=12608，50 层 × 7 个 head chunk = 350 次打分 + 建 plan）：
+一步 107.2 s，比预先建好 plan 的 103.9 s 多 3.3 s（3.2 %），峰值 4.49 GB。
 
 没有搜索过的方案表（`plans/` 为空）时 `uniform_tile_plan` 退回到该几何 padding
 最少的 tile 形状——搜索本身也是从这个形状出发的，作为测速 baseline 是诚实的。
@@ -485,15 +517,18 @@ bf16、音频 fp32，1 秒 16:9 片段，39 帧）：
 所以去噪一步的下限是 50 × 2.704 = 135.2 s，实测一步端到端（`mlx_generate.py
 --steps 1`）**136.1 s**，多出来的 0.7 % 是非 trunk 的头和 Euler 步。
 
-| 一步 | 每 block | 一步 | 8 步 | 峰值 |
-|---|---|---|---|---|
-| 稠密 | 2.704 s | 136.1 s | 18 分 09 秒 | 4.39 GB |
-| Veda 稀疏，密度 0.136 | 2.078 s | 103.9 s | 13 分 51 秒 | 4.71 GB |
+| 一步 | 一步 | 8 步 | 峰值 |
+|---|---|---|---|
+| 稠密 | 136.1 s | 18 分 09 秒 | 4.39 GB |
+| Veda 稀疏，随机打分器，密度 0.136 | 103.9 s | 13 分 51 秒 | 4.71 GB |
+| Veda 稀疏，mean-pooled QK 打分器（默认） | 107.2 s | 14 分 18 秒 | 4.49 GB |
 
-稀疏这一行用的是**随机打分器**（`--sparse-ratio 0.1`，真实的 tile 方案与预算、
-每头 top-k、每层两个头组），只说明速度，不说明画面。attention 从 0.900 降到
-0.241 s（3.7×，不是 9–10×，因为 Veda 的 `q_block=128` 让 gather 量涨了 16 倍），
-整块因此只快 1.31 倍。
+前两行的每 block 时间是 2.704 s（稠密）和 2.078 s（稀疏）。随机打分器那行
+（`--sparse-scorer random`，真实的 tile 方案与预算、每头 top-k、每层两个头组）
+只说明速度，不说明画面；第三行是默认打分器，每层用自己的 q/k 打分、每步重新选，
+多出来的 3.3 s 就是打分加建 plan 的全部代价。attention 从 0.900 降到 0.241 s
+（3.7×，不是 9–10×，因为 Veda 的 `q_block=128` 让 gather 量涨了 16 倍），整块
+因此只快 1.31 倍。
 
 ### 视频 VAE 移植到 MLX
 
@@ -580,7 +615,7 @@ transformers 的 eager 路径是纯 bf16。这同时钉住了 mrope → 普通 r
 
 ## 测试
 
-`tests/unit/test_mlx_block.py`（13 个，缺 mlx 时自动 skip）：
+`tests/unit/test_mlx_block.py`（16 个，缺 mlx 时自动 skip）：
 
 - torch ↔ MLX 转换、RoPE、SwiGLU 逐位相等（`torch.equal`）。
 - 整个 block 对 torch 参考实现：fp32 相对 L2 < 1e-5；bf16 < 5e-3，并且额外要求
@@ -591,8 +626,12 @@ transformers 的 eager 路径是纯 bf16。这同时钉住了 mrope → 普通 r
   query tile 数不对时报错。
 - 把同一个 plan 拆成两个头组（恒等排列）与单 plan 路径**逐位相等**；`LayerPlan` 的
   头数、`scatter` 长度不对时报错。
+- per-head 的选择在 head chunk 下不变（chunk=2 逐位相等，chunk=1 差 1 ulp）。
+- `BlockOptions.sparse` 传 planner：每个 head chunk 各调用一次、拿到的正是这个
+  chunk 的 q/k 与起始头号，结果与同样的静态 `LayerPlan` **逐位相等**；planner 返回
+  的头数不对时报错。
 
-`tests/unit/test_mlx_veda_plan.py`（7 个）：
+`tests/unit/test_mlx_veda_plan.py`（8 个）：
 
 - plan 展开出来的逐行掩码与 `veda.mask.dense_block_mask`（再按 `slot_valid` 掩掉
   padding 行）**逐位相等**（`torch.equal`）。
@@ -603,6 +642,18 @@ transformers 的 eager 路径是纯 bf16。这同时钉住了 mrope → 普通 r
   再反排列"**逐位相等**，头也回到输入顺序；头组不构成划分时报错。
 - `layer_plan_from_scores` 走真实几何（16:9、`h3.layout.pack`、`ClipTiling`、
   `TilePlan` 两种形状）：头组、排列长度、密度都对，跑出来的 attention 同样逐位相等。
+
+`tests/unit/test_mlx_veda_predictor.py`（5 个）：
+
+- `gather_tiles` 与 `veda.tiling.gather_tiles` **逐位相等**（纯数据搬运）。
+- `pool_tiles`：max / min 与 torch 参考**逐位相等**，mean 相对 1e-6；空 tile 恰好
+  是 0（没有漏掉 -inf）。
+- `score_tiles` 与 `veda.predictor.LayerPredictor`：带投影、不带投影两条路都对得上
+  （1e-5）。
+- `ActivationPlanner` 在真实几何上选出的 `index` / `keep` 与"torch 侧同样的池化
+  分数 → `select_video_blocks`"**逐位相等**。
+- 按 head chunk 建 plan：每个头拿到的选择与整层一次建出来的**逐位相同**，返回的
+  plan 只覆盖这个 chunk 的头且从 0 编号。
 
 `tests/unit/test_mlx_convert.py`（7 个）+ `tests/unit/test_h3_release.py`（6 个）：
 
@@ -766,6 +817,14 @@ transformers 的 eager 路径是纯 bf16。这同时钉住了 mrope → 普通 r
   `runs/mlx_clip_0000/clip.mp4` **还没有做人工可视化确认**，因此这部分还不能
   按 1.5 判定为通过。`pytest tests/unit` 218 passed。
 
+- 2026-09-26，Apple M3 Pro / 18 GB / mlx 0.32.2：Veda 打分器移到 MLX
+  （`veda_predictor.py` + `veda_plan.ActivationPlanner`）。gather 与 max / min
+  池化和 torch 参考**逐位相等**，mean / logits 相对误差 1e-6 量级，真实几何下
+  选出的 `index` / `keep` 与 torch 路径逐位相等；`pytest tests/unit` 229 passed。
+  真实权重一步去噪 107.2 s、峰值 4.49 GB（`--sparse-ratio 0.1 --sparse-scorer
+  pooled`）。选择现在跟内容走，但**投影是未训练的**（等价于 mean-pooled QK），
+  画面层面的人工确认仍未做。
+
 - **生成质量仍未验证**：上面那条轨迹的文本 embedding 是随机张量，也还没有 VAE
   解码，所以没有做视频层面的可视化对比。在人工一致性确认之前，这里的结论只覆盖
   数值、时间和内存，不覆盖生成质量。
@@ -777,9 +836,10 @@ transformers 的 eager 路径是纯 bf16。这同时钉住了 mrope → 普通 r
   确认。DiT 这一侧（转 slab → 去噪循环）已经用真实权重跑通。
 - CFG：现在的循环只算一次速度评估，还没有无条件分支（开了就是两倍时间，18 GB
   上要先确认值不值）。
-- 打分器本身还在 torch 侧：`layer_plan_from_scores` 接受一个"给定 tile layout 和
-  头号返回 logits"的回调，真实运行时要么把 `veda.predictor` 移植到 MLX，要么每层
-  往返一次 torch（后者会把排列的 3 % 开销变成一次真正的同步，得先测）。
+- 打分器已经在 MLX 上按每层的 q/k 打分（mean-pooled QK），但**没有训练好的
+  predictor 投影**：要接真实 checkpoint，给 `ActivationPlanner(projections=...)`
+  传回调即可，代价是每层多两次 [H', 3D, D] 的矩阵乘和一次权重常驻（50 层 × 56 头
+  × 384 × 128 × 2 = 275M 参数，bf16 0.55 GB）。
 - `q_block=128` 的 gather 量是 `q_block=2048` 的 16 倍。可以把 16 个相邻 query
   tile 的选择取并集，共享一次 gather，再对每个 tile 单独调一次 SDPA（掩码仍然按
   tile）。并集能省多少取决于相邻 query tile 的选择有多重合，随机打分器上并集≈全集，

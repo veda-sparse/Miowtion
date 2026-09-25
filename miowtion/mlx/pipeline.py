@@ -183,7 +183,9 @@ def generate(weights: dit.NonTrunkWeights,
              clip: mlx_model.ClipInputs, traj: Trajectory,
              tables: mlx_model.AdalnTables, config: h3_config.H3Config,
              options: mlx_block.BlockOptions = mlx_block.BlockOptions(),
-             plans: Sequence[sparse_attention.LayerPlan | None] | None = None,
+             plans: Sequence[sparse_attention.LayerPlan
+                             | mlx_veda_plan.ActivationPlanner
+                             | None] | None = None,
              ) -> Generated:
     """Rolls `traj` to the end of its schedule.
 
@@ -198,8 +200,8 @@ def generate(weights: dit.NonTrunkWeights,
         tables: AdaLN tables covering every step's timestep set.
         config: Architecture.
         options: Block chunking and the optional Veda plan.
-        plans: One Veda plan per trunk layer (model.velocity); built once
-            per clip, since the selection does not depend on the step.
+        plans: One Veda plan -- or one planner, when the scorer reads the
+            activations -- per trunk layer (model.velocity).
 
     Returns:
         The denoised target rows and the per-step wall times.
@@ -277,11 +279,15 @@ class SparseRequest:
         veda: Budgets and the dense-layer set.
         plan_path: A searched tile plan (`plans/*.json`); None falls back to
             the least-padding shape for every head.
-        seed: Seed of the stand-in scorer. It is only read when `scorer` is
-            None, and the plans it builds measure speed, not quality (see
-            veda_plan.random_scores).
-        scorer: Tile scorer, as in veda_plan.layer_plan_from_scores; None
-            uses the stand-in.
+        seed: Seed of the stand-in scorer; only read when `scorer` is
+            'random'.
+        scorer: 'pooled' scores every layer from its own q and k (the
+            mean-pooled QK of an untrained predictor, see
+            veda_predictor) and therefore builds its plans inside the
+            denoise loop; 'random' draws the logits once per clip, which
+            measures speed and says nothing about quality (see
+            veda_plan.random_scores); a callable is a static torch scorer,
+            as in veda_plan.layer_plan_from_scores.
         share_heads: Collapse the head axis of a group whose heads picked
             the same tiles.
     """
@@ -289,19 +295,21 @@ class SparseRequest:
     veda: veda_attention.VedaConfig = veda_attention.VedaConfig()
     plan_path: str | None = None
     seed: int = 0
-    scorer: Callable | None = None
+    scorer: str | Callable = 'pooled'
     share_heads: bool = True
 
 
 def build_plans(request: SparseRequest, geometry: h3_geometry.Geometry,
                 layout: h3_layout.PackedLayout,
                 config: h3_config.H3Config
-                ) -> list[sparse_attention.LayerPlan | None]:
-    """The per-layer Veda plans of one clip.
+                ) -> list[sparse_attention.LayerPlan
+                          | mlx_veda_plan.ActivationPlanner | None]:
+    """The per-layer Veda plans of one clip, or the planners that build them.
 
-    The tile layouts and the selection are built on the torch CPU side
-    once, before the first step: they depend on the geometry and the
-    scorer, not on the denoise step.
+    The tile layouts are built on the torch CPU side once, before the first
+    step. The selection is too when the scorer does not read activations;
+    the 'pooled' scorer does, so it returns one planner per layer and the
+    block calls it with its own q and k.
 
     Args:
         request: What to build.
@@ -310,7 +318,10 @@ def build_plans(request: SparseRequest, geometry: h3_geometry.Geometry,
         config: Architecture (layers and heads).
 
     Returns:
-        One plan per trunk layer, None where the layer stays dense.
+        One entry per trunk layer, None where the layer stays dense.
+
+    Raises:
+        ValueError: On an unknown scorer name.
     """
     if request.plan_path:
         tile_plan = veda_tile_plan.TilePlan.load(request.plan_path)
@@ -319,13 +330,27 @@ def build_plans(request: SparseRequest, geometry: h3_geometry.Geometry,
             geometry, config.num_layers, config.num_heads)
     clip = veda_attention.ClipTiling(layout, request.veda,
                                      torch.device('cpu'))
-    scorer = request.scorer or mlx_veda_plan.random_scores(request.seed)
+    shapes = ' '.join(str(s) for s in tile_plan.shapes)
+    dense_layers = request.veda.dense_layers
+    if request.scorer == 'pooled':
+        plans = mlx_veda_plan.clip_planners(
+            tile_plan, clip, config.num_layers, None, dense_layers,
+            request.share_heads)
+        progress.log(f'veda: tiles {shapes}, {len(dense_layers)}/'
+                     f'{len(plans)} layers dense, mean-pooled QK scorer '
+                     f'(selection per layer and step)')
+        return plans
+    if request.scorer == 'random':
+        scorer = mlx_veda_plan.random_scores(request.seed)
+    elif callable(request.scorer):
+        scorer = request.scorer
+    else:
+        raise ValueError(f'unknown scorer {request.scorer!r}')
     plans = mlx_veda_plan.clip_plans(
-        tile_plan, clip, config.num_layers, scorer,
-        request.veda.dense_layers, request.share_heads)
+        tile_plan, clip, config.num_layers, scorer, dense_layers,
+        request.share_heads)
     dense = sum(p is None for p in plans)
     kept = [p.density() for p in plans if p is not None]
-    shapes = ' '.join(str(s) for s in tile_plan.shapes)
     density = f'{np.mean(kept):.3f}' if kept else 'n/a'
     progress.log(f'veda: tiles {shapes}, {dense}/{len(plans)} layers dense, '
                  f'density {density}')

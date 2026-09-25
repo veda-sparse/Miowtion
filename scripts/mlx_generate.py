@@ -70,10 +70,12 @@ def _sparse_request(args: argparse.Namespace
                     ) -> pipeline.SparseRequest | None:
     """The Veda request, or None for dense attention.
 
-    Without `--sparse-plan` the scorer is the stand-in one: the sparse run
-    then costs what a real predictor would cost, but the tiles it keeps are
-    random, so its output is a speed measurement and not a clip anyone
-    should look at.
+    The default scorer pools every layer's own q and k and scores the tiles
+    with mean-pooled QK -- what an untrained Veda predictor computes -- so
+    the selection follows the content. `--sparse-scorer random` keeps the
+    tile shapes, the budget and the per-head spread but picks arbitrary
+    tiles: that run is a speed measurement, not a clip anyone should look
+    at.
     """
     if args.sparse_ratio is None:
         return None
@@ -82,10 +84,11 @@ def _sparse_request(args: argparse.Namespace
     veda = veda_attention.VedaConfig(
         target_budget=veda_mask.Budget(ratio=args.sparse_ratio),
         dense_layers=dense)
-    progress.log(f'veda: keep {args.sparse_ratio}, {len(dense)} dense layers, '
-                 f'scorer {"plan" if args.sparse_plan else "random"}')
+    progress.log(f'veda: keep {args.sparse_ratio}, {len(dense)} dense '
+                 f'layers, scorer {args.sparse_scorer}')
     return pipeline.SparseRequest(veda=veda, plan_path=args.sparse_plan,
-                                  seed=args.sparse_seed)
+                                  seed=args.sparse_seed,
+                                  scorer=args.sparse_scorer)
 
 
 def main() -> None:
@@ -120,6 +123,10 @@ def main() -> None:
                              'least-padding shape is used without one')
     parser.add_argument('--sparse-seed', type=int, default=0,
                         help='seed of the stand-in tile scorer')
+    parser.add_argument('--sparse-scorer', default='pooled',
+                        choices=('pooled', 'random'),
+                        help='pooled: score each layer from its own q/k; '
+                             'random: stand-in scorer, speed only')
     parser.add_argument('--dense-layers', default='',
                         help='comma-separated trunk layers to keep dense')
     parser.add_argument('--out', required=True,

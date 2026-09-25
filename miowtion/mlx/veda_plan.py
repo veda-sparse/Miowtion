@@ -32,11 +32,13 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 
+import mlx.core as mx
 import torch
 
 from miowtion.h3 import geometry as h3_geometry
 from miowtion.mlx import interop
 from miowtion.mlx import sparse_attention
+from miowtion.mlx import veda_predictor
 from miowtion.veda import attention as veda_attention
 from miowtion.veda import mask as veda_mask
 from miowtion.veda import plan as veda_tile_plan
@@ -274,3 +276,149 @@ def clip_plans(tile_plan: veda_tile_plan.TilePlan,
                                                 scores, share_heads))
         bar.update()
     return plans
+
+
+def tile_geometry(layout: tiling.TileLayout
+                  ) -> veda_predictor.TileGeometry:
+    """The MLX view of a tile layout that the scorer needs."""
+    return veda_predictor.TileGeometry(
+        gather=interop.from_torch(layout.gather_index.to(torch.int32)),
+        slot_valid=interop.from_torch(layout.slot_valid.to(torch.bool)),
+        valid_count=interop.from_torch(
+            layout.valid_count.clamp(min=1).to(torch.float32)),
+        kv_ok=interop.from_torch(layout.kv_ok.to(torch.bool)),
+        n_tiles=layout.n_tiles, n_video_tiles=layout.n_video_tiles,
+        tile_size=tiling.TILE_SIZE)
+
+
+class ActivationPlanner:
+    """Builds a layer's plan from the layer's own q and k, per head chunk.
+
+    This is the counterpart of `clip_plans` for a real scorer: a selection
+    that depends on the activations cannot be built before the denoise step
+    that produces them, so the block calls the planner inside its head loop
+    (`block.BlockOptions.sparse` accepts a callable) instead of receiving a
+    plan built once per clip.
+
+    The split of work follows the cost: pooling reads the whole q and k of
+    the chunk and stays in MLX, while the top-k, the budget split and the
+    plan construction run on the torch side on [H', n_q, n_k] logits --
+    ~2 MB for a 12k-token clip, against the ~26 MB of one q copy.
+
+    Everything that does not depend on the activations (tile layouts, their
+    MLX geometry, the column blocks) is built on the first call and reused
+    by every later layer and step.
+    """
+
+    def __init__(self, tile_plan: veda_tile_plan.TilePlan,
+                 clip: veda_attention.ClipTiling, layer: int,
+                 projections: Callable[
+                     [int, Sequence[int]],
+                     tuple[torch.Tensor, torch.Tensor]] | None = None,
+                 share_heads: bool = True,
+                 geometries: dict[tiling.TileShape,
+                                  veda_predictor.TileGeometry] | None = None):
+        """Initializes the planner of one layer.
+
+        Args:
+            tile_plan: The geometry's tile plan.
+            clip: Tile layouts of the clip.
+            layer: Trunk layer index.
+            projections: Called with the layer index and the global head
+                ids of a group; returns that group's `(proj_q, proj_k)`,
+                each [H', 3D, D] fp32. None scores with the mean-pooled
+                features, which is what an untrained predictor computes --
+                see `miowtion.mlx.veda_predictor`.
+            share_heads: See `plan_from_selection`.
+            geometries: Cache of tile geometries shared between the layers
+                of one clip; a private one is used when None.
+        """
+        self.tile_plan = tile_plan
+        self.clip = clip
+        self.layer = layer
+        self.projections = projections
+        self.share_heads = share_heads
+        self.geometries = {} if geometries is None else geometries
+        self._logged = False
+
+    def geometry(self, shape: tiling.TileShape) -> veda_predictor.TileGeometry:
+        if shape not in self.geometries:
+            self.geometries[shape] = tile_geometry(self.clip.get(shape))
+        return self.geometries[shape]
+
+    def __call__(self, q: mx.array, k: mx.array,
+                 head_start: int) -> sparse_attention.LayerPlan:
+        """The plan of the heads in q, numbered from 0.
+
+        Args:
+            q: [S, H', D] packed queries of heads
+                [head_start, head_start + H'), as the attention sees them.
+            k: [S, H', D] packed keys.
+            head_start: Global id of q's first head.
+
+        Returns:
+            A layer plan over exactly those H' heads, whose group head ids
+            are positions inside the chunk; the caller therefore runs it
+            with `head_start=0`.
+        """
+        stop = head_start + q.shape[1]
+        groups = []
+        for group in self.tile_plan.head_groups(self.layer, self.clip.device):
+            heads = [int(h) for h in group.heads if head_start <= h < stop]
+            if not heads:
+                continue
+            layout = self.clip.get(group.shape)
+            pick = mx.array([h - head_start for h in heads], dtype=mx.int32)
+            proj = (None, None) if self.projections is None else tuple(
+                interop.from_torch(p.to(torch.float32))
+                for p in self.projections(self.layer, heads))
+            logits = veda_predictor.score_tiles(
+                mx.take(q, pick, axis=1), mx.take(k, pick, axis=1),
+                self.geometry(group.shape), *proj)
+            selection = veda_mask.select_video_blocks(
+                interop.to_torch(logits), layout, self.clip.blocks(layout))
+            groups.append(head_group_plan([h - head_start for h in heads],
+                                          selection, layout,
+                                          self.share_heads))
+        plan = layer_plan(groups, q.shape[1])
+        if not self._logged and self.layer == 0:
+            # The density is only known once a selection exists, and it is
+            # what the kernel is about to pay for; report it once per clip.
+            self._logged = True
+            progress.log(f'veda: density {plan.density():.3f} '
+                         f'(layer 0, heads {head_start}-{stop - 1})')
+        return plan
+
+
+def clip_planners(tile_plan: veda_tile_plan.TilePlan,
+                  clip: veda_attention.ClipTiling, num_layers: int,
+                  projections: Callable[
+                      [int, Sequence[int]],
+                      tuple[torch.Tensor, torch.Tensor]] | None = None,
+                  dense_layers: frozenset[int] = frozenset(),
+                  share_heads: bool = True
+                  ) -> list[ActivationPlanner | None]:
+    """One `ActivationPlanner` per trunk layer, None where it stays dense.
+
+    Args:
+        tile_plan: The geometry's tile plan; must cover `num_layers`.
+        clip: Tile layouts of the clip.
+        num_layers: Trunk layers.
+        projections: See `ActivationPlanner`.
+        dense_layers: Layers that keep dense attention.
+        share_heads: See `plan_from_selection`.
+
+    Returns:
+        The planners, sharing one tile-geometry cache.
+
+    Raises:
+        ValueError: If the tile plan covers fewer layers than the trunk.
+    """
+    if tile_plan.num_layers < num_layers:
+        raise ValueError(f'tile plan covers {tile_plan.num_layers} layers, '
+                         f'expected at least {num_layers}')
+    geometries: dict[tiling.TileShape, veda_predictor.TileGeometry] = {}
+    return [None if layer in dense_layers else
+            ActivationPlanner(tile_plan, clip, layer, projections,
+                              share_heads, geometries)
+            for layer in range(num_layers)]

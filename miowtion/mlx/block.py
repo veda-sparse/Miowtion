@@ -23,7 +23,7 @@ from __future__ import annotations
 import dataclasses
 import math
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 
 import mlx.core as mx
 
@@ -203,13 +203,19 @@ class BlockOptions:
             (`used` must then be a multiple of both tile sizes); a LayerPlan
             carries one permutation and selection per head group, which is
             what a real tile plan needs (up to two tile shapes per layer).
+            A callable is a planner that is given this block's own q and k
+            (`q, k, head_start`) and returns the LayerPlan of exactly those
+            heads, numbered from 0 -- a scorer that reads the activations
+            cannot be run before the block that produces them, see
+            miowtion.mlx.veda_plan.ActivationPlanner.
     """
 
     head_chunk: int | None = None
     row_chunk: int = DEFAULT_ROW_CHUNK
     eval_chunks: bool = True
     sparse: (sparse_attention.SparsePlan | sparse_attention.LayerPlan
-             | None) = None
+             | Callable[[mx.array, mx.array, int],
+                        sparse_attention.LayerPlan] | None) = None
 
 
 class _Stages:
@@ -317,6 +323,10 @@ def _check_inputs(x, adaln, adaln_index, rope, used, config, options):
     if options.row_chunk < 1:
         raise ValueError(f'row_chunk must be >= 1, got {options.row_chunk}')
     sparse = options.sparse
+    if callable(sparse):
+        # A planner's plans exist only once q and k do; they are checked in
+        # the head loop instead.
+        return
     if isinstance(sparse, sparse_attention.SparsePlan):
         _check_plan(sparse, used)
     elif sparse is not None:
@@ -357,6 +367,37 @@ def _check_plan(plan, rows: int) -> None:
     if plan.key_valid is not None and plan.key_valid.shape != (rows,):
         raise ValueError(f'sparse key_valid must be [{rows}], got '
                          f'{plan.key_valid.shape}')
+
+
+def _planned(planner, q: mx.array, k: mx.array, head_start: int,
+             used: int) -> sparse_attention.LayerPlan:
+    """The plan of one head chunk, checked as a static plan would be.
+
+    Args:
+        planner: Called with (q, k, head_start), see BlockOptions.sparse.
+        q: [S, H', D] queries of the chunk.
+        k: [S, H', D] keys of the chunk.
+        head_start: Global id of the chunk's first head.
+        used: Real rows of the sequence.
+
+    Returns:
+        The chunk's layer plan, whose heads are numbered from 0.
+
+    Raises:
+        ValueError: If the plan does not cover the chunk's heads, or if a
+            group's selection does not match its permutation.
+    """
+    plan = planner(q, k, head_start)
+    heads = q.shape[1]
+    if plan.num_heads != heads:
+        raise ValueError(f'planner returned {plan.num_heads} heads, expected '
+                         f'the chunk\'s {heads}')
+    for group in plan.groups:
+        if group.scatter.shape != (used,):
+            raise ValueError(f'group scatter must be [{used}], got '
+                             f'{group.scatter.shape}')
+        _check_plan(group.plan, group.gather.shape[0])
+    return plan
 
 
 def block_forward(x: mx.array, weights: BlockWeights,
@@ -429,6 +470,11 @@ def block_forward(x: mx.array, weights: BlockWeights,
         del qkv
         stages.mark('qk_norm_rope', q, k)
         sparse = options.sparse
+        if callable(sparse):
+            sparse = _planned(sparse, q, k, h0, used)
+            head_start = 0
+        else:
+            head_start = h0
         qt, kt, vt = (t[:used].transpose(1, 0, 2) for t in (q, k, v))
         if sparse is None:
             out = mx.fast.scaled_dot_product_attention(
@@ -442,8 +488,8 @@ def block_forward(x: mx.array, weights: BlockWeights,
                 k_block=chunk.k_block, scale=scale, keep=chunk.keep,
                 key_valid=chunk.key_valid, dense_rows=chunk.dense_rows)
         else:
-            out = sparse_attention.layer_attention(sparse, qt, kt, vt,
-                                                   head_start=h0, scale=scale)
+            out = sparse_attention.layer_attention(
+                sparse, qt, kt, vt, head_start=head_start, scale=scale)
         del qt, kt, vt
         out = out.transpose(1, 0, 2)  # [used, head_chunk, D]
         del q, k, v

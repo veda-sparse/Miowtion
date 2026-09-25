@@ -19,7 +19,7 @@ packed positions, the RoPE tables -- is built once by clip_inputs.
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 
 import mlx.core as mx
 import numpy as np
@@ -218,7 +218,8 @@ def velocity(weights: dit.NonTrunkWeights, blocks: BlockSource,
              timestep: TimestepInputs, video_rows: mx.array,
              audio_rows: mx.array, config: h3_config.H3Config,
              options: mlx_block.BlockOptions = mlx_block.BlockOptions(),
-             plans: Sequence[sparse_attention.LayerPlan | None] | None = None,
+             plans: Sequence[sparse_attention.LayerPlan | Callable
+                             | None] | None = None,
              ) -> tuple[mx.array, mx.array]:
     """One velocity evaluation over a streamed trunk.
 
@@ -234,10 +235,11 @@ def velocity(weights: dit.NonTrunkWeights, blocks: BlockSource,
         audio_rows: [Na, audio_channels] fp32 rows in audio_pos order.
         config: Architecture.
         options: Block chunking (head_chunk, row_chunk, sparse plan).
-        plans: One Veda plan per trunk layer, None for the layers that stay
-            dense; `plans=None` runs `options` unchanged everywhere. A
-            per-layer plan overrides `options.sparse`, which cannot express
-            that different layers select different tiles.
+        plans: One Veda plan -- or one planner, see BlockOptions.sparse --
+            per trunk layer, None for the layers that stay dense;
+            `plans=None` runs `options` unchanged everywhere. A per-layer
+            entry overrides `options.sparse`, which cannot express that
+            different layers select different tiles.
 
     Returns:
         (video_v [Nt, video_patch_dim] fp32, audio_v [Nta, channels] fp32).
