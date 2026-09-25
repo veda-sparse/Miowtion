@@ -128,12 +128,13 @@ mrope 分段都不会执行；三个 mrope 轴此时携带同一个 position，
 | `miowtion/mlx/dit.py` | trunk 之外的部分：`NonTrunkWeights`（常驻）、RoPE / 时间步表、AdaLN 表预计算、token refiner、embed、final layer |
 | `miowtion/mlx/pipeline.py` | 去噪循环：`Trajectory`（Euler 步）、`generate`（每步重新流式读一遍 trunk）、`schedule_timestep_sets` |
 | `miowtion/mlx/convert.py` | 读发布的 checkpoint（`ShardedSafetensors`：mmap safetensors → MLX array；`ReleaseReader` 另加 H3 的 config 与 schema），融合 q/k/v、写 trunk slab |
-| `miowtion/mlx/text_encoder.py` | Qwen3-VL 文本塔：`TowerConfig`、`LayerWeights`、`layer_forward`（GQA + 因果注意力 + SwiGLU）、`encode`、`write_tower_slabs` / `slab_layers`（按层流式） |
-| `miowtion/mlx/check.py` | 真实权重上的数值对照：同一个发布 block 跑 MLX、torch bf16、torch fp32 三条路，给出 `BlockComparison` |
+| `miowtion/mlx/text_encoder.py` | Qwen3-VL 文本塔：`TowerConfig`、`LayerWeights`、`layer_forward`（GQA + 因果注意力 + SwiGLU）、`encode`、`token_ids`、`write_tower_slabs` / `slab_layers`（按层流式） |
+| `miowtion/mlx/check.py` | 真实权重上的数值对照：同一个发布 block（`compare_block`）或文本塔层（`compare_text_layer`）跑 MLX、torch bf16、torch fp32 三条路，给出 `BlockComparison` |
 | `miowtion/mlx/bench.py` | 测量用：合成权重、进程与系统内存统计、各项 benchmark |
 | `scripts/mlx_bench.py` | 命令行入口，每项测量单独一个进程，结果按 JSON 行输出 |
-| `scripts/mlx_convert.py` | 把发布的 transformer 目录转成 per-block slab（可指定 block 区间与量化位宽） |
-| `scripts/mlx_check.py` | 真实权重的 block 对照，一行一个序列长度（`--out` 另存 JSON 行） |
+| `scripts/mlx_convert.py` | 把发布的 transformer 目录（`--transformer`）或文本编码器（`--text-encoder`）转成 per-block / per-layer slab（可指定区间与量化位宽） |
+| `scripts/mlx_check.py` | 真实权重的对照，一行一个序列长度（`--out` 另存 JSON 行）；`--transformer` 对 trunk block，`--text-encoder` 对文本塔的一层 |
+| `scripts/mlx_encode_text.py` | 用真实 prompt 跑文本塔，写出 DiT 条件用的 hidden states（`--slabs` 走 slab 快路径） |
 
 ### 两套发布命名
 
@@ -425,6 +426,22 @@ block 一个 plan"，而是 `LayerPlan`：每个头组带自己的 `gather` / `s
 **4 bit 不能用**：单层就 12.6 %，50 层还要叠。8 bit 只在磁盘放不下 bf16 时用，
 而且它连计算都更慢（+18 %），省的只是 I/O 和内存。
 
+### 真实权重：文本塔一层的三方对照
+
+`scripts/mlx_check.py --text-encoder <发布目录> --block N --seq-len S`
+（真实 Qwen3-VL 文本塔，hidden 5120、64 q 头 / 8 kv 头、head_dim 128）：
+
+| layer | seq | mlx vs torch(bf16) | mlx vs fp32 | torch(bf16) vs fp32 |
+|---|---|---|---|---|
+| 0 | 64 | 1.569e-03 | 2.461e-03 | 2.489e-03 |
+| 7 | 256 | 5.155e-03 | 6.373e-03 | 7.750e-03 |
+| 30 | 256 | 8.611e-03 | 1.023e-02 | 1.386e-02 |
+
+三层都满足 `mlx_vs_fp32 <= torch_vs_fp32`，而且层越深 MLX 反而更靠近 fp32：
+`mx.fast.rms_norm` 和 `mx.fast.scaled_dot_product_attention` 内部用 fp32 累加，
+transformers 的 eager 路径是纯 bf16。这同时钉住了 mrope → 普通 rope 的化简
+（rope base 写错的话，单层就是 5e-3 量级，见单测里的注释）。
+
 ### 真实权重：一条完整轨迹（33B，8 步）
 
 第一次用发布的 33B T2VA transformer 跑完整去噪循环，1 秒 16:9 片段
@@ -503,6 +520,19 @@ block 一个 plan"，而是 `LayerPlan`：每个头组带自己的 `gather` / `s
   （`mx.array_equal`，含 AdaLN 投影）。置换写反了在"只走一个方向"的测试里
   是看不出来的，所以这里把回来的方向也钉住。
 - 合成 release 上 `compare_block` 跑通，且 `as_good_as_torch` 成立。
+
+`tests/unit/test_mlx_text_encoder.py`（10 个）：
+
+- 单层、整塔、以及"只跑前缀层"（H3 在 `TEXT_LAYERS` 处停下）对
+  transformers 自己的 `Qwen3VLTextDecoderLayer` / `Qwen3VLTextModel`：单层
+  相对 L2 < 1e-3，整塔 < 1e-2。阈值特意卡在 1e-3：rope base 写错时是 5e-3，
+  写对是 3e-4，再松就分不出来了。
+- 层权重写成 slab 再读回来**逐位相等**（`mx.array_equal`）；合成发布目录里
+  `layer_tensors` / `embed_tokens` 读出来的也与写进去的逐位相等。
+- 合成发布目录上 `compare_text_layer` 跑通且 `as_good_as_torch` 成立。
+- `LayerWeights.from_tensors` 缺 tensor 报错；token 越界报错；`TowerConfig`
+  读发布 config（顺带钉住"每层约 1 GB"这个流式的前提），非 default 的
+  rope type 直接报错而不是静默当成 default。
 
 `tests/unit/test_mlx_sparse_attention.py`（13 个）：
 
@@ -583,6 +613,11 @@ block 一个 plan"，而是 `LayerPlan`：每个头组带自己的 `gather` / `s
   （seq 12 352，见「真实权重：一条完整轨迹」），1 050 s、峰值 4.51 GB，输出
   video `(12096, 96)`、audio `(130, 32)`，数值没有 NaN / 爆炸（video std 0.90、
   audio std 0.23）。
+- 2026-09-25，同一台机器：真实发布的文本编码器 layer 0 / 7 / 30 用
+  `scripts/mlx_check.py --text-encoder` 做了三方对照（见「真实权重：文本塔
+  一层的三方对照」），三层的 `mlx-vs-fp32` 都不比 `torch-vs-fp32` 差；真实
+  prompt 跑前 3 层（15 token）1.9 s/层（直接读 checkpoint，mmap 缺页路径），
+  峰值 3.27 GB；`pytest tests/unit` 201 passed。
 - **生成质量仍未验证**：上面那条轨迹的文本 embedding 是随机张量，也还没有 VAE
   解码，所以没有做视频层面的可视化对比。在人工一致性确认之前，这里的结论只覆盖
   数值、时间和内存，不覆盖生成质量。

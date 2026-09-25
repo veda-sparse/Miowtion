@@ -193,6 +193,26 @@ def embed_tokens(reader: mlx_convert.ShardedSafetensors) -> mx.array:
     return reader.read(EMBED_KEY)
 
 
+def token_ids(tokenizer_dir: str, prompt: str) -> list[int]:
+    """Token ids of a T2VA prompt.
+
+    H3 feeds the prompt verbatim, with no chat template and no special
+    tokens (miowtion.train.encode.TextEncoder._ids); images would add
+    vision blocks, which this port does not carry.
+
+    Args:
+        tokenizer_dir: The released `<variant>/tokenizer`.
+        prompt: Structured prompt text.
+
+    Returns:
+        The ids.
+    """
+    from transformers import AutoTokenizer  # pylint: disable=import-outside-toplevel
+
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir)
+    return list(tokenizer(prompt, add_special_tokens=False)['input_ids'])
+
+
 def layer_forward(x: mx.array, weights: LayerWeights,
                   config: TowerConfig) -> mx.array:
     """One decoder layer on a single causal sequence.

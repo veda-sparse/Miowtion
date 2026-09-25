@@ -1,15 +1,20 @@
 """The MLX text tower against transformers' Qwen3-VL text model."""
 
-import numpy as np
+import json
+import os
+
 import pytest
 import torch
+from safetensors.torch import save_file
 
 mx = pytest.importorskip('mlx.core')
 transformers = pytest.importorskip('transformers')
 
-from miowtion.mlx import interop  # pylint: disable=wrong-import-position
-from miowtion.mlx import slab as mlx_slab  # pylint: disable=wrong-import-position
-from miowtion.mlx import text_encoder  # pylint: disable=wrong-import-position
+from miowtion.mlx import check  # noqa: E402
+from miowtion.mlx import convert  # noqa: E402
+from miowtion.mlx import interop  # noqa: E402
+from miowtion.mlx import slab as mlx_slab  # noqa: E402
+from miowtion.mlx import text_encoder  # noqa: E402
 
 # A tower with the released proportions (GQA 8:1, head_dim > hidden /
 # heads, SwiGLU 5x) but small enough for a CPU reference.
@@ -149,7 +154,6 @@ def test_encode_rejects_an_out_of_range_token():
 
 
 def test_tower_config_reads_the_released_shape(tmp_path):
-    import json
     config = {'text_config': {
         'hidden_size': 5120, 'num_hidden_layers': 64,
         'num_attention_heads': 64, 'num_key_value_heads': 8, 'head_dim': 128,
@@ -165,7 +169,6 @@ def test_tower_config_reads_the_released_shape(tmp_path):
 
 
 def test_tower_config_rejects_an_unknown_rope(tmp_path):
-    import json
     config = {'text_config': {
         'hidden_size': 8, 'num_hidden_layers': 1, 'num_attention_heads': 2,
         'num_key_value_heads': 1, 'head_dim': 4, 'intermediate_size': 8,
@@ -174,3 +177,74 @@ def test_tower_config_rejects_an_unknown_rope(tmp_path):
     (tmp_path / 'config.json').write_text(json.dumps(config))
     with pytest.raises(ValueError, match='rope type'):
         text_encoder.TowerConfig.from_pretrained(str(tmp_path))
+
+
+def _write_text_release(directory, config=_CONFIG, seed=0):
+    """A released text encoder directory with random weights."""
+    torch.manual_seed(seed)
+    inner = config.num_attention_heads * config.head_dim
+    kv = config.num_key_value_heads * config.head_dim
+    shapes = {
+        'input_layernorm': (config.hidden_size,),
+        'post_attention_layernorm': (config.hidden_size,),
+        'self_attn.q_norm': (config.head_dim,),
+        'self_attn.k_norm': (config.head_dim,),
+        'self_attn.q_proj': (inner, config.hidden_size),
+        'self_attn.k_proj': (kv, config.hidden_size),
+        'self_attn.v_proj': (kv, config.hidden_size),
+        'self_attn.o_proj': (config.hidden_size, inner),
+        'mlp.gate_proj': (config.intermediate_size, config.hidden_size),
+        'mlp.up_proj': (config.intermediate_size, config.hidden_size),
+        'mlp.down_proj': (config.hidden_size, config.intermediate_size),
+    }
+    tensors = {text_encoder.EMBED_KEY: torch.randn(config.vocab_size,
+                                         config.hidden_size).bfloat16()}
+    for i in range(config.num_hidden_layers):
+        for name, shape in shapes.items():
+            tensors[f'{text_encoder.PREFIX}.layers.{i}.{name}.weight'] = torch.randn(
+                *shape).bfloat16()
+    os.makedirs(directory, exist_ok=True)
+    save_file(tensors, os.path.join(directory, 'model.safetensors'))
+    text = {'hidden_size': config.hidden_size,
+            'num_hidden_layers': config.num_hidden_layers,
+            'num_attention_heads': config.num_attention_heads,
+            'num_key_value_heads': config.num_key_value_heads,
+            'head_dim': config.head_dim,
+            'intermediate_size': config.intermediate_size,
+            'rms_norm_eps': config.rms_norm_eps,
+            'rope_theta': config.rope_theta,
+            'vocab_size': config.vocab_size,
+            'attention_bias': False,
+            'model_type': 'qwen3_vl_text',
+            'rope_scaling': {'rope_type': 'default',
+                             'mrope_section': [config.head_dim // 2, 0, 0],
+                             'mrope_interleaved': True}}
+    with open(os.path.join(directory, 'config.json'), 'w') as f:
+        json.dump({'architectures': ['Qwen3VLForConditionalGeneration'],
+                   'model_type': 'qwen3_vl', 'text_config': text}, f)
+    return tensors
+
+
+def test_compare_text_layer_on_a_synthetic_release(tmp_path):
+    _write_text_release(tmp_path)
+    with convert.ShardedSafetensors(str(tmp_path)) as reader:
+        result = check.compare_text_layer(reader, str(tmp_path), 1,
+                                          seq_len=16)
+    assert result.index == 1 and result.seq_len == 16
+    # Random weights are worse conditioned than trained ones, so what is
+    # asserted is the three-way relation, not an absolute error.
+    assert result.as_good_as_torch
+    assert result.mlx_seconds > 0.0 and result.torch_seconds > 0.0
+
+
+def test_layer_tensors_read_the_released_names(tmp_path):
+    written = _write_text_release(tmp_path)
+    with convert.ShardedSafetensors(str(tmp_path)) as reader:
+        got = text_encoder.layer_tensors(reader, 2)
+        embed = text_encoder.embed_tokens(reader)
+        for name, value in got.items():
+            want = written[f'{text_encoder.PREFIX}.layers.2.{name}']
+            assert mx.array_equal(value, interop.from_torch(want)), name
+        assert mx.array_equal(embed,
+                              interop.from_torch(written[
+                                  text_encoder.EMBED_KEY]))

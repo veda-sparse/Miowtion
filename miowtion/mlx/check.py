@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import dataclasses
 import time
+from collections.abc import Mapping
 
 import mlx.core as mx
 import numpy as np
@@ -30,6 +31,7 @@ from miowtion.mlx import block as mlx_block
 from miowtion.mlx import convert as mlx_convert
 from miowtion.mlx import dit
 from miowtion.mlx import interop
+from miowtion.mlx import text_encoder as mlx_text
 
 # Std of the synthetic activations fed to the block. The released blocks
 # see RMS-normed rows, so the scale only has to be O(1).
@@ -151,6 +153,93 @@ def compare_block(reader: mlx_convert.ReleaseReader, index: int,
     mx.eval(got)  # The first run pays for compilation and page faults.
     start = time.time()
     got = mlx_block.block_forward(interop.from_torch(x), *mx_args)
+    mx.eval(got)
+    mlx_seconds = time.time() - start
+
+    got = interop.to_torch(got)
+    return BlockComparison(
+        index=index, seq_len=seq_len,
+        mlx_vs_torch=_rel_l2(got, want), mlx_vs_fp32=_rel_l2(got, gold),
+        torch_vs_fp32=_rel_l2(want, gold), torch_seconds=torch_seconds,
+        mlx_seconds=mlx_seconds, peak_gb=mx.get_peak_memory() / 2**30)
+
+
+def torch_text_layer(tensors: Mapping[str, mx.array], directory: str,
+                     index: int):
+    """A transformers decoder layer holding one released text layer.
+
+    Args:
+        tensors: The layer, keyed as in miowtion.mlx.text_encoder.
+        directory: The released `<variant>/text_encoder` (for the config).
+        index: Layer index (transformers uses it for the layer type).
+
+    Returns:
+        An evaluated Qwen3VLTextDecoderLayer in bf16.
+    """
+    from transformers import AutoConfig  # pylint: disable=import-outside-toplevel
+    from transformers.models.qwen3_vl import modeling_qwen3_vl as qwen  # pylint: disable=import-outside-toplevel
+
+    config = AutoConfig.from_pretrained(directory).text_config
+    layer = qwen.Qwen3VLTextDecoderLayer(config, index).to(torch.bfloat16)
+    with torch.no_grad():
+        for name in mlx_text.NORM_NAMES + mlx_text.LINEAR_NAMES:
+            key = f'{name}.weight'
+            layer.get_parameter(key).copy_(interop.to_torch(tensors[key]))
+    return layer.eval()
+
+
+def compare_text_layer(reader, directory: str, index: int, seq_len: int,
+                       seed: int = 0) -> BlockComparison:
+    """Runs one released text encoder layer on both backends.
+
+    The same three-way check as compare_block: what matters is whether
+    `mlx_vs_fp32` beats `torch_vs_fp32`, not the distance between the two
+    bf16 paths.
+
+    Args:
+        reader: An open ShardedSafetensors over `<variant>/text_encoder`.
+        directory: That same directory (the config is read from it).
+        index: Layer to compare.
+        seq_len: Prompt length of the synthetic input.
+        seed: Seed of the synthetic input.
+
+    Returns:
+        The comparison.
+    """
+    from transformers import AutoConfig  # pylint: disable=import-outside-toplevel
+    from transformers.models.qwen3_vl import modeling_qwen3_vl as qwen  # pylint: disable=import-outside-toplevel
+
+    config = mlx_text.TowerConfig.from_pretrained(directory)
+    tensors = mlx_text.layer_tensors(reader, index)
+    mx.eval(*tensors.values())
+    weights = mlx_text.LayerWeights.from_tensors(tensors)
+    layer = torch_text_layer(tensors, directory, index)
+    del tensors
+
+    torch.manual_seed(seed)
+    x = (torch.randn(1, seq_len, config.hidden_size) * _INPUT_STD).bfloat16()
+    # Text-only mrope: one position on all three axes.
+    positions = torch.arange(seq_len)[None, None, :].expand(3, 1, seq_len)
+    rotary = qwen.Qwen3VLTextRotaryEmbedding(
+        AutoConfig.from_pretrained(directory).text_config)
+    mask = torch.full((seq_len, seq_len), float('-inf')).triu(1)
+    with torch.no_grad():
+        cos, sin = rotary(x, positions)
+        start = time.time()
+        want = layer(x, position_embeddings=(cos, sin),
+                     attention_mask=mask.bfloat16()[None, None])
+        torch_seconds = time.time() - start
+        want = (want[0] if isinstance(want, tuple) else want)[0]
+        gold = layer.float()(x.float(),
+                             position_embeddings=(cos.float(), sin.float()),
+                             attention_mask=mask[None, None])
+        gold = (gold[0] if isinstance(gold, tuple) else gold)[0]
+
+    mx_x = interop.from_torch(x[0])
+    got = mlx_text.layer_forward(mx_x, weights, config)
+    mx.eval(got)  # The first run pays for compilation and page faults.
+    start = time.time()
+    got = mlx_text.layer_forward(mx_x, weights, config)
     mx.eval(got)
     mlx_seconds = time.time() - start
 

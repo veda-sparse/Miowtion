@@ -1,4 +1,4 @@
-"""Compares a released trunk block on MLX against the torch reference.
+"""Compares a released block or text layer against the torch reference.
 
 Prints one line per sequence length (and one JSON line per comparison when
 --out is given). The torch side is CPU eager and quadratic in the sequence
@@ -8,6 +8,8 @@ Examples:
     python scripts/mlx_check.py --transformer weights/h3/transformer
     python scripts/mlx_check.py --transformer weights/h3/transformer \
         --block 7 --seq-len 512 4096 --out runs/mlx_check/blocks.jsonl
+    python scripts/mlx_check.py --text-encoder weights/h3/text_encoder \
+        --block 0 --seq-len 64
 """
 
 import argparse
@@ -21,10 +23,15 @@ from miowtion.utils import progress
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--transformer', required=True,
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument('--transformer',
                         help='released <variant>/transformer directory')
+    source.add_argument('--text-encoder',
+                        help='released <variant>/text_encoder directory; '
+                             'compares one Qwen3-VL layer instead')
     parser.add_argument('--block', type=int, default=0,
-                        help='trunk block to compare')
+                        help='trunk block (or text encoder layer) to '
+                             'compare')
     parser.add_argument('--seq-len', type=int, nargs='+', default=[512],
                         help='packed sequence lengths to compare at')
     parser.add_argument('--seed', type=int, default=0)
@@ -36,11 +43,18 @@ def main() -> None:
     parser.add_argument('--out', help='append one JSON line per comparison')
     args = parser.parse_args()
 
-    with convert.ReleaseReader(args.transformer) as reader:
+    opener = (convert.ShardedSafetensors(args.text_encoder)
+              if args.text_encoder else
+              convert.ReleaseReader(args.transformer))
+    with opener as reader:
         for seq_len in args.seq_len:
-            result = check.compare_block(reader, args.block, seq_len,
-                                         args.seed, bits=args.bits,
-                                         group_size=args.group_size)
+            if args.text_encoder:
+                result = check.compare_text_layer(
+                    reader, args.text_encoder, args.block, seq_len, args.seed)
+            else:
+                result = check.compare_block(reader, args.block, seq_len,
+                                             args.seed, bits=args.bits,
+                                             group_size=args.group_size)
             flag = ('' if args.bits or result.as_good_as_torch
                     else '  [WORSE THAN TORCH BF16]')
             progress.log(f'{result.line()}{flag}')
