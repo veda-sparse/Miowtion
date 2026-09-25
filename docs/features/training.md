@@ -110,7 +110,9 @@
 
 ## 测试
 - `tests/unit/test_train_pipeline.py`：prompt 校验（两种格式）、样本缓存读写往返、AdaLN 表与实时
-  计算逐位一致、tiny DiT 上阶段 1 训练 3 步 + checkpoint + 恢复（CPU 端到端）。
+  计算逐位一致、tiny DiT 上阶段 1 训练 3 步 + checkpoint + 恢复（CPU 端到端）、学习率表
+  （常数路径是 warmup 后持平、cosine 在 warmup 结束处不跳变且单调落到下限、非法的
+  `lr_decay` / `lr_min_ratio` 被拒）。
 - 真实权重：`scripts/smoke_dit.py`（结果见上表，2026-09-23）。
 
 ## 多几何混训（`configs/stage1_turbo8_multigeo_4090.yaml`）
@@ -119,7 +121,7 @@
 - 样本：MovieGenVideoBench 扩写集中每个 latent_t 各 150 条（10 s 的 150 条单独扩写）；另外随机
   留出 20 条（随机宽高比与时长）只用于最终的稠密 / 稀疏对比，不参与训练。
 - lr 1e-3（用户指定），warmup 20（lr 是参考配方的 10 倍，第一步不能把权重整个替换掉），accum 2
-  （每次 update 4 个状态）；warmup 之后是常数 lr，没有衰减。
+  （每次 update 4 个状态）；warmup 之后是常数 lr。衰减见下面的「学习率与分阶段」。
 - checkpoint：每 50 次 update 存一次，**一个都不删**。权重 + EMA 是训练历史（打分器 275.25M
   参数 → 1.03 GiB + 1.03 GiB），2000 次 update 共约 82 GiB。Adam 的一阶 / 二阶矩另外占
   2.05 GiB，单独写在 `optim.pt` 里，只有最近 `keep_optimizer: 2` 个 checkpoint 保留（恢复只会从
@@ -131,6 +133,21 @@
 - 冒烟（`configs/stage1_turbo8_multigeo_smoke_4090.yaml`，每个几何 1 步）：micro-step 1:1 t37
   16 s、16:9 t37 31 s、1:1 t72 36 s、4:3 t72 54 s、1:1 t102 63 s、4:3 t102 81 s、16:9 / 9:16
   t102 150 s；初始 KL 0.94–1.64，recall ≈ 0.52–0.54。
+
+## 学习率与分阶段（`trainer.learning_rate`）
+- 学习率永远是「线性 warmup × 衰减系数」的乘积，不是分段拼接：`lr_decay: none`（默认）时
+  warmup 之后恒定；`lr_decay: cosine` 时 cosine 从 warmup 结束处开始、到第 `steps` 次 update
+  落到 `lr_min_ratio × lr`。两者相乘而不是接续，是为了让衔接处没有跳变（warmup 期间 cosine
+  的自变量被截到 0，系数恒为 1），并且恢复训练时只看绝对的 `step`，不需要额外状态。超过
+  `steps` 继续训练时钳在下限，不会翻上去。
+- **阶段 A（`stage1_fast_t37_4090.yaml`）只训 latent_t 37、常数 lr 1e-3**：一次 t102 update 的
+  代价是 t37 的 5–8 倍，只换来同样的一次梯度，循环 12 种几何会把约 70% 的墙钟花在 1/3 的
+  update 上。
+- **阶段 B（`stage1_refine_multigeo_4090.yaml`）恢复 12 种几何、lr 1e-3 cosine 衰减到 1e-4**：
+  从阶段 A 第 600 次 update 接着训 600 次。这一阶段打分器已经收敛，只是去适配没见过的长度，
+  所以要衰减——常数 lr 下按几何循环时，最后一个几何的梯度会直接决定最终权重，衰减让尾部变成
+  平均而不是覆盖。batch 取 4（accum 2）而不是阶段 A 的 8：12 种几何的 micro-step 平均约 65 s，
+  batch 8 的 600 次 update 要约 43 小时。
 
 ## 训练动态的诊断量（`miowtion/veda/{attention,heatmap}.py`）
 每个 micro-step 记录，日志里每 `log_every` 步汇总一次：

@@ -1,0 +1,55 @@
+# Stage 1 phase B ("geometry refine"): all twelve geometries, continued
+# from the phase-A run (stage1_fast_t37_4090) at update 600.
+#
+# Phase A trained on latent_t 37 only, because a t102 update costs 5-8x a
+# t37 one. The step-600 holdout comparison shows that predictor extrapolates
+# to t72/t102 -- those are in fact where the speedup is largest (end to end
+# 2.76x at t102 vs 1.57x at t37, see docs/features/inference.md) -- so this
+# phase is about closing the gap on lengths the predictor never saw, not
+# about learning the task.
+#
+# Cosine decay (new here): phase A ran a constant 1e-3 after warmup, which
+# is the right setting while the predictor is still moving, but this phase
+# starts from a converged one and only adapts it to longer sequences. A
+# constant 1e-3 across a cycle whose per-geometry gradients differ in scale
+# would let the last geometry of the run set the final weights. The cosine
+# falls to 1e-4 at update 600 so the tail averages instead.
+#
+# accum 2 (batch 4, not phase A's 8): the twelve-geometry cycle averages
+# ~65 s per micro-step (t37 16-31 s, t102 63-150 s), so batch 8 would cost
+# ~43 h for 600 updates. Batch 4 halves that. The variance batch 8 was
+# raised to fight is a phase-A problem: teacher_q_tiles is 1.0 here too, and
+# the cycle already decorrelates consecutive updates by geometry.
+run_name: stage1_refine_multigeo_4090
+checkpoint_root: weights/MiniMax-H3
+sample_cache: artifacts/samples/moviegen_multigeo_train
+geometries: ['1:1@37', '4:3@37', '16:9@37', '9:16@37', '1:1@72', '4:3@72',
+             '16:9@72', '9:16@72', '1:1@102', '4:3@102', '16:9@102',
+             '9:16@102']
+geometry_sampling: cycle
+variant: FL2VA
+tasks: [t2va]
+plan_dir: runs/search_turbo8_multigeo_4090/plans
+schedule: turbo
+num_steps: 8
+teacher_adapter: weights/turbo_lora/minimax_h3_turbo_v4_step600_ema.safetensors
+init_from: runs/stage1_fast_t37_4090/ckpt/step_0000600
+keep_ratio: 0.1
+teacher_q_tiles: 1.0   # supervise every query tile
+accum: 2               # 2 ranks x 2 = batch 4
+steps: 600
+lr: 1.0e-3
+warmup: 20
+lr_decay: cosine
+lr_min_ratio: 0.1      # 1e-4 at update 600
+# save_every 100 and keep_optimizer 1 as in phase A: each checkpoint is
+# ~2.1 GiB of weights + EMA and the box this runs on is short on space.
+save_every: 100
+keep_optimizer: 1
+out_dir: runs
+# 44, not the 50 inference uses: training shards the trunk over the ranks,
+# inference replicates it per card. 104k token peaks at 20.9 GiB here.
+offload_blocks: 44
+prefetch: 1
+mlp_chunk_rows: 8192
+offload_optimizer: true

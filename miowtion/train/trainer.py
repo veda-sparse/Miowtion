@@ -82,6 +82,8 @@ class TrainConfig:
     steps: int = 400
     lr: float = 1e-4
     warmup: int = 25
+    lr_decay: str = 'none'  # or 'cosine', see learning_rate()
+    lr_min_ratio: float = 0.1  # floor of the cosine, as a fraction of lr
     betas: tuple[float, float] = (0.9, 0.95)
     weight_decay: float = 0.0
     grad_clip: float = 1.0
@@ -130,6 +132,40 @@ class TrainConfig:
                 1 <= self.trajectory_steps <= self.num_steps):
             raise ValueError(f'trajectory_steps must be in [1, '
                              f'{self.num_steps}], got {self.trajectory_steps}')
+        if self.lr_decay not in LR_DECAYS:
+            raise ValueError(f'lr_decay must be one of {sorted(LR_DECAYS)}, '
+                             f'got {self.lr_decay!r}')
+        if not 0.0 <= self.lr_min_ratio <= 1.0:
+            raise ValueError(f'lr_min_ratio must be in [0, 1], got '
+                             f'{self.lr_min_ratio}')
+
+
+LR_DECAYS = ('none', 'cosine')
+
+
+def learning_rate(config: TrainConfig, step: int) -> float:
+    """Learning rate for a 0-based update index.
+
+    Linear warmup over `warmup` updates, then either a constant rate or a
+    cosine falling to `lr_min_ratio * lr` at `steps`. The two are multiplied
+    rather than chained, so the cosine starts at the end of the warmup and
+    the curve has no jump there.
+
+    Args:
+        config: Run configuration.
+        step: Update index, 0-based; may exceed `config.steps` (the cosine
+            is clamped at its floor).
+
+    Returns:
+        The rate to write into every parameter group.
+    """
+    lr = config.lr * min(1.0, (step + 1) / max(1, config.warmup))
+    if config.lr_decay == 'none':
+        return lr
+    done = (step + 1 - config.warmup) / max(1, config.steps - config.warmup)
+    done = min(1.0, max(0.0, done))
+    cosine = 0.5 * (1.0 + math.cos(math.pi * done))
+    return lr * (config.lr_min_ratio + (1.0 - config.lr_min_ratio) * cosine)
 
 
 class Trainer:
@@ -362,9 +398,9 @@ class Trainer:
             norms = {name: torch.nn.utils.clip_grad_norm_(
                 params, config.grad_clip).item()
                      for name, params in self.clip_groups.items()}
+            lr = learning_rate(config, self.step)
             for group in self.optimizer.param_groups:
-                group['lr'] = config.lr * min(1.0, (self.step + 1)
-                                              / max(1, config.warmup))
+                group['lr'] = lr
             if self.masters is not None:
                 self.masters.pull_grads()
             diagnostics = (self.monitor.before_step()

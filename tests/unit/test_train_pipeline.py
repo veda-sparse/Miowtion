@@ -316,3 +316,44 @@ def test_update_monitor_and_gradient_stop():
     trunk.weight.grad = torch.ones_like(trunk.weight)
     with pytest.raises(RuntimeError, match='frozen'):
         monitor.check_gradient_stop(model, list(pred.parameters()))
+
+
+def _lr_config(**kwargs) -> trainer_lib.TrainConfig:
+    base = dict(run_name='lr', checkpoint_root='.', sample_cache='.',
+                geometries=['1:1@37'], lr=1e-3, warmup=20, steps=600)
+    base.update(kwargs)
+    return trainer_lib.TrainConfig(**base)
+
+
+def test_constant_lr_is_warmup_then_flat():
+    config = _lr_config()
+    assert trainer_lib.learning_rate(config, 0) == pytest.approx(5e-5)
+    assert trainer_lib.learning_rate(config, 19) == pytest.approx(1e-3)
+    assert trainer_lib.learning_rate(config, 599) == pytest.approx(1e-3)
+
+
+def test_cosine_decays_from_the_end_of_the_warmup_to_the_floor():
+    config = _lr_config(lr_decay='cosine', lr_min_ratio=0.1)
+    # The cosine starts where the warmup ends: no jump at the seam.
+    assert trainer_lib.learning_rate(config, 19) == pytest.approx(1e-3)
+    # Halfway through the post-warmup span, the cosine is at the midpoint
+    # between lr and the floor.
+    assert trainer_lib.learning_rate(config, 19 + 290) == pytest.approx(
+        0.55e-3, rel=1e-3)
+    assert trainer_lib.learning_rate(config, 599) == pytest.approx(1e-4)
+    # Monotone after the warmup, and clamped at the floor past the end.
+    rates = [trainer_lib.learning_rate(config, s) for s in range(19, 600)]
+    assert all(a >= b for a, b in zip(rates, rates[1:]))
+    assert trainer_lib.learning_rate(config, 900) == pytest.approx(1e-4)
+    # The warmup itself is unchanged by the decay.
+    plain = _lr_config()
+    assert all(trainer_lib.learning_rate(config, s)
+               == pytest.approx(trainer_lib.learning_rate(plain, s))
+               for s in range(19))
+
+
+def test_lr_schedule_settings_are_validated():
+    with pytest.raises(ValueError, match='lr_decay'):
+        _lr_config(lr_decay='linear').validate()
+    with pytest.raises(ValueError, match='lr_min_ratio'):
+        _lr_config(lr_decay='cosine', lr_min_ratio=1.5).validate()
