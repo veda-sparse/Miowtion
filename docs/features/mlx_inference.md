@@ -691,6 +691,14 @@ transformers 的 eager 路径是纯 bf16。这同时钉住了 mrope → 普通 r
   rope 的 cos。对策：`rope_tables` 的单测直接钉 numpy 写出来的解析式，而不是钉
   另一份实现。
 
+- **每头一份的选择遇上 head chunk 会直接崩**。现象：真实 Veda plan（每层两个头组、
+  每个头自己 top-k）跑起来报 `per-head index has 56 heads, expected 8`。原因：trunk 按
+  `head_chunk=8` 分块算注意力，`layer_attention` 把 q 切到 8 个头，却把整组 56 个头的
+  `index` / `keep` 原样传给 kernel。合成 plan 是所有头共用一份 2 维 index，所以之前的
+  测试全过。对策：`SparsePlan.select_heads` / `HeadGroupPlan.select_heads`，切 q 的同时
+  切选择；单测钉"分块与不分块逐位相等"（head_chunk=1 时 batch 为 1，kernel 归约顺序
+  不同，差 1 ulp）。
+
 ## 验证记录
 
 - 2026-09-24，Apple M3 Pro / 18 GB / mlx 0.32.2，commit 见本次提交：

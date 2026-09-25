@@ -102,3 +102,5 @@
 | bf16 权重集 4.5 GB，载入峰值却是 9.0 GB，`mx.clear_cache()` 无效 | MLX 的 `astype` 惰性，fp32 原张量活到结果被 eval；一个 block 才 eval 一次 | 读一个张量就 `mx.eval`（`_cast`），超额降到一个张量 128 MB | [mlx_inference](features/mlx_inference.md) |
 | 同一份代码、同一个 batch，两次测速差 3.3 倍 | 机器内存紧张时 4.5 GB 常驻权重被换出，每次前向都在重新缺页 | 测速前先看 `memory_pressure`，把当时的空闲内存一起写进文档 | [mlx_inference](features/mlx_inference.md) |
 | 移植 VAE 后两条 fp32 路径相对 L2 是 6e-3 而不是 1e-7 | RoPE 的频率表漏了 `2π` | 逐段对照中间量定位；单测钉 numpy 的解析式，不要钉另一份实现 | [mlx_inference](features/mlx_inference.md) |
+| 真实 Veda plan 一跑就报 `per-head index has 56 heads, expected 8` | trunk 按 head_chunk 切 q，却把整层的每头选择原样传给 kernel；合成 plan 是共用的 2 维 index，测不出来 | `select_heads` 跟着 q 一起切；单测钉分块 / 不分块逐位相等 | [mlx_inference](features/mlx_inference.md) |
+

@@ -271,3 +271,26 @@ def test_layer_plan_is_validated():
         with pytest.raises(ValueError):
             mlx_block.block_forward(*args,
                                     mlx_block.BlockOptions(sparse=layer))
+
+
+def test_per_head_selection_survives_head_chunking():
+    # Veda picks its key tiles per head, and the trunk runs attention
+    # head_chunk heads at a time; the chunk's q must meet its own heads'
+    # selection, not the whole layer's.
+    from miowtion.mlx import sparse_attention
+    heads = _CONFIG.num_heads
+    index = mx.stack([sparse_attention.random_index(_USED // 20,
+                                                    _USED // 16, 2, seed=h)
+                      for h in range(heads)])
+    plan = sparse_attention.SparsePlan(index, 20, 16)
+    want = _mlx_forward(torch.float32, mlx_block.BlockOptions(sparse=plan))
+    # Two heads per call is bitwise the same work, only narrower.
+    assert torch.equal(
+        _mlx_forward(torch.float32,
+                     mlx_block.BlockOptions(sparse=plan, head_chunk=2)),
+        want)
+    # One head leaves the kernel a batch of one, which reduces in a
+    # different order: 1 ulp of fp32, not a different selection.
+    alone = _mlx_forward(torch.float32,
+                         mlx_block.BlockOptions(sparse=plan, head_chunk=1))
+    assert (alone - want).abs().max().item() <= 2.4e-7

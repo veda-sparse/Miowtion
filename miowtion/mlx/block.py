@@ -434,10 +434,13 @@ def block_forward(x: mx.array, weights: BlockWeights,
             out = mx.fast.scaled_dot_product_attention(
                 qt[None], kt[None], vt[None], scale=scale)[0]
         elif isinstance(sparse, sparse_attention.SparsePlan):
+            # A per-head selection covers the layer's heads; this call
+            # only has the chunk's.
+            chunk = sparse.select_heads(range(h0, h0 + qt.shape[0]))
             out = sparse_attention.block_sparse_attention(
-                qt, kt, vt, sparse.index, q_block=sparse.q_block,
-                k_block=sparse.k_block, scale=scale, keep=sparse.keep,
-                key_valid=sparse.key_valid, dense_rows=sparse.dense_rows)
+                qt, kt, vt, chunk.index, q_block=chunk.q_block,
+                k_block=chunk.k_block, scale=scale, keep=chunk.keep,
+                key_valid=chunk.key_valid, dense_rows=chunk.dense_rows)
         else:
             out = sparse_attention.layer_attention(sparse, qt, kt, vt,
                                                    head_start=h0, scale=scale)

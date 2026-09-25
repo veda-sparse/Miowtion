@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import dataclasses
 import math
+from collections.abc import Sequence
 
 import mlx.core as mx
 
@@ -79,6 +80,27 @@ class SparsePlan:
         not the density of the selection.
         """
         return self.budget / (seq_len / self.k_block)
+
+    def select_heads(self, positions: Sequence[int]) -> SparsePlan:
+        """The same plan restricted to some of its heads.
+
+        A block that chunks its heads hands the kernel a q of
+        `head_chunk` heads, so a per-head selection has to be narrowed
+        the same way; a shared selection is returned unchanged.
+
+        Args:
+            positions: Ascending head positions of this plan to keep.
+
+        Returns:
+            A plan whose per-head arrays have `len(positions)` heads.
+        """
+        if self.index.ndim == 2 or len(positions) == self.index.shape[0]:
+            return self
+        pick = mx.array(list(positions), dtype=mx.int32)
+        return dataclasses.replace(
+            self, index=mx.take(self.index, pick, axis=0),
+            keep=None if self.keep is None
+            else mx.take(self.keep, pick, axis=0))
 
 
 def block_mask_from_index(index: mx.array, q_block: int, k_block: int,
@@ -361,6 +383,24 @@ class HeadGroupPlan:
     scatter: mx.array
     plan: SparsePlan
 
+    def select_heads(self, positions: Sequence[int]) -> HeadGroupPlan:
+        """The group restricted to some of its heads.
+
+        The permutation is shared by the whole group, so only the
+        selection narrows.
+
+        Args:
+            positions: Ascending positions into `heads` to keep.
+
+        Returns:
+            A group of `len(positions)` heads.
+        """
+        if len(positions) == len(self.heads):
+            return self
+        return dataclasses.replace(
+            self, heads=tuple(self.heads[i] for i in positions),
+            plan=self.plan.select_heads(positions))
+
 
 @dataclasses.dataclass(frozen=True)
 class LayerPlan:
@@ -448,16 +488,20 @@ def layer_attention(layer: LayerPlan, q: mx.array, k: mx.array, v: mx.array,
                          f'[0, {layer.num_heads})')
     parts, order = [], []
     for group in layer.groups:
-        local = [h - head_start for h in group.heads if head_start <= h < stop]
-        if not local:
+        positions = [position for position, head in enumerate(group.heads)
+                     if head_start <= head < stop]
+        if not positions:
             continue
+        local = [group.heads[position] - head_start for position in positions]
         if len(local) == heads:
             sub = (q, k, v)
         else:
             pick = mx.array(local, dtype=mx.int32)
             sub = tuple(mx.take(x, pick, axis=0) for x in (q, k, v))
-        parts.append(group_attention(group, *sub, scale=scale,
-                                     head_chunk=head_chunk))
+        # The group's selection is per head, so it has to be narrowed to
+        # the same heads q was narrowed to.
+        parts.append(group_attention(group.select_heads(positions), *sub,
+                                     scale=scale, head_chunk=head_chunk))
         order += local
     if len(parts) == 1:
         return parts[0]
