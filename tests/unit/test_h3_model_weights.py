@@ -172,3 +172,35 @@ def test_chunked_adaln_ops_are_bitwise_identical(monkeypatch):
     monkeypatch.setattr(h3_model, '_ADALN_CHUNK_ROWS', 128)
     assert torch.equal(h3_model._modulate(x, 1.0 + table, table, index), mod)
     assert torch.equal(h3_model._gated_residual(x, table, index, h), res)
+
+
+_RELEASE_V2_CONFIG = {
+    '_class_name': 'MiniMaxH3Transformer3DModel',
+    'num_attention_heads': 56, 'attention_head_dim': 128,
+    'hidden_size': 5376, 'num_layers': 50, 'num_refiner_layers': 2,
+    'ffn_dim': 14336, 'in_channels': 24, 'audio_in_channels': 32,
+    'patch_size': [1, 2, 2], 'text_dim': 5120, 'freq_dim': 256,
+    'time_embed_hidden_dim': 5376, 'time_embed_dim': 2688,
+    'rope_freq_dim': 16, 'rope_theta': 10000.0, 'norm_eps': 1e-05,
+    'qk_norm_eps': 1e-05, 'final_norm_eps': 1e-05,
+}
+
+
+def _write_config(directory, raw):
+    with open(os.path.join(directory, 'config.json'), 'w') as f:
+        json.dump(raw, f)
+    return str(directory)
+
+
+def test_config_reads_the_diffusers_release_schema(tmp_path):
+    """The diffusers port renamed most keys but describes the same model."""
+    cfg = h3_config.H3Config.from_pretrained(
+        _write_config(tmp_path, _RELEASE_V2_CONFIG))
+    assert cfg == h3_config.H3Config()
+
+
+def test_config_refuses_an_unknown_schema(tmp_path):
+    raw = dict(_RELEASE_V2_CONFIG)
+    del raw['ffn_dim']
+    with pytest.raises(KeyError, match='ffn_dim'):
+        h3_config.H3Config.from_pretrained(_write_config(tmp_path, raw))

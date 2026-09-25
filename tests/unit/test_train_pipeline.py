@@ -39,6 +39,10 @@ def _write_release(root, variant='FL2VA'):
                    'time_embed_hidden_size': c.time_embed_hidden,
                    'time_embed_dim': c.time_embed_dim,
                    'rope_inv_freq_len': c.rope_freqs_per_axis,
+                   'latents_dim': c.video_channels,
+                   'audio_latents_dim': c.audio_channels,
+                   'norm_eps': c.norm_eps, 'qk_norm_eps': c.qk_norm_eps,
+                   'final_norm_eps': c.final_norm_eps,
                    'patch_size': [1, 2, 2]}, f)
     with open(os.path.join(root, variant, 'model_index.json'), 'w') as f:
         json.dump({'_minimax_h3': {'sigma_shift_scales': {

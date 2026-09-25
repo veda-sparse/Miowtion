@@ -75,6 +75,14 @@ VAE 代码、`model_index.json` 的 sigma 位移）直接复用，不重写。
   [S, 56, 128] 的临时张量，78k token 时约 4 GB，训练在 4:3 14.4 s 上 OOM。按行分块后临时显存有界，
   结果逐位不变。之后 16:9 14.4 s（104k token）又在 `_modulate`（`index_select` 出的 [S, 5376]
   调制向量、乘积、和）处 OOM，调制和 gate 残差同样按行分块。
+- **发布的 checkpoint 有两套命名**：最早的 `MiniMaxH3DiTModel`（diffusers 0.32）用
+  `blocks.N.attn.qkv_proj.weight` 这类 H3 原生名字，后来上游改成 diffusers 移植版
+  `MiniMaxH3Transformer3DModel`（diffusers 0.36），config.json 的键几乎全部改名
+  （`ffn_hidden_size` → `ffn_dim`、`latents_dim` → `in_channels`、`rope_inv_freq_len`
+  → `rope_freq_dim` 等），权重也改成 `transformer_blocks.N.attn.to_q/to_k/to_v`。
+  旧的 `from_pretrained` 只认第一套键名，遇到第二套会**静默退回 dataclass 默认值**——
+  这次恰好默认值和真实值一致所以没炸，换个 checkpoint 就会安静地跑错模型。现在
+  `CONFIG_KEYS` 同时登记两套拼写，任何字段找不到就直接 `KeyError`。
 - 浮点恒等式不能直接在测试里用：`a+b−a` 在浮点下不等于 `b`，逐位测试应当直接复算期望值。
 
 ## 验证记录
