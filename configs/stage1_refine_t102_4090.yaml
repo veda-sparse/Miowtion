@@ -45,13 +45,14 @@ lr_min_ratio: 0.1      # 1e-4 at update 600
 save_every: 100
 keep_optimizer: 1
 out_dir: runs
-# 48, not the 44 the twelve-geometry run used: that run only visited t102
-# every twelfth trajectory, this one never leaves it. At 44 the allocator
-# already had to flush its cache to find 3.4 GiB at the 78k-token (4:3)
-# transition, with 0.6 GiB free; 16:9 is 104k. Launch with
-# PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True as well -- the failure
-# was fragmentation, not a real shortage.
-offload_blocks: 48
+# 50 (every block streamed), not the 44 the twelve-geometry run used: that
+# run only visited t102 every twelfth trajectory, this one never leaves it.
+# 44 could not find 3.4 GiB of contiguous space at the 60k -> 78k token
+# transition; 48 got through that but left 20 MB free on the 104k-token
+# 16:9, where the allocator spent its time mapping and unmapping 20 MiB
+# granules. Launch with
+# PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.8.
+offload_blocks: 50
 prefetch: 1
 mlp_chunk_rows: 8192
 offload_optimizer: true

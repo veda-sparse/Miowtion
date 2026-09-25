@@ -101,8 +101,12 @@ class ClipTiling:
 
 # Bound on one tile-ordered q / k / v / out copy in TeacherCollector and
 # SparseStudent (heads are processed in chunks under it), and the bytes of
-# one bf16 head_dim-128 row.
-_COLLECT_BYTES = 512 * 2**20
+# one bf16 head_dim-128 row. Note the collector holds *two* of these at
+# once (the q and k copies, until the heat is built), so the peak is twice
+# this. 256 MiB, not 512: at 104k tokens the 1 GiB that cost left the card
+# with 20 MB free. Heads are independent, so the chunk size does not touch
+# the result -- only how many kernel launches build it.
+_COLLECT_BYTES = 256 * 2**20
 _HEAD_DIM_BYTES = 128 * 2
 
 

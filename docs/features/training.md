@@ -220,7 +220,15 @@ kernel 只读 top-k 的排序，两者会分开；见 `docs/features/veda_predic
   测试覆盖 `SparseStudent`。现在只取视频行，新增的 CPU 测试用带全局 tile 的真实打包布局，并检查全
   保留预算时与稠密一致。
 
-- **只训 t102 时 offload 44 不够，分配器在几何切换处清缓存重试**：12 几何混训时 44 是够的
+- **只训 t102 时显存到顶（两种告警，两种原因）**：先是 offload 44 在 60k → 78k token 的几何切换处
+  报"要 3.4 GiB 连续块、只有 0.6 GiB 空闲"（碎片），加 `expandable_segments` + offload 48 解决；
+  接着 104k token 的 16:9 又报 `expandable_segments: memory mapping failed ... map 20 MiB
+  (free: 20 MB)`——这次是**真没有了**，不是碎片。省下来的两处：`offload_blocks` 提到 50（全部
+  block 都流式拷贝，每 rank 再省约 0.8 GiB），以及 `attention._COLLECT_BYTES` 512 → 256 MiB
+  （收集器同时持有 q 和 k 两份 tile 序副本，峰值是这个常数的两倍；头之间互相独立，chunk 大小
+  不影响结果，只影响 kernel launch 次数）。启动再加
+  `garbage_collection_threshold:0.8`，让分配器在撞墙前就回收缓存，而不是每次失败再重试。
+  详细的第一版现象：**只训 t102 时 offload 44 不够，分配器在几何切换处清缓存重试**：12 几何混训时 44 是够的
   （104k token 峰值 20.9 GiB），但那种配比下 t102 每 12 条轨迹才来一次；只训 t102 时每次几何
   切换都是大张量换大张量，日志里出现
   `CUDACachingAllocator ... memory allocation failed with OOM ... (free: 0.6 GiB)`——
