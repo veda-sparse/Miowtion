@@ -51,16 +51,15 @@ def _read_header(path: str) -> tuple[dict, int]:
     return header, 8 + length
 
 
-class ReleaseReader:
-    """Random access to a sharded safetensors checkpoint as MLX arrays.
+class ShardedSafetensors:
+    """Random access to a sharded safetensors directory as MLX arrays.
 
-    Attributes:
-        schema: The detected release layout (miowtion.h3.release.SCHEMAS).
-        config: The architecture read from config.json.
+    Nothing here knows about H3: the text encoder streams its own layers
+    through the same reader.
     """
 
-    def __init__(self, transformer_dir: str):
-        """Opens `<variant>/transformer`.
+    def __init__(self, directory: str):
+        """Opens every `*.safetensors` in `directory`.
 
         The index file is optional: the shard headers are the ground truth
         and are cheap to read (one seek each).
@@ -68,11 +67,10 @@ class ReleaseReader:
         Raises:
             FileNotFoundError: When the directory holds no safetensors.
         """
-        shards = sorted(glob.glob(os.path.join(transformer_dir,
-                                               '*.safetensors')))
+        shards = sorted(glob.glob(os.path.join(directory, '*.safetensors')))
         if not shards:
-            raise FileNotFoundError(f'no safetensors in {transformer_dir}')
-        self._dir = transformer_dir
+            raise FileNotFoundError(f'no safetensors in {directory}')
+        self._dir = directory
         self._headers: dict[str, dict] = {}
         self._bases: dict[str, int] = {}
         self._key_to_file: dict[str, str] = {}
@@ -82,17 +80,9 @@ class ReleaseReader:
             self._bases[path] = base
             self._key_to_file.update({k: path for k in header})
         self._maps: dict[str, mmap.mmap] = {}
-        self.config = h3_config.H3Config.from_pretrained(transformer_dir)
-        self.schema = h3_release.detect_schema(self._key_to_file)
 
     def keys(self) -> set[str]:
         return set(self._key_to_file)
-
-    def check_complete(self) -> None:
-        """Raises KeyError when a tensor the DiT needs is absent."""
-        h3_release.check_complete(self.schema, self._key_to_file,
-                                  self.config.num_layers,
-                                  self.config.num_refiner_layers)
 
     def _map(self, path: str) -> mmap.mmap:
         if path not in self._maps:
@@ -128,11 +118,31 @@ class ReleaseReader:
             mapped.close()
         self._maps.clear()
 
-    def __enter__(self) -> ReleaseReader:
+    def __enter__(self) -> ShardedSafetensors:
         return self
 
     def __exit__(self, *exc) -> None:
         self.close()
+
+
+class ReleaseReader(ShardedSafetensors):
+    """A released `<variant>/transformer` directory.
+
+    Attributes:
+        schema: The detected release layout (miowtion.h3.release.SCHEMAS).
+        config: The architecture read from config.json.
+    """
+
+    def __init__(self, transformer_dir: str):
+        super().__init__(transformer_dir)
+        self.config = h3_config.H3Config.from_pretrained(transformer_dir)
+        self.schema = h3_release.detect_schema(self._key_to_file)
+
+    def check_complete(self) -> None:
+        """Raises KeyError when a tensor the DiT needs is absent."""
+        h3_release.check_complete(self.schema, self._key_to_file,
+                                  self.config.num_layers,
+                                  self.config.num_refiner_layers)
 
 
 def fuse_qkv(q: mx.array, k: mx.array, v: mx.array, num_heads: int,

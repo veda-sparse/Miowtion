@@ -27,7 +27,7 @@ import json
 import os
 import struct
 import time
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 
 import mlx.core as mx
 import numpy as np
@@ -251,11 +251,20 @@ class SlabReader:
         for job in jobs:
             job.result()
 
+    def tensors(self, slot: int) -> dict[str, mx.array]:
+        """The raw buffers of `slot`, keyed by tensor name.
+
+        The arrays are the slot's own buffers, not copies: the next read
+        into the same slot overwrites them.
+        """
+        arrays, _ = self.slots[slot]
+        return arrays
+
     def weights(self, slot: int) -> mlx_block.BlockWeights:
         """The block currently held by `slot` (views of its buffers)."""
-        arrays, _ = self.slots[slot]
         return mlx_block.BlockWeights.from_tensors(
-            arrays, group_size=self.layout.group_size, bits=self.layout.bits)
+            self.tensors(slot), group_size=self.layout.group_size,
+            bits=self.layout.bits)
 
     def close(self) -> None:
         self._pool.shutdown()
@@ -296,13 +305,22 @@ class BlockPrefetcher:
     """
 
     def __init__(self, reader: SlabReader, order: Sequence[int],
-                 depth: int = 1):
+                 depth: int = 1, unpack: Callable | None = None):
+        """Args:
+            reader: The slabs to stream.
+            order: Block indices in the order they are consumed.
+            depth: Blocks read ahead.
+            unpack: Turns a slot number into what the consumer wants;
+                SlabReader.weights (a DiT block) by default, and
+                SlabReader.tensors for slabs that are not DiT blocks.
+        """
         if depth < 1 or len(reader.slots) < depth + 1:
             raise ValueError(f'depth {depth} needs {depth + 1} reader slots, '
                              f'reader has {len(reader.slots)}')
         self.reader = reader
         self.order = list(order)
         self.depth = depth
+        self._unpack = unpack if unpack is not None else reader.weights
         self.stats = StreamStats()
         self._io = concurrent.futures.ThreadPoolExecutor(1)
 
@@ -316,7 +334,7 @@ class BlockPrefetcher:
 
         return self._io.submit(job)
 
-    def __iter__(self) -> Iterator[tuple[int, mlx_block.BlockWeights]]:
+    def __iter__(self) -> Iterator[tuple[int, object]]:
         futures = {k: self._submit(k)
                    for k in range(min(self.depth, len(self.order)))}
         for k, index in enumerate(self.order):
@@ -329,7 +347,7 @@ class BlockPrefetcher:
                 # may still be queued.
                 mx.synchronize()
                 futures[ahead] = self._submit(ahead)
-            yield index, self.reader.weights(k % (self.depth + 1))
+            yield index, self._unpack(k % (self.depth + 1))
         self._io.shutdown()
 
 

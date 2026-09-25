@@ -97,6 +97,23 @@ trunk 之外同样的做法：两张超越函数表（RoPE 的 cos/sin、时间�
 只对一个 block 做：block 里已经包含了移植过的每一个算子，而 torch 参考是 CPU
 eager 的，seq=4096 时一个 block 就要 26 s，50 个 block 没有意义。
 
+### 文本编码器也要流式：50 GB 的塔，一次一层
+
+H3 的条件是 Qwen3-VL（32B）前 `TEXT_LAYERS = 50` 层的 hidden states。按
+bf16 算每层约 1 GB、50 层约 50 GB，是 18 GB 机器的三倍，`transformers` 的
+`device_map='auto'` 只能退化成磁盘 offload。所以文本塔和 DiT trunk 用同一套
+办法：**每层一个 slab，一次只驻留一层**。两者的区别在于频率——trunk 每个去噪
+步都要重读一遍，文本塔整段只读一次，几百个 token 的算力可以忽略，全部时间都
+是 I/O。
+
+只移植文本这一路。T2VA 的 prompt 是纯文本，视觉塔、deepstack 合并、图像
+mrope 分段都不会执行；三个 mrope 轴此时携带同一个 position，
+`Qwen3VLTextRotaryEmbedding.recomposition_frequencies` 在每个轴上取到的是同一
+个频率，于是旋转退化成普通的 rotate-half RoPE，正好是 `mx.fast.rope` 的语义
+（单测里对着 transformers 钉住）。
+
+层权重保持发布的名字和形状，不融合也不置换，所以 slab 是发布张量的逐字节拷贝。
+
 ## 代码位置与接口
 
 | 文件 | 作用 |
@@ -110,7 +127,8 @@ eager 的，seq=4096 时一个 block 就要 26 s，50 个 block 没有意义。
 | `miowtion/mlx/model.py` | 一次速度评估：`clip_inputs`（一条轨迹算一次）、`precompute_adaln`（一遍扫过 26 GB 的 AdaLN 投影，只留下表）、`velocity`（trunk 流式过一遍 block） |
 | `miowtion/mlx/dit.py` | trunk 之外的部分：`NonTrunkWeights`（常驻）、RoPE / 时间步表、AdaLN 表预计算、token refiner、embed、final layer |
 | `miowtion/mlx/pipeline.py` | 去噪循环：`Trajectory`（Euler 步）、`generate`（每步重新流式读一遍 trunk）、`schedule_timestep_sets` |
-| `miowtion/mlx/convert.py` | 读发布的 checkpoint（mmap safetensors → MLX array），融合 q/k/v、写 trunk slab |
+| `miowtion/mlx/convert.py` | 读发布的 checkpoint（`ShardedSafetensors`：mmap safetensors → MLX array；`ReleaseReader` 另加 H3 的 config 与 schema），融合 q/k/v、写 trunk slab |
+| `miowtion/mlx/text_encoder.py` | Qwen3-VL 文本塔：`TowerConfig`、`LayerWeights`、`layer_forward`（GQA + 因果注意力 + SwiGLU）、`encode`、`write_tower_slabs` / `slab_layers`（按层流式） |
 | `miowtion/mlx/check.py` | 真实权重上的数值对照：同一个发布 block 跑 MLX、torch bf16、torch fp32 三条路，给出 `BlockComparison` |
 | `miowtion/mlx/bench.py` | 测量用：合成权重、进程与系统内存统计、各项 benchmark |
 | `scripts/mlx_bench.py` | 命令行入口，每项测量单独一个进程，结果按 JSON 行输出 |
