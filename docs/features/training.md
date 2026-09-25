@@ -143,12 +143,16 @@
 | `heat_kept` | 预测掩码保住的教师块热量占比 | 真正关心的量：掩码丢掉了多少注意力质量 |
 | `heat_ceiling` | oracle（按教师热量取 top-k）保住的占比 | 当前预算下的上限。`heat_ceiling` 本身低说明教师不够集中，训练救不回来 |
 | `recall` | 预测掩码与 oracle 掩码（去掉对角）的交集 / oracle | 与 `heat_kept` 互补：不加权的命中率 |
+| `topk_bce` | oracle top-k 的平衡 BCE（`topk_weight > 0` 时才有） | 直接看"块在不在 oracle 集合里"这个目标；ln 2 ≈ 0.693 相当于无信息 |
 
 代价：这些量都在 **÷128 的压缩 tile 网格**上算（103k token 时是 `[28, 810, 810]` ≈ 18M 元素），
 相对产生它们的 O(S²·D) 教师热力图约 1e-6，可以忽略，所以 `recall_every: 1`，每层都算。真正的开销
 不是 FLOPs 而是**设备同步**：原先每层每头组都 `kl.item()`，并且 `mask_recall` 里对设备张量做了
 Python 分支。现在全部累加成 0 维设备张量，每个 micro-step 只有 `LayerStats.resolve()` 里的一次
 `torch.stack(...).cpu()`。
+
+`topk_weight`（默认 0）把 `heatmap.oracle_bce()` 按该权重加到 KL 上。KL 拟合教师的整个分布，而
+kernel 只读 top-k 的排序，两者会分开；见 `docs/features/veda_predictor_mask.md` 的 A/B 记录。
 
 ## 踩坑记录
 - **诊断量里的 `.item()` 比诊断量本身贵得多**：逐层 `.item()` 会把 CPU 和 GPU 串起来，让前向失去

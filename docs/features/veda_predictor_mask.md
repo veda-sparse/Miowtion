@@ -45,6 +45,12 @@
   不变（只有浮点舍入可能不同）；抽样的 query 行对整组只抽一次。
 - seer KL：student logits 在空列上填 −inf 后做 log-softmax；teacher 热力图按行归一化；
   只在 tgt>0 的位置累加；先在有效行上平均，再在头上平均。
+- oracle top-k BCE（`oracle_bce`，`topk_weight > 0` 时加到 KL 上）：kernel 唯一读的东西是"哪些块
+  进了 top-k"，而 KL 拟合的是教师的整个分布，两个目标在实践中分开了（600 次 update 里 KL 降了
+  30%，`heat_kept` 只动了 3%，`logit_std` 单调下降 3.73 → 2.51，说明 KL 是靠"摊平到教师的主体"
+  被最小化的）。这一项直接陈述目标：该块在不在 oracle 的集合里。正负样本分别求平均再取一半
+  （预算只留约 `keep_ratio` 的列，不平衡的话全判负就已经很"好"了）；强制对角不参与（那是 kernel
+  的规则不是打分器的决定，和 recall 的算法一致）。**它是加在 KL 上的，不是替代 KL**。
 - recall：预测集合与 oracle 集合（同样规则下对热力图做 top-k）的交集比例，只统计 video→video
   象限且去掉对角；当预算里只有对角时返回 NaN（日志中用 nanmean 汇总）。
 
@@ -52,7 +58,9 @@
 `tests/unit/test_veda_predictor_mask.py`、`tests/unit/test_veda_heatmap_attention.py`：
 池化与朴素实现一致、空 tile 无 NaN、未训练打分器约等于均值 QK、Bresenham、等代价预算、对角规则、
 分段预算、行子集按 tile 号取 pattern、kernel 索引与稠密掩码互相还原、热力图与暴力计算一致、
-KL 在最优点为 0、recall 为 1、TeacherCollector 输出与稠密逐位一致且只训练打分器。
+KL 在最优点为 0、recall 为 1、TeacherCollector 输出与稠密逐位一致且只训练打分器、
+`oracle_bce` 在复现 oracle 集合时为 0 / 全反时很大 / 无信息时恰为 ln 2（平衡性），
+其梯度抬高被保留块、压低被丢弃块，对角完全没有梯度。
 
 ## 踩坑记录
 - **Bresenham 的浮点误差**：`2.3−2` 得到 `0.29999999999999982`，`floor(400×frac)` 少算 1 个，
@@ -63,6 +71,12 @@ KL 在最优点为 0、recall 为 1、TeacherCollector 输出与稠密逐位一�
   这是错的。现在返回 NaN。
 
 ## 验证记录
+- 2026-09-25，2×RTX 4090，20 次配对 update 的 A/B（同 seed、同数据、同几何循环，各占一张卡，
+  BS=8，从 `stage1_fast_t37_4090` 的 update 600 出发，只有 `topk_weight` 不同 1.0 / 0.0）：
+  recall 在 update 2–7 落后 2.7 个点（`topk_weight: 1.0` 时 BCE 初值 3.19，约是 KL 0.32 的十倍，
+  前期扰动），8–13 持平，14–20 反超 1.2 个点（.5660 vs .5544），最后 8 次配对赢 7 次；
+  `heat_kept` 同向改善，`logit_std` 分叉（2.15 vs 2.44），KL 本身没有变差。结论：保留该项，
+  长跑时建议对 `topk_weight` 做 warmup 以消掉前期的扰动。
 - 2026-09-23，macOS CPU：unit 全部通过。
 - 2026-09-23，RTX 4090：热力图 kernel 与 torch 参考一致（tests/gpu）。16:9 5.17 s（297 个 tile、
   56 头、d=128）：全部 query tile 123 ms（169 TFLOPS），同一数据上 FA4 稠密前向 263 ms

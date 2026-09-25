@@ -1,5 +1,7 @@
 """Tests for miowtion.veda.heatmap and miowtion.veda.attention."""
 
+import math
+
 import pytest
 import torch
 
@@ -22,6 +24,26 @@ def _qkv(seq_len, heads=2, dim=32, seed=0):
     g = torch.Generator().manual_seed(seed)
     return [torch.randn(seq_len, heads, dim, generator=g).to(torch.bfloat16)
             for _ in range(3)]
+
+
+def _tiny_oracle_case(ratio=0.9, heads=2, seed=1):
+    """A layout plus teacher heat whose oracle set is a proper subset.
+
+    The layout only holds six video tiles, so the ratio has to be high for
+    the budget to reach past the forced diagonal: the balanced BCE needs
+    both classes to be non-empty, and below ~0.7 the oracle keeps the
+    diagonal and nothing else.
+    """
+    lay = _layout()
+    blocks = veda_mask.column_blocks(lay, veda_mask.Budget(ratio=ratio))
+    rows = torch.arange(3)
+    g = torch.Generator().manual_seed(seed)
+    heat = torch.rand(heads, rows.numel(), lay.n_tiles, generator=g) + 0.01
+    sel = veda_mask.select_video_blocks(heat, lay, blocks, rows)
+    # Guard against a degenerate case: the assertions below are about the
+    # two classes, and several of them pass vacuously on an empty one.
+    assert int(sel.keep.sum(-1).min()) > 1, 'oracle kept only the diagonal'
+    return lay, blocks, rows, heat
 
 
 def test_heat_matches_brute_force_block_max():
@@ -293,3 +315,43 @@ def test_teacher_collector_unequal_groups():
     assert torch.equal(out, dense)  # the teacher pass stays dense
     assert len(collector.stats.recall) == 2  # one per head group
     assert pred.layers[0].proj_q.grad.abs().sum() > 0
+
+
+def test_oracle_bce_is_zero_when_logits_match_the_oracle():
+    """A predictor that reproduces the oracle's set drives the term down."""
+    torch.manual_seed(0)
+    lay, blocks, rows, heat = _tiny_oracle_case()
+    n_video = lay.n_video_tiles
+    oracle = veda_mask.select_video_blocks(heat, lay, blocks, rows)
+    target = torch.zeros(*oracle.index.shape[:2], n_video, dtype=torch.bool)
+    target.scatter_(2, oracle.index, oracle.keep)
+    # Large logits of the right sign: BCE -> 0 on both classes.
+    confident = torch.where(target, 30.0, -30.0)
+    loss = heatmap.oracle_bce(confident, heat, lay, blocks, rows)
+    assert loss.item() < 1e-6
+    # The opposite assignment is the worst case, and an indifferent
+    # predictor sits at ln 2 whatever the keep ratio (the term is balanced).
+    assert heatmap.oracle_bce(-confident, heat, lay, blocks, rows).item() > 10
+    flat = torch.zeros_like(confident)
+    assert heatmap.oracle_bce(flat, heat, lay, blocks, rows).item() == \
+        pytest.approx(math.log(2.0), abs=1e-6)
+
+
+def test_oracle_bce_gradient_pushes_towards_the_oracle_set():
+    lay, blocks, rows, heat = _tiny_oracle_case()
+    logits = torch.zeros(heat.shape, requires_grad=True)
+    heatmap.oracle_bce(logits, heat, lay, blocks, rows).backward()
+    n_video = lay.n_video_tiles
+    oracle = veda_mask.select_video_blocks(heat, lay, blocks, rows)
+    target = torch.zeros(*oracle.index.shape[:2], n_video, dtype=torch.bool)
+    target.scatter_(2, oracle.index, oracle.keep)
+    diag = torch.nn.functional.one_hot(rows, n_video).bool()[None]
+    grad = logits.grad[:, :, :n_video]
+    # Descent raises the kept blocks' logits and lowers the dropped ones.
+    kept = target & ~diag & lay.kv_ok[None, None, :n_video]
+    dropped = ~target & ~diag & lay.kv_ok[None, None, :n_video]
+    assert (grad[kept] < 0).all()
+    assert (grad[dropped] > 0).all()
+    # The diagonal is forced by the kernel, so it gets no gradient at all.
+    assert torch.equal(grad[diag.expand_as(grad)],
+                       torch.zeros(int(diag.expand_as(grad).sum())))

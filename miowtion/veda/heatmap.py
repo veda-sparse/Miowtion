@@ -111,6 +111,61 @@ def seer_kl(logits: torch.Tensor, heat: torch.Tensor,
     return per_head.mean()
 
 
+def oracle_bce(logits: torch.Tensor, heat: torch.Tensor,
+               layout: tiling.TileLayout,
+               blocks: list[veda_mask.ColumnBlock],
+               q_tiles: torch.Tensor) -> torch.Tensor:
+    """Balanced BCE of the student logits against the oracle's top-k set.
+
+    The seer KL fits the teacher's whole distribution, but the only thing
+    the kernel ever reads out of the predictor is which blocks land in the
+    top-k. The two objectives came apart in practice: over 600 updates the
+    KL fell 30% while the kept heat moved 3% and the logit spread shrank
+    monotonically (3.73 -> 2.51), i.e. the KL was being minimized by
+    flattening towards the bulk instead of sharpening the ordering. This
+    term states the objective directly -- is this block in the oracle's set
+    or not -- and is meant to be added to the KL, not to replace it.
+
+    Positives and negatives are averaged separately and then halved: the
+    oracle keeps about `keep_ratio` of the columns, so an unbalanced mean
+    would be ~90% negatives and the all-negative predictor would already
+    look good.
+
+    The forced diagonal is excluded. It is a kernel rule, not a predictor
+    decision, so it is free to get right and would only dilute the loss --
+    the same reason mask_diagnostics() removes it from recall.
+
+    Args:
+        logits: [H', R, n_tiles] fp32 student block logits (with grad).
+        heat: [H', R, n_tiles] fp32 teacher heat.
+        layout: Tile layout.
+        blocks: Column blocks from column_blocks().
+        q_tiles: [R] int64 video query tile ids.
+
+    Returns:
+        Scalar loss; 0 when no column is both valid and off-diagonal.
+    """
+    n_video = layout.n_video_tiles
+    with torch.no_grad():
+        oracle = veda_mask.select_video_blocks(heat, layout, blocks, q_tiles)
+        target = torch.zeros(*oracle.index.shape[:2], n_video,
+                             dtype=torch.bool, device=logits.device)
+        target.scatter_(2, oracle.index, oracle.keep)
+        diag = F.one_hot(q_tiles, n_video).bool()[None]
+        valid = layout.kv_ok[None, None, :n_video] & ~diag
+        positive = target & valid
+        negative = ~target & valid
+    scores = logits[:, :, :n_video].float()
+    terms = F.binary_cross_entropy_with_logits(
+        scores, target.to(scores.dtype), reduction='none')
+    n_pos = positive.sum().clamp(min=1)
+    n_neg = negative.sum().clamp(min=1)
+    loss = 0.5 * ((terms * positive).sum() / n_pos
+                  + (terms * negative).sum() / n_neg)
+    # No Python branch on the counts: that would synchronize.
+    return torch.where(valid.any(), loss, torch.zeros_like(loss))
+
+
 @torch.no_grad()
 def mask_diagnostics(logits: torch.Tensor, heat: torch.Tensor,
                      layout: tiling.TileLayout,

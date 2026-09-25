@@ -74,6 +74,10 @@ class TrainConfig:
     tile_conditions: bool = False
     teacher_q_tiles: float = 1.0
     recall_every: int = 1  # mask diagnostics on every n-th layer
+    # Weight of the oracle top-k BCE added to the seer KL (0 = KL only).
+    # The KL fits the whole teacher distribution; only the top-k ordering
+    # reaches the kernel. See heatmap.oracle_bce().
+    topk_weight: float = 0.0
     accum: int = 4
     steps: int = 400
     lr: float = 1e-4
@@ -308,7 +312,8 @@ class Trainer:
             kl_scale *= self.config.kl_weight
         collector = veda_attention.TeacherCollector(
             self.clip_tiling, self.plan, self.predictor, self.noise_gen,
-            grad_scale=kl_scale, dense_backend=self.config.dense_backend)
+            grad_scale=kl_scale, dense_backend=self.config.dense_backend,
+            topk_weight=self.config.topk_weight)
         teacher_ctx = (_FrozenTeacher(self) if self.config.stage == 2
                        else contextlib.nullcontext())
         with teacher_ctx, torch.no_grad():
@@ -318,7 +323,8 @@ class Trainer:
         resolved = collector.stats.resolve()  # one device transfer
         stats['kl'].append(sum(resolved['kl']) / num_layers)
         stats['kl_layers'].append(resolved['kl'])
-        for name in ('logit_std', 'recall', 'heat_kept', 'heat_ceiling'):
+        for name in ('topk_bce', 'logit_std', 'recall', 'heat_kept',
+                     'heat_ceiling'):
             stats[name] += resolved[name]
         progress.log(f'  update {self.step + 1}/{self.config.steps} micro '
                      f'{len(stats["kl"])}/{self.config.accum}: traj step '
@@ -342,7 +348,8 @@ class Trainer:
         while self.step < config.steps:
             start = time.time()
             stats = {name: [] for name in
-                     ('kl', 'kl_layers', 'logit_std', 'recall', 'heat_kept',
+                     ('kl', 'kl_layers', 'topk_bce', 'logit_std', 'recall',
+                      'heat_kept',
                       'heat_ceiling', 'mse')}
             for _ in range(config.accum):
                 self._micro_step(stats)
@@ -410,7 +417,7 @@ class Trainer:
                   if torch.cuda.is_available() else 0.0}
         if stats['mse']:
             record['mse'] = self._reduce_mean(stats['mse'])
-        for name in ('heat_kept', 'heat_ceiling', 'logit_std'):
+        for name in ('topk_bce', 'heat_kept', 'heat_ceiling', 'logit_std'):
             if stats[name]:
                 record[name] = round(self._reduce_mean(stats[name]), 5)
         # Per-layer KL is rank 0's own micro-steps: it says where in depth

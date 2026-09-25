@@ -1,0 +1,42 @@
+# Stage 1 phase A ("fast convergence"): the four aspect ratios at the
+# cheapest length only (latent_t 37), warm-started from the mixed-geometry
+# run at step 170.
+#
+# Why drop t72/t102 here: a t102 update costs 5-8x a t37 update and buys
+# exactly one gradient step, so cycling all twelve geometries spends ~70%
+# of the wall clock on 1/3 of the updates. Geometry coverage is restored in
+# phase B (stage1_refine_multigeo_4090.yaml), which starts from this run.
+#
+# Batch size 8 = 2 ranks x accum 4. The previous run ran BS 4 with
+# teacher_q_tiles 0.25 and its two micro-batch gradients disagreed outright
+# on ~1 step in 4 (grad_cos down to -0.12); both changes here attack that
+# variance. Raising teacher_q_tiles 0.25 -> 1.0 quadruples the supervised
+# query rows for ~18% more time, which is the cheapest variance reduction
+# available -- the heat kernel is only ~23% of a micro-step.
+run_name: stage1_fast_t37_4090
+checkpoint_root: weights/MiniMax-H3
+sample_cache: artifacts/samples/moviegen_multigeo_train
+geometries: ['1:1@37', '4:3@37', '16:9@37', '9:16@37']
+geometry_sampling: cycle
+variant: FL2VA
+tasks: [t2va]
+plan_dir: runs/search_turbo8_multigeo_4090/plans
+schedule: turbo
+num_steps: 8
+teacher_adapter: weights/turbo_lora/minimax_h3_turbo_v4_step600_ema.safetensors
+init_from: runs/stage1_turbo8_multigeo_4090/ckpt/step_0000170
+keep_ratio: 0.1
+teacher_q_tiles: 1.0   # supervise every query tile
+accum: 4               # 2 ranks x 4 = batch 8
+steps: 600
+lr: 1.0e-3
+warmup: 20
+# save_every 100 (not the usual 50) and keep_optimizer 1: this box has very
+# little free space and every checkpoint is ~2.2 GiB of weights + EMA.
+save_every: 100
+keep_optimizer: 1
+out_dir: runs
+offload_blocks: 44
+prefetch: 1
+mlp_chunk_rows: 8192
+offload_optimizer: true

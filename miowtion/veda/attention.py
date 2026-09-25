@@ -150,7 +150,8 @@ def _gather_lse(lse: torch.Tensor, tile_layout: tiling.TileLayout,
 
 
 # Diagnostic fields of LayerStats, in the order resolve() transfers them.
-_STAT_FIELDS = ('kl', 'logit_std', 'recall', 'heat_kept', 'heat_ceiling')
+_STAT_FIELDS = ('kl', 'topk_bce', 'logit_std', 'recall', 'heat_kept',
+                'heat_ceiling')
 
 
 @dataclasses.dataclass
@@ -166,6 +167,7 @@ class LayerStats:
     """
 
     kl: list[torch.Tensor] = dataclasses.field(default_factory=list)
+    topk_bce: list[torch.Tensor] = dataclasses.field(default_factory=list)
     logit_std: list[torch.Tensor] = dataclasses.field(default_factory=list)
     recall: list[torch.Tensor] = dataclasses.field(default_factory=list)
     heat_kept: list[torch.Tensor] = dataclasses.field(default_factory=list)
@@ -197,7 +199,7 @@ class TeacherCollector:
     def __init__(self, clip: ClipTiling, plan: veda_plan.TilePlan,
                  predictor: veda_predictor.TileScorePredictor,
                  generator: torch.Generator, grad_scale: float,
-                 dense_backend: str = 'auto'):
+                 dense_backend: str = 'auto', topk_weight: float = 0.0):
         """Initializes the collector.
 
         Args:
@@ -207,6 +209,8 @@ class TeacherCollector:
             generator: Draws the supervised query tiles.
             grad_scale: Scale of every KL backward.
             dense_backend: Kernel for the teacher's dense attention.
+            topk_weight: Weight of heatmap.oracle_bce() added to the KL.
+                0 disables the term and skips its oracle top-k.
         """
         self.clip = clip
         self.plan = plan
@@ -214,6 +218,7 @@ class TeacherCollector:
         self.generator = generator
         self.grad_scale = grad_scale
         self.dense_backend = dense_backend
+        self.topk_weight = topk_weight
         self.stats = LayerStats()
         self._num_heads = sum(
             g.heads.numel() for g in plan.head_groups(0, clip.device))
@@ -248,7 +253,14 @@ class TeacherCollector:
                     logits = self.predictor.layers[layer_index](
                         feats_q[:, rows], feats_k, heads)
                     kl = heatmap.seer_kl(logits, heat, tile_layout)
-                    (kl * (weight * self.grad_scale)).backward()
+                    loss = kl
+                    if self.topk_weight:
+                        bce = heatmap.oracle_bce(
+                            logits, heat, tile_layout,
+                            self.clip.blocks(tile_layout), rows)
+                        loss = loss + self.topk_weight * bce
+                        self.stats.topk_bce.append(bce.detach())
+                    (loss * (weight * self.grad_scale)).backward()
                 # Accumulated on the device: .item() here would synchronize
                 # once per layer and head group.
                 term = kl.detach() * weight

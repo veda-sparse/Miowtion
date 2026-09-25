@@ -1,0 +1,30 @@
+# 20-update A/B probe for the oracle top-k term (see heatmap.oracle_bce).
+# Single rank, accum 8, so batch stays at 8 and the two arms can run side by
+# side on one GPU each. Everything except topk_weight is identical, including
+# the seed and the geometry cycle, so recall can be compared update by update.
+run_name: probe_kl_t37
+checkpoint_root: weights/MiniMax-H3
+sample_cache: artifacts/samples/moviegen_multigeo_train
+geometries: ['1:1@37', '4:3@37', '16:9@37', '9:16@37']
+geometry_sampling: cycle
+variant: FL2VA
+tasks: [t2va]
+plan_dir: runs/search_turbo8_multigeo_4090/plans
+schedule: turbo
+num_steps: 8
+teacher_adapter: weights/turbo_lora/minimax_h3_turbo_v4_step600_ema.safetensors
+init_from: runs/stage1_fast_t37_4090/ckpt/step_0000600
+keep_ratio: 0.1
+teacher_q_tiles: 1.0
+topk_weight: 0.0
+accum: 8
+steps: 20
+lr: 1.0e-3
+warmup: 1
+save_every: 20
+keep_optimizer: 1
+out_dir: runs
+offload_blocks: 44
+prefetch: 1
+mlp_chunk_rows: 8192
+offload_optimizer: true
