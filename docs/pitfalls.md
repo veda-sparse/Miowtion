@@ -99,3 +99,6 @@
 | MLX 的 Euler 步与 torch 差 1 ulp | torch 的 `add_(v, alpha=)` 是 fused multiply-add（单次 round），MLX 分开乘加 | 记录误差（2.4e-07）、测试钉 ≤1 ulp；不要为此把这一步改成 GEMM | [mlx_inference](features/mlx_inference.md) |
 | 真实权重下 MLX block 与 torch 参考相对 L2 = 1.2（完全对不上），合成权重的单测却全过 | 对照脚本把 fused QKV 的行置换用反了（`perm` 的逆）；单测只走"torch → MLX"一个方向，看不出来 | 反方向写成库函数 `interop.torch_block`，并加往返逐位相等的单测；`mlx[perm[r]] == torch[r]`，回来是 gather | [mlx_inference](features/mlx_inference.md) |
 | 用很短的片段（`latent_t` 2）试 VAE 解码，报 `torch.cat(): expected a non-empty list of Tensors` | 视频 VAE 按 `clip_length` 分块解码，并先补上 `token_drop` 个 token；latent 帧数不到一个 chunk 时分块数算成 0 | 冒烟测试压画布（短边）而不是压时长，时长至少取一个完整 chunk | [mlx_inference](features/mlx_inference.md) |
+| bf16 权重集 4.5 GB，载入峰值却是 9.0 GB，`mx.clear_cache()` 无效 | MLX 的 `astype` 惰性，fp32 原张量活到结果被 eval；一个 block 才 eval 一次 | 读一个张量就 `mx.eval`（`_cast`），超额降到一个张量 128 MB | [mlx_inference](features/mlx_inference.md) |
+| 同一份代码、同一个 batch，两次测速差 3.3 倍 | 机器内存紧张时 4.5 GB 常驻权重被换出，每次前向都在重新缺页 | 测速前先看 `memory_pressure`，把当时的空闲内存一起写进文档 | [mlx_inference](features/mlx_inference.md) |
+| 移植 VAE 后两条 fp32 路径相对 L2 是 6e-3 而不是 1e-7 | RoPE 的频率表漏了 `2π` | 逐段对照中间量定位；单测钉 numpy 的解析式，不要钉另一份实现 | [mlx_inference](features/mlx_inference.md) |

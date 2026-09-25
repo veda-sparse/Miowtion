@@ -447,10 +447,11 @@ kernel 干的活一模一样，**但保留哪些 tile 是随机的**。所以它
 **4 bit 不能用**：单层就 12.6 %，50 层还要叠。8 bit 只在磁盘放不下 bf16 时用，
 而且它连计算都更慢（+18 %），省的只是 I/O 和内存。
 
-### VAE 解码：留在 torch/MPS
+### VAE 解码：先留在 torch/MPS（已被下一节取代）
 
 视频 VAE 是 2.4B 的 ViT3D，音频 VAE 很小，两个都只在整段结束时跑一次，
-所以没有理由在 DiT 定下来之前先移植它们。MPS 上（`--device mps`，视频
+所以没有理由在 DiT 定下来之前先移植它们（视频这一侧后来还是移植了，见
+「视频 VAE 移植到 MLX」；音频 VAE 仍在 torch）。MPS 上（`--device mps`，视频
 bf16、音频 fp32，1 秒 16:9 片段，39 帧）：
 
 | 阶段 | 1344×768 | 224×128（短边 128） |
@@ -461,6 +462,37 @@ bf16、音频 fp32，1 秒 16:9 片段，39 帧）：
 
 也就是说解码在整条链路里只占 8 步去噪（1 050 s）的 16 %，画布缩到 1/6
 时间掉到 1/13——解码是纯算力，没有流式开销。
+
+### 视频 VAE 移植到 MLX
+
+发布的解码是**分块**的：`use_tiling=True`，像素空间 256×256 一块、至少 64 px
+重叠（按 16 的倍数加宽），线性交叉淡化后拼回；时间上按 `clip_length=17` /
+`token_drop=3` 切成 5 个 latent 帧一段、重叠 2 段。这套几何是权重训练时就定下
+的，**不是调参旋钮**，移植时逐位复刻（`split_tiles` 完全相同，`blend` /
+`stitch_tiles` 逐位相等）。1344×768、39 帧一段的片子因此是 4×7 个 tile × 2 个
+时间块 = 56 次 1797 token 的前向，约 486 TFLOP。
+
+`miowtion/mlx/video_vae.py` 是这个 2.42B ViT3D 的 MLX 实现（fused QKV、fp32
+RMSNorm、三轴 RoPE、SwiGLU、逐 block `mx.eval`）。同一段 latent、同一台机器：
+
+| 后端 | 视频解码（39 帧 1344×768） | 峰值 |
+|---|---|---|
+| torch / MPS（发布实现） | 155.4 s | — |
+| MLX，`--tile-batch 2`（默认） | 104.9 s | 5.76 GB |
+
+`tile_batch` 把 N 个 tile 拼成一次前向。一个 tile 本身已经是 1797 行，GEMM 早就
+跑满了，所以它几乎只是个内存旋钮（真实权重，合成 latent）：
+
+| tile_batch | s/tile | GEMM | 峰值 |
+|---|---|---|---|
+| 1 | 1.91 | 4.56 TFLOP/s | 4.78 GB |
+| 2 | 1.86 | 4.68 TFLOP/s | 5.03 GB |
+| 4 | 1.84 | 4.72 TFLOP/s | 5.55 GB |
+| 8 | 1.83 | 4.75 TFLOP/s | 6.11 GB |
+
+权重常驻 4.51 GB（bf16），载入 15 s。**这张表只在机器不紧张时成立**：同样的
+batch 8，在系统只剩 18 % 空闲内存时是 6.1 s/tile（0.44 GB 的差别换来 3.3 倍的
+时间），载入也从 15 s 变成 38 s。见踩坑记录。
 
 ### 真实权重：文本塔一层的三方对照
 
@@ -642,6 +674,22 @@ transformers 的 eager 路径是纯 bf16。这同时钉住了 mrope → 普通 r
   只走一个方向的测试永远看不出方向反了。对策：把反方向做成库函数
   `interop.torch_block`，并加"发布 layout → torch → 发布 layout **逐位相等**"的单测；
   真实权重的对照也从一次性脚本改成 `scripts/mlx_check.py`。
+- **MLX 的 `astype` 是惰性的，会把 fp32 原张量一直拖着**。现象：bf16 权重集
+  4.51 GB，载入峰值却是 9.03 GB，正好两倍；`mx.clear_cache()` 一点用都没有
+  （cache 本来就是 0）。原因：`reader.read(k).astype(bf16)` 只建了一个图节点，
+  fp32 的输入活到这个节点被 eval 为止；每个 block 才 eval 一次的话，整个
+  checkpoint 的 fp32 副本都还在。对策：`_cast()` 读完一个张量就 `mx.eval`，
+  超额从"整份 checkpoint"降到"一个张量"（128 MB），峰值 9.03 → 4.60 GB。
+- **测出来的时间先要问机器当时紧不紧张**。现象：同一份代码、同一个 batch，
+  两次测量差 3.3 倍（1.83 vs 6.1 s/tile），一度以为是 `tile_batch` 线性省时间，
+  据此把默认值调到 8。原因：4.5 GB 常驻 + 前一个进程留下的内存压力，MLX 的
+  buffer 被换出去，每次前向都在重新缺页。对策：每次测之前看 `memory_pressure`，
+  可疑的数字换个时间重测一遍；结论写进文档时把当时的空闲内存也写上。
+- **RoPE 的角度漏了 2π**。现象：两条 fp32 路径的相对 L2 是 6e-3（不是 1e-7）。
+  原因：发布实现的频率表是 `2π * pos * inv_freq`，移植时只写了 `pos * inv_freq`。
+  排查方式是逐段对照中间量（proj_in → rope → block 0 → …），第一段对不上的就是
+  rope 的 cos。对策：`rope_tables` 的单测直接钉 numpy 写出来的解析式，而不是钉
+  另一份实现。
 
 ## 验证记录
 
@@ -670,6 +718,14 @@ transformers 的 eager 路径是纯 bf16。这同时钉住了 mrope → 普通 r
 - 2026-09-25，同一台机器：diffusers 移植版的两个 VAE 在 MPS 上解码通过，
   1 秒 16:9（39 帧 1344×768）随机 latent 解出 mp4（见「VAE 解码」）。这只
   说明解码链路通，不说明画面内容对——真实 latent 的可视化确认还没做。
+- 2026-09-25，Apple M3 Pro / 18 GB / mlx 0.32.2：视频 VAE 的 MLX 移植。
+  纯数据变换（`split_tiles` / `blend` / `stitch_tiles`）与 diffusers 参考**逐位
+  相等**；整条解码路径（随机小模型、两边 fp32，`scripts/mlx_check_video_vae.py`）
+  相对 L2 1.4e-7 ~ 1.6e-7，量级就是 fp32 的累加顺序，属于 AGENTS.md 1.5 里
+  "无法位级对齐"的一类。真实权重、真实 latent 解出的
+  `runs/mlx_clip_0000/clip.mp4` **还没有做人工可视化确认**，因此这部分还不能
+  按 1.5 判定为通过。`pytest tests/unit` 218 passed。
+
 - **生成质量仍未验证**：上面那条轨迹的文本 embedding 是随机张量，也还没有 VAE
   解码，所以没有做视频层面的可视化对比。在人工一致性确认之前，这里的结论只覆盖
   数值、时间和内存，不覆盖生成质量。

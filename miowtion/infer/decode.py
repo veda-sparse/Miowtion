@@ -144,13 +144,18 @@ class DiffusersDecoder:
     """
 
     def __init__(self, variant_dir: str, device: torch.device,
-                 dtype: torch.dtype = torch.bfloat16):
-        """Loads both VAEs on `device`.
+                 dtype: torch.dtype = torch.bfloat16,
+                 load_video: bool = True):
+        """Loads the VAEs on `device`.
 
         Args:
             variant_dir: Directory holding `vae/` and `audio_vae/`.
             device: Where the decoders run (`mps` on Apple silicon).
             dtype: Video VAE weight dtype; see Decoder for why bf16.
+            load_video: Load the video VAE. The MLX decoder replaces it
+                and the two would not fit next to each other in unified
+                memory, so it can be left out and only the (small) audio
+                VAE loaded.
 
         Raises:
             ImportError: When the installed diffusers has no MiniMax-H3
@@ -168,8 +173,11 @@ class DiffusersDecoder:
         self.device = device
         video_dir = os.path.join(variant_dir, 'vae')
         audio_dir = os.path.join(variant_dir, 'audio_vae')
-        self.video_vae = diffusers.AutoencoderKLMiniMaxH3.from_pretrained(
-            video_dir, torch_dtype=dtype).to(device).eval()
+        self.video_vae = None
+        if load_video:
+            self.video_vae = (
+                diffusers.AutoencoderKLMiniMaxH3.from_pretrained(
+                    video_dir, torch_dtype=dtype).to(device).eval())
         # Small enough that its dtype does not show up in the decode time.
         self.audio_vae = (
             diffusers.AutoencoderKLMiniMaxH3Audio.from_pretrained(
@@ -182,7 +190,14 @@ class DiffusersDecoder:
     @torch.no_grad()
     def video(self, rows: torch.Tensor,
               geometry: h3_geometry.Geometry) -> np.ndarray:
-        """[N_video, 96] rows -> [frames, H, W, 3] uint8."""
+        """[N_video, 96] rows -> [frames, H, W, 3] uint8.
+
+        Raises:
+            RuntimeError: When the video VAE was not loaded.
+        """
+        if self.video_vae is None:
+            raise RuntimeError('this decoder was built without the video '
+                               'VAE')
         z = video_latent(rows, geometry, self.video_mean, self.video_std)
         dtype = next(self.video_vae.parameters()).dtype
         recon = self.video_vae.decode(z.to(self.device, dtype)).sample
