@@ -128,6 +128,91 @@ class Decoder:
         return wav.clamp(-1.0, 1.0).cpu()
 
 
+class DiffusersDecoder:
+    """The same two VAEs, from the diffusers-port release layout.
+
+    The original release ships the VAEs as python packages inside the
+    checkpoint (what `Decoder` imports) and needs diffusers 0.32.2 to run
+    them; the re-published port ships plain diffusers components
+    (`vae/`, `audio_vae/`) whose classes only exist in diffusers >= 0.36.
+    The two pins cannot live in one environment, so this class imports
+    diffusers lazily and nothing else in the repo depends on it.
+
+    The rows, the normalization and the returned types are identical to
+    `Decoder`, so callers (and the mp4 writer) do not care which one they
+    got.
+    """
+
+    def __init__(self, variant_dir: str, device: torch.device,
+                 dtype: torch.dtype = torch.bfloat16):
+        """Loads both VAEs on `device`.
+
+        Args:
+            variant_dir: Directory holding `vae/` and `audio_vae/`.
+            device: Where the decoders run (`mps` on Apple silicon).
+            dtype: Video VAE weight dtype; see Decoder for why bf16.
+
+        Raises:
+            ImportError: When the installed diffusers has no MiniMax-H3
+                autoencoder (it landed in 0.36).
+        """
+        import diffusers  # pylint: disable=import-outside-toplevel
+
+        missing = [n for n in ('AutoencoderKLMiniMaxH3',
+                               'AutoencoderKLMiniMaxH3Audio')
+                   if not hasattr(diffusers, n)]
+        if missing:
+            raise ImportError(
+                f'diffusers {diffusers.__version__} has no {missing[0]}; '
+                'the diffusers-port VAEs need diffusers >= 0.36')
+        self.device = device
+        video_dir = os.path.join(variant_dir, 'vae')
+        audio_dir = os.path.join(variant_dir, 'audio_vae')
+        self.video_vae = diffusers.AutoencoderKLMiniMaxH3.from_pretrained(
+            video_dir, torch_dtype=dtype).to(device).eval()
+        # Small enough that its dtype does not show up in the decode time.
+        self.audio_vae = (
+            diffusers.AutoencoderKLMiniMaxH3Audio.from_pretrained(
+                audio_dir, torch_dtype=torch.float32).to(device).eval())
+        self.video_mean, self.video_std = _latent_stats(video_dir)
+        self.audio_mean, self.audio_std = _latent_stats(audio_dir)
+        with open(os.path.join(audio_dir, 'config.json')) as f:
+            self.sample_rate = int(json.load(f)['sampling_rate'])
+
+    @torch.no_grad()
+    def video(self, rows: torch.Tensor,
+              geometry: h3_geometry.Geometry) -> np.ndarray:
+        """[N_video, 96] rows -> [frames, H, W, 3] uint8."""
+        z = video_latent(rows, geometry, self.video_mean, self.video_std)
+        dtype = next(self.video_vae.parameters()).dtype
+        recon = self.video_vae.decode(z.to(self.device, dtype)).sample
+        # The decoder emits 4 * (T - 1) + 1 frames; a geometry whose frame
+        # count is not that (aligned durations) keeps its leading frames.
+        recon = recon[:, :, :geometry.frame_count]
+        out = np.empty((recon.shape[2], recon.shape[3], recon.shape[4], 3),
+                       np.uint8)
+        for start in range(0, recon.shape[2], _REVERT_CHUNK_FRAMES):
+            rows_ = slice(start, start + _REVERT_CHUNK_FRAMES)
+            # diffusers returns [-1, 1]; the release package's
+            # revert_tensor does the same affine map.
+            pixels = recon[0, :, rows_].float().permute(1, 2, 3, 0)
+            frames = pixels.add(1.0).mul(127.5).round().clamp(0.0, 255.0)
+            out[rows_] = frames.to(torch.uint8).cpu().numpy()
+        return out
+
+    @torch.no_grad()
+    def audio(self, rows: torch.Tensor) -> torch.Tensor:
+        """[2 * audio_t, 32] channel-major rows -> [2, samples] fp32."""
+        z = audio_latent(rows, self.audio_mean, self.audio_std)
+        dtype = next(self.audio_vae.parameters()).dtype
+        wav = self.audio_vae.decode(z.to(self.device, dtype)).sample
+        wav = wav[:, 0].float()
+        std = wav.std() * _LOUDNESS_STD_FACTOR
+        if std > 1.0:
+            wav = wav / std
+        return wav.clamp(-1.0, 1.0).cpu()
+
+
 def _write_wav(path: str, waveform: torch.Tensor, sample_rate: int) -> None:
     pcm = (waveform.clamp(-1.0, 1.0) * 32767.0).round().to(torch.int16)
     with wave.open(path, 'wb') as f:

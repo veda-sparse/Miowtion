@@ -129,13 +129,15 @@ mrope 分段都不会执行；三个 mrope 轴此时携带同一个 position，
 | `miowtion/mlx/pipeline.py` | 去噪循环：`Trajectory`（Euler 步）、`generate`（每步重新流式读一遍 trunk）、`schedule_timestep_sets`、`run_clip`（从发布目录到去噪后的行，整段只有一个入口） |
 | `miowtion/mlx/convert.py` | 读发布的 checkpoint（`ShardedSafetensors`：mmap safetensors → MLX array；`ReleaseReader` 另加 H3 的 config 与 schema），融合 q/k/v、写 trunk slab |
 | `miowtion/mlx/text_encoder.py` | Qwen3-VL 文本塔：`TowerConfig`、`LayerWeights`、`layer_forward`（GQA + 因果注意力 + SwiGLU）、`encode`、`token_ids`、`write_tower_slabs` / `slab_layers`（按层流式） |
+| `miowtion/infer/decode.py` | 两套发布布局的 VAE 解码：`Decoder`（发布包，diffusers 0.32.2）与 `DiffusersDecoder`（diffusers 移植版的 `vae/` + `audio_vae/`，需要 diffusers ≥ 0.36），接口一致 |
 | `miowtion/mlx/check.py` | 真实权重上的数值对照：同一个发布 block（`compare_block`）或文本塔层（`compare_text_layer`）跑 MLX、torch bf16、torch fp32 三条路，给出 `BlockComparison` |
 | `miowtion/mlx/bench.py` | 测量用：合成权重、进程与系统内存统计、各项 benchmark |
 | `scripts/mlx_bench.py` | 命令行入口，每项测量单独一个进程，结果按 JSON 行输出 |
 | `scripts/mlx_convert.py` | 把发布的 transformer 目录（`--transformer`）或文本编码器（`--text-encoder`）转成 per-block / per-layer slab（可指定区间与量化位宽） |
 | `scripts/mlx_check.py` | 真实权重的对照，一行一个序列长度（`--out` 另存 JSON 行）；`--transformer` 对 trunk block，`--text-encoder` 对文本塔的一层 |
 | `scripts/mlx_encode_text.py` | 用真实 prompt 跑文本塔，写出 DiT 条件用的 hidden states（`--slabs` 走 slab 快路径） |
-| `scripts/mlx_generate.py` | 生成一个片段：prompt（或已编码的 hidden states）→ 去噪后的 video / audio latent 行（`.npy`） |
+| `scripts/mlx_generate.py` | 生成一个片段：prompt（或已编码的 hidden states）→ 去噪后的 video / audio latent 行（`.npy` + `meta.json`） |
+| `scripts/mlx_decode.py` | 把上面那些行交给两个 VAE（torch/MPS），写出 mp4 |
 
 ### 两套发布命名
 
@@ -427,6 +429,21 @@ block 一个 plan"，而是 `LayerPlan`：每个头组带自己的 `gather` / `s
 **4 bit 不能用**：单层就 12.6 %，50 层还要叠。8 bit 只在磁盘放不下 bf16 时用，
 而且它连计算都更慢（+18 %），省的只是 I/O 和内存。
 
+### VAE 解码：留在 torch/MPS
+
+视频 VAE 是 2.4B 的 ViT3D，音频 VAE 很小，两个都只在整段结束时跑一次，
+所以没有理由在 DiT 定下来之前先移植它们。MPS 上（`--device mps`，视频
+bf16、音频 fp32，1 秒 16:9 片段，39 帧）：
+
+| 阶段 | 1344×768 | 224×128（短边 128） |
+|---|---|---|
+| 两个 VAE 载入 | 13.7 s | 13.5 s |
+| 视频解码（39 帧） | 167.2 s | 13.1 s |
+| 音频解码（2×52000 样本） | 1.7 s | 3.1 s |
+
+也就是说解码在整条链路里只占 8 步去噪（1 050 s）的 16 %，画布缩到 1/6
+时间掉到 1/13——解码是纯算力，没有流式开销。
+
 ### 真实权重：文本塔一层的三方对照
 
 `scripts/mlx_check.py --text-encoder <发布目录> --block N --seq-len S`
@@ -626,6 +643,9 @@ transformers 的 eager 路径是纯 bf16。这同时钉住了 mrope → 普通 r
   一层的三方对照」），三层的 `mlx-vs-fp32` 都不比 `torch-vs-fp32` 差；真实
   prompt 跑前 3 层（15 token）1.9 s/层（直接读 checkpoint，mmap 缺页路径），
   峰值 3.27 GB；`pytest tests/unit` 201 passed。
+- 2026-09-25，同一台机器：diffusers 移植版的两个 VAE 在 MPS 上解码通过，
+  1 秒 16:9（39 帧 1344×768）随机 latent 解出 mp4（见「VAE 解码」）。这只
+  说明解码链路通，不说明画面内容对——真实 latent 的可视化确认还没做。
 - **生成质量仍未验证**：上面那条轨迹的文本 embedding 是随机张量，也还没有 VAE
   解码，所以没有做视频层面的可视化对比。在人工一致性确认之前，这里的结论只覆盖
   数值、时间和内存，不覆盖生成质量。

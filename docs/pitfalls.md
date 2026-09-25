@@ -98,3 +98,4 @@
 | 主机侧 numpy 算的时间步正弦表与 torch 差 1 ulp，位级对齐的测试挂掉 | numpy 与 torch 的 fp32 `exp` 在 128 个频率里有 14 个最后一位不同（指数的自变量本身逐位相等） | 记录误差（max abs 2.98e-08）、测试改钉"≤1 ulp"；RoPE 的表仍然逐位相等 | [mlx_inference](features/mlx_inference.md) |
 | MLX 的 Euler 步与 torch 差 1 ulp | torch 的 `add_(v, alpha=)` 是 fused multiply-add（单次 round），MLX 分开乘加 | 记录误差（2.4e-07）、测试钉 ≤1 ulp；不要为此把这一步改成 GEMM | [mlx_inference](features/mlx_inference.md) |
 | 真实权重下 MLX block 与 torch 参考相对 L2 = 1.2（完全对不上），合成权重的单测却全过 | 对照脚本把 fused QKV 的行置换用反了（`perm` 的逆）；单测只走"torch → MLX"一个方向，看不出来 | 反方向写成库函数 `interop.torch_block`，并加往返逐位相等的单测；`mlx[perm[r]] == torch[r]`，回来是 gather | [mlx_inference](features/mlx_inference.md) |
+| 用很短的片段（`latent_t` 2）试 VAE 解码，报 `torch.cat(): expected a non-empty list of Tensors` | 视频 VAE 按 `clip_length` 分块解码，并先补上 `token_drop` 个 token；latent 帧数不到一个 chunk 时分块数算成 0 | 冒烟测试压画布（短边）而不是压时长，时长至少取一个完整 chunk | [mlx_inference](features/mlx_inference.md) |

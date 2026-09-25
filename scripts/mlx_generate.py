@@ -13,6 +13,8 @@ Examples:
 """
 
 import argparse
+import dataclasses
+import json
 import os
 import time
 
@@ -113,6 +115,17 @@ def main() -> None:
         np.save(os.path.join(args.out, f'{name}.npy'), values)
         progress.log(f'{name}: mean {values.mean():.4f}, '
                      f'std {values.std():.4f}')
+    # The rows alone do not say what shape they fold back into, so the
+    # geometry the decoder needs is written next to them.
+    meta = {'geometry': dataclasses.asdict(
+        geometry.resolve_geometry(args.aspect, args.seconds,
+                                  args.short_edge)),
+            'aspect': args.aspect, 'seconds': args.seconds,
+            'short_edge': args.short_edge, 'steps': args.steps,
+            'seed': args.seed, 'prompt': args.prompt,
+            'step_seconds': list(out.step_seconds)}
+    with open(os.path.join(args.out, 'meta.json'), 'w') as f:
+        json.dump(meta, f, indent=1)
 
 
 if __name__ == '__main__':
