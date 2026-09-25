@@ -239,6 +239,13 @@ kernel 只读 top-k 的排序，两者会分开；见 `docs/features/veda_predic
   影响数值，必须与 tile 搜索时一致。
 
 ## 验证记录
+- 2026-09-25 2×4090，`configs/stage1_refine_t102_4090.yaml`（全部 latent_t 102，四个宽高比
+  轮转，accum 2，offload_blocks 50，`_COLLECT_BYTES` 256 MiB，
+  `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.8`）：
+  前 10 次 update 全程 **0 条 OOM 告警**，包括 104k token 的 16:9 / 9:16。显存峰值与
+  单次 update 耗时：1:1 13.59 GiB / 146 s，4:3 15.90 GiB / 230 s，9:16 18.77 GiB / 374 s。
+  四个几何平均约 281 s，600 次 update 约 47 h（不是早期日志按 1:1 外推的 26 h）。
+  逐层裁剪生效：`grad_norm.predictor` 0.27，最后一层单独占 0.268。
 - 2026-09-23 macOS CPU：unit 全部通过（阶段 1 端到端 + 恢复；optimizer offload 与不 offload
   逐位一致；Turbo 适配器下表路径与全合并路径逐位一致）。
 - 2026-09-23 2×4090，50 步 base 教师，阶段 1 冒烟（10 条 PE prompt，5.17 s 16:9，冒烟方案表，
