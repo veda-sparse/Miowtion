@@ -6,7 +6,7 @@ decoded after the DiT is freed. Every mode gets its own <mode>.mp4. With both
 modes (the standard comparison) there is also dense_vs_veda.mp4: side by side
 with the titles "Dense" / "Veda <S>% Sparsity" and both audio tracks, plus
 timing (per step, attention only, speedups; step 0 of each mode includes
-kernel compilation and is excluded) and the per-frame PSNR in summary.json.
+kernel compilation and is excluded) in summary.json.
 
 One process drives every visible GPU; set CUDA_VISIBLE_DEVICES to choose.
 
@@ -295,10 +295,11 @@ def _decode_and_compare(args, sample, geometry, results, decoder,
                            / veda['seconds_excl_step0']),
             'attention': (dense['attention_seconds_excl_step0']
                           / veda['attention_seconds_excl_step0'])}
-        psnr = decode.psnr_per_frame(frames['veda'], frames['dense'])
-        summary['veda_vs_dense_psnr'] = {
-            'mean': float(psnr.mean()), 'min': float(psnr.min()),
-            'per_frame': [round(float(p), 2) for p in psnr]}
+        # No PSNR here. Sparse and dense differ in composition, not just in
+        # detail, so a per-frame number says nothing about quality -- and
+        # computing it needs two fp32 copies of the clip plus their
+        # difference (14 GB at 14.4 s, 1344x768), which on a loaded host
+        # spends longer in reclaim than the whole denoise took.
         side = decode.side_by_side([
             decode.add_title(frames[m], _title(m, args.keep_ratio))
             for m in ('dense', 'veda')])
@@ -313,8 +314,7 @@ def _decode_and_compare(args, sample, geometry, results, decoder,
                          f'{m["attention_seconds_excl_step0"]:.1f} s')
         progress.log(f'speedup: end-to-end '
                      f'{summary["speedup"]["end_to_end"]:.2f}x, attention '
-                     f'{summary["speedup"]["attention"]:.2f}x; PSNR veda vs '
-                     f'dense {psnr.mean():.2f} dB (min {psnr.min():.2f}); '
+                     f'{summary["speedup"]["attention"]:.2f}x; '
                      f'side by side: {path}')
     with open(os.path.join(out_dir, 'summary.json'), 'w') as f:
         json.dump(summary, f, indent=1)

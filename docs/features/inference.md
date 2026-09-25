@@ -58,8 +58,12 @@
 - **标准对比方式**（以后所有稠密 / 稀疏对比都按这个来）：每种模式单独一个 `<mode>.mp4`；另有
   `dense_vs_veda.mp4`，左右拼接，顶部标题栏分别是 "Dense" 和 "Veda <S>% Sparsity"
   （S = 100 × (1 − 保留比例)），带两条音轨（稠密在前）；`summary.json` 记录每步耗时、注意力 GPU
-  时间（CUDA event，Veda 包括打分、选块和 gather）、端到端与注意力加速比、逐帧 PSNR。第 0 步包含
+  时间（CUDA event，Veda 包括打分、选块和 gather）、端到端与注意力加速比。第 0 步包含
   kernel 编译，不计入加速比。还会保存 `<mode>_latents.pt`。
+- **生成路径不算 PSNR**。稀疏与稠密的差别是构图级的（不是细节级的），逐帧 PSNR 说明不了质量——
+  移植后的第一次目视检查里两边构图完全不同，PSNR 只有 10.9 dB，而画面各自都是好的。质量判断走
+  并排视频的人工确认（1.5 节）。`decode.psnr_per_frame` 保留给同一条 latent 的数值对照（例如
+  解码 dtype 的 bf16 vs fp32）。
 
 ## 用法
 一个进程用掉所有可见的卡，用 `CUDA_VISIBLE_DEVICES` 选卡：
@@ -105,6 +109,12 @@ fp32/bf16 两种存储都逐位往返、bf16 是默认且加载后不被升回 f
   必须按 warmup 之后的步折算。
 - **解码 14.4 s 16:9 时 OOM**：`revert_tensor(recon.float())` 要把 [1,3,345,768,1344] 转成 fp32
   （约 4 GB）再加上输出，单卡放不下。按帧分块后峰值有界，单测检查分块与不分块逐位相同。
+- **解码阶段三个 worker 各卡死半小时，100% CPU、无 I/O、GPU 全空**：`psnr_per_frame` 里
+  `a.astype(np.float32) - b.astype(np.float32)` 对 14.4 s 的片子要两份 4.3 GB fp32 加上差值，
+  每个 worker 约 12.8 GB、三个就是 38 GB；主机内存被 pinned slab 和 page cache 占满后，每次首次
+  触页都走 direct reclaim，全是内核态 CPU，所以看着像在算其实在回收。ptrace_scope=1 时
+  `py-spy` 只能 attach 自己的后代进程，detach 出去的长任务要 sudo 才能取栈。对策：生成路径直接
+  不算 PSNR。
 - **两个单卡推理进程被 host OOM killer 干掉**：每个进程为 offload 的 44 个 block pin 约 35 GB，
   125 GB 的机器上两个进程就只剩十几 GB。改成一个进程驱动多张卡、共享 pinned slab。
 
