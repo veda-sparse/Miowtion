@@ -86,6 +86,17 @@ trunk 之外同样的做法：两张超越函数表（RoPE 的 cos/sin、时间�
 1 ulp 远在 bf16 的分辨率之下，所以不另做可视化确认；单测钉住"≤1 ulp 且
 `t = 0` 那一行精确相等"。
 
+### 真实权重上怎么判断"对齐"
+
+两个后端不可能逐位相等（matmul 和 softmax 的归约顺序不同），所以单看
+`mlx-vs-torch` 说明不了问题：它既可能是 bf16 舍入，也可能是移植 bug。
+`check.compare_block` 用同一份权重多跑一条 **fp32 torch gold**，看的是
+`mlx-vs-fp32` 有没有比 `torch-vs-fp32` 更差——没有更差，就说明 MLX 这条路
+和参考实现自己的 bf16 路一样好，差的那部分是 bf16 的分辨率，不是移植。
+
+只对一个 block 做：block 里已经包含了移植过的每一个算子，而 torch 参考是 CPU
+eager 的，seq=4096 时一个 block 就要 26 s，50 个 block 没有意义。
+
 ## 代码位置与接口
 
 | 文件 | 作用 |
@@ -100,9 +111,11 @@ trunk 之外同样的做法：两张超越函数表（RoPE 的 cos/sin、时间�
 | `miowtion/mlx/dit.py` | trunk 之外的部分：`NonTrunkWeights`（常驻）、RoPE / 时间步表、AdaLN 表预计算、token refiner、embed、final layer |
 | `miowtion/mlx/pipeline.py` | 去噪循环：`Trajectory`（Euler 步）、`generate`（每步重新流式读一遍 trunk）、`schedule_timestep_sets` |
 | `miowtion/mlx/convert.py` | 读发布的 checkpoint（mmap safetensors → MLX array），融合 q/k/v、写 trunk slab |
+| `miowtion/mlx/check.py` | 真实权重上的数值对照：同一个发布 block 跑 MLX、torch bf16、torch fp32 三条路，给出 `BlockComparison` |
 | `miowtion/mlx/bench.py` | 测量用：合成权重、进程与系统内存统计、各项 benchmark |
 | `scripts/mlx_bench.py` | 命令行入口，每项测量单独一个进程，结果按 JSON 行输出 |
 | `scripts/mlx_convert.py` | 把发布的 transformer 目录转成 per-block slab（可指定 block 区间与量化位宽） |
+| `scripts/mlx_check.py` | 真实权重的 block 对照，一行一个序列长度（`--out` 另存 JSON 行） |
 
 ### 两套发布命名
 
@@ -368,6 +381,21 @@ block 一个 plan"，而是 `LayerPlan`：每个头组带自己的 `gather` / `s
 | 8 bit | 20.5 GB | 0.82 GB | 1.98 GB |
 | 4 bit | 10.8 GB | 0.43 GB | 1.59 GB |
 
+### 真实权重：一个 block 的三方对照
+
+`scripts/mlx_check.py --transformer <发布目录> --block 0 --seq-len 512 4096`
+（真实 T2VA transformer，hidden 5376、56 头、head_dim 128，block 0.718 GiB bf16）：
+
+| block | seq | mlx vs torch(bf16) | mlx vs fp32 | torch(bf16) vs fp32 | torch | mlx |
+|---|---|---|---|---|---|---|
+| 0 | 512 | 3.78e-03 | 8.920e-03 | 8.904e-03 | 1.82 s | 0.07 s |
+| 0 | 4096 | 2.68e-03 | 6.074e-03 | 6.076e-03 | 25.71 s | 0.67 s |
+| 1 | 512 | 3.36e-03 | 1.237e-02 | 1.237e-02 | 1.83 s | 0.07 s |
+
+即 **MLX 离 fp32 的距离和 torch 自己的 bf16 路一模一样**（差在第三位有效数字
+以内，两边互有胜负），剩下的 2.7e-03 ~ 3.8e-03 就是 bf16 本身的分辨率
+（bf16 的 eps 是 7.8e-03）。torch 那一列是 CPU eager，不是性能对照。
+
 ## 18 GB 机器上的推荐配置
 
 - **bf16 slab + `depth=1` 预取（2 个 slot）+ `head_chunk=8, row_chunk=4096`。**
@@ -418,6 +446,13 @@ block 一个 plan"，而是 `LayerPlan`：每个头组带自己的 `gather` / `s
 - 转换成 slab 再读回来与直接读 checkpoint **逐位相等**（`mx.array_equal`）。
 - 名字表对着 `third_party/MiniMax-H3` 里锁定的旧版 index 校验：除了重新计算的
   `rope.inv_freq`，每个张量都被恰好一个名字认领。
+
+`tests/unit/test_mlx_check.py`（4 个）：
+
+- 发布 layout → torch `Block` → 发布 layout 的往返**逐位相等**
+  （`mx.array_equal`，含 AdaLN 投影）。置换写反了在"只走一个方向"的测试里
+  是看不出来的，所以这里把回来的方向也钉住。
+- 合成 release 上 `compare_block` 跑通，且 `as_good_as_torch` 成立。
 
 `tests/unit/test_mlx_sparse_attention.py`（13 个）：
 
@@ -471,6 +506,14 @@ block 一个 plan"，而是 `LayerPlan`：每个头组带自己的 `gather` / `s
 - **`mx.load` 的返回值要及时丢掉**。它是惰性的，但 evaluate 过的 array 会一直持有
   数据；把 dict 缓存起来的话，读过的每个 block 都会留在内存里。
 
+- **真实权重对不上，问题却在对照脚本里**。现象：合成权重的单测相对 L2 < 5e-3 全过，
+  换成真实发布的 block 0 却是 1.2（等于毫无关系）。原因：临时写的对照脚本把 fused QKV
+  的行置换用成了 `perm` 的逆；`interop.block_weights_from_torch` 写的是
+  `mlx[perm[r]] = torch[r]`，所以回来要 **gather**（`torch = mlx[perm]`），不是用逆索引。
+  只走一个方向的测试永远看不出方向反了。对策：把反方向做成库函数
+  `interop.torch_block`，并加"发布 layout → torch → 发布 layout **逐位相等**"的单测；
+  真实权重的对照也从一次性脚本改成 `scripts/mlx_check.py`。
+
 ## 验证记录
 
 - 2026-09-24，Apple M3 Pro / 18 GB / mlx 0.32.2，commit 见本次提交：
@@ -483,8 +526,12 @@ block 一个 plan"，而是 `LayerPlan`：每个头组带自己的 `gather` / `s
   核对 `h3/release.py` 的名字表：完全覆盖。
 - 块稀疏与稠密掩码路径**逐位相等**（单测），因此不需要 AGENTS.md 1.5 要求的
   可视化人工确认。
-- **尚未用真实权重验证**，也没有做视频层面的可视化对比。在真实 checkpoint 上
-  跑通并做人工一致性确认之前，这里的结论只覆盖性能，不覆盖生成质量。
+- 2026-09-25，同一台机器：真实发布权重的 block 0 / block 1 用
+  `scripts/mlx_check.py` 做了三方对照（见「真实权重：一个 block 的三方对照」），
+  `mlx-vs-fp32` 不比 `torch-vs-fp32` 差；`pytest tests/unit` 190 passed。
+- **整条生成链路仍未用真实权重跑通**，也没有做视频层面的可视化对比（还缺文本
+  编码器与 VAE）。在人工一致性确认之前，这里的结论只覆盖单 block 的数值和性能，
+  不覆盖生成质量。
 
 ## 待办
 
