@@ -34,6 +34,10 @@ from miowtion.mlx import convert as mlx_convert
 from miowtion.mlx import dit
 from miowtion.mlx import model as mlx_model
 from miowtion.mlx import slab as mlx_slab
+from miowtion.mlx import sparse_attention
+from miowtion.mlx import veda_plan as mlx_veda_plan
+from miowtion.veda import attention as veda_attention
+from miowtion.veda import plan as veda_tile_plan
 from miowtion.utils import progress
 
 _FP32 = mx.float32
@@ -179,6 +183,7 @@ def generate(weights: dit.NonTrunkWeights,
              clip: mlx_model.ClipInputs, traj: Trajectory,
              tables: mlx_model.AdalnTables, config: h3_config.H3Config,
              options: mlx_block.BlockOptions = mlx_block.BlockOptions(),
+             plans: Sequence[sparse_attention.LayerPlan | None] | None = None,
              ) -> Generated:
     """Rolls `traj` to the end of its schedule.
 
@@ -193,6 +198,8 @@ def generate(weights: dit.NonTrunkWeights,
         tables: AdaLN tables covering every step's timestep set.
         config: Architecture.
         options: Block chunking and the optional Veda plan.
+        plans: One Veda plan per trunk layer (model.velocity); built once
+            per clip, since the selection does not depend on the step.
 
     Returns:
         The denoised target rows and the per-step wall times.
@@ -209,7 +216,8 @@ def generate(weights: dit.NonTrunkWeights,
         timestep = traj.timestep()
         video_v, audio_v = mlx_model.velocity(
             weights, blocks(), clip, tables.get(timestep.timesteps),
-            timestep, traj.video_rows, traj.audio_rows, config, options)
+            timestep, traj.video_rows, traj.audio_rows, config, options,
+            plans)
         traj.advance(video_v, audio_v)
         step_seconds.append(time.time() - start)
         steps.update(f'step {traj.step - 1}: {step_seconds[-1]:.1f} s')
@@ -249,6 +257,7 @@ class ClipRequest:
         shift: Schedule shift scales.
         short_edge: Short edge of the canvas. Only smoke tests lower it;
             the released model was trained at the default.
+        sparse: Veda block sparsity; None runs dense attention.
     """
 
     aspect: str
@@ -257,6 +266,70 @@ class ClipRequest:
     seed: int = 0
     shift: h3_schedule.ShiftScales = TURBO_SHIFT
     short_edge: int = h3_geometry.BASE_SHORT_EDGE
+    sparse: SparseRequest | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class SparseRequest:
+    """How to build the Veda plans of a clip.
+
+    Attributes:
+        veda: Budgets and the dense-layer set.
+        plan_path: A searched tile plan (`plans/*.json`); None falls back to
+            the least-padding shape for every head.
+        seed: Seed of the stand-in scorer. It is only read when `scorer` is
+            None, and the plans it builds measure speed, not quality (see
+            veda_plan.random_scores).
+        scorer: Tile scorer, as in veda_plan.layer_plan_from_scores; None
+            uses the stand-in.
+        share_heads: Collapse the head axis of a group whose heads picked
+            the same tiles.
+    """
+
+    veda: veda_attention.VedaConfig = veda_attention.VedaConfig()
+    plan_path: str | None = None
+    seed: int = 0
+    scorer: Callable | None = None
+    share_heads: bool = True
+
+
+def build_plans(request: SparseRequest, geometry: h3_geometry.Geometry,
+                layout: h3_layout.PackedLayout,
+                config: h3_config.H3Config
+                ) -> list[sparse_attention.LayerPlan | None]:
+    """The per-layer Veda plans of one clip.
+
+    The tile layouts and the selection are built on the torch CPU side
+    once, before the first step: they depend on the geometry and the
+    scorer, not on the denoise step.
+
+    Args:
+        request: What to build.
+        geometry: The clip's geometry.
+        layout: The clip's packed layout.
+        config: Architecture (layers and heads).
+
+    Returns:
+        One plan per trunk layer, None where the layer stays dense.
+    """
+    if request.plan_path:
+        tile_plan = veda_tile_plan.TilePlan.load(request.plan_path)
+    else:
+        tile_plan = mlx_veda_plan.uniform_tile_plan(
+            geometry, config.num_layers, config.num_heads)
+    clip = veda_attention.ClipTiling(layout, request.veda,
+                                     torch.device('cpu'))
+    scorer = request.scorer or mlx_veda_plan.random_scores(request.seed)
+    plans = mlx_veda_plan.clip_plans(
+        tile_plan, clip, config.num_layers, scorer,
+        request.veda.dense_layers, request.share_heads)
+    dense = sum(p is None for p in plans)
+    kept = [p.density() for p in plans if p is not None]
+    shapes = ' '.join(str(s) for s in tile_plan.shapes)
+    density = f'{np.mean(kept):.3f}' if kept else 'n/a'
+    progress.log(f'veda: tiles {shapes}, {dense}/{len(plans)} layers dense, '
+                 f'density {density}')
+    return plans
 
 
 def run_clip(reader: mlx_convert.ReleaseReader, slab_dir: str,
@@ -322,6 +395,8 @@ def run_clip(reader: mlx_convert.ReleaseReader, slab_dir: str,
     if missing:
         raise FileNotFoundError(
             f'{len(missing)} trunk slabs missing, first {missing[0]}')
+    plans = (None if request.sparse is None else
+             build_plans(request.sparse, geometry, layout, config))
     video, audio = h3_noise.initial_noise(geometry, request.seed)
     traj = Trajectory(layout, schedule, mx.array(video.numpy()),
                       mx.array(audio.numpy()))
@@ -330,6 +405,6 @@ def run_clip(reader: mlx_convert.ReleaseReader, slab_dir: str,
         return generate(
             weights,
             lambda: mlx_slab.BlockPrefetcher(slabs, range(config.num_layers)),
-            clip, traj, tables, config, options)
+            clip, traj, tables, config, options, plans)
     finally:
         slabs.close()

@@ -28,6 +28,7 @@ from miowtion.h3 import config as h3_config
 from miowtion.mlx import block as mlx_block
 from miowtion.mlx import convert as mlx_convert
 from miowtion.mlx import dit
+from miowtion.mlx import sparse_attention
 from miowtion.utils import progress
 
 BlockSource = Iterable[tuple[int, mlx_block.BlockWeights]]
@@ -217,6 +218,7 @@ def velocity(weights: dit.NonTrunkWeights, blocks: BlockSource,
              timestep: TimestepInputs, video_rows: mx.array,
              audio_rows: mx.array, config: h3_config.H3Config,
              options: mlx_block.BlockOptions = mlx_block.BlockOptions(),
+             plans: Sequence[sparse_attention.LayerPlan | None] | None = None,
              ) -> tuple[mx.array, mx.array]:
     """One velocity evaluation over a streamed trunk.
 
@@ -232,16 +234,23 @@ def velocity(weights: dit.NonTrunkWeights, blocks: BlockSource,
         audio_rows: [Na, audio_channels] fp32 rows in audio_pos order.
         config: Architecture.
         options: Block chunking (head_chunk, row_chunk, sparse plan).
+        plans: One Veda plan per trunk layer, None for the layers that stay
+            dense; `plans=None` runs `options` unchanged everywhere. A
+            per-layer plan overrides `options.sparse`, which cannot express
+            that different layers select different tiles.
 
     Returns:
         (video_v [Nt, video_patch_dim] fp32, audio_v [Nta, channels] fp32).
 
     Raises:
         ValueError: When the source does not yield every block in order, or
-            when `tables` does not cover the trunk.
+            when `tables` or `plans` does not cover the trunk.
     """
     if len(tables) != config.num_layers:
         raise ValueError(f'tables cover {len(tables)} blocks, expected '
+                         f'{config.num_layers}')
+    if plans is not None and len(plans) != config.num_layers:
+        raise ValueError(f'plans cover {len(plans)} blocks, expected '
                          f'{config.num_layers}')
     adaln_input = dit.adaln_input(weights, timestep.timesteps)
     x = dit.embed(weights, config, clip.seq_len, clip.text, video_rows,
@@ -251,9 +260,11 @@ def velocity(weights: dit.NonTrunkWeights, blocks: BlockSource,
         if index != expected:
             raise ValueError(f'block source yielded {index}, expected '
                              f'{expected}')
+        block_options = (options if plans is None else
+                         dataclasses.replace(options, sparse=plans[index]))
         x = mlx_block.block_forward(x, block, tables[index],
                                     timestep.adaln_index, clip.rope,
-                                    clip.used, config, options)
+                                    clip.used, config, block_options)
         # Streaming only works if the block's weights die with the block:
         # without this the lazy graph holds all 50 of them.
         mx.eval(x)

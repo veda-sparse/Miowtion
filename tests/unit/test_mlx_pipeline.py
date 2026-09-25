@@ -17,6 +17,7 @@ from miowtion.mlx import dit as mlx_dit  # noqa: E402
 from miowtion.mlx import interop  # noqa: E402
 from miowtion.mlx import model as mlx_model  # noqa: E402
 from miowtion.mlx import pipeline  # noqa: E402
+from miowtion.veda import attention as veda_attention  # noqa: E402
 from tests.unit.test_mlx_model import _blocks, _non_trunk, _rel_l2  # noqa
 from tests.unit.test_mlx_model import _torch_model  # noqa: E402
 
@@ -212,3 +213,60 @@ def test_run_clip_reports_a_missing_slab(tmp_path):
                                      short_edge=64))
     finally:
         reader.close()
+
+
+def test_build_plans_follows_the_budget():
+    """The plans keep roughly the requested fraction of the tiles."""
+    geometry = h3_geometry.resolve_geometry('16:9', 1.0, 448)
+    lay = h3_layout.pack(torch.ones(_TEXT_LEN, dtype=torch.long), geometry)
+    plans = pipeline.build_plans(pipeline.SparseRequest(), geometry, lay,
+                                 _CONFIG)
+    assert len(plans) == _CONFIG.num_layers
+    for plan in plans:
+        assert plan.num_heads == _CONFIG.num_heads
+        # The global tiles are kept on top of the budget and the Bresenham
+        # split rounds up, so the density sits just above the ratio.
+        assert 0.1 <= plan.density() <= 0.2
+
+
+def test_build_plans_keeps_the_dense_layers_dense():
+    geometry = h3_geometry.resolve_geometry('16:9', 1.0, 448)
+    lay = h3_layout.pack(torch.ones(_TEXT_LEN, dtype=torch.long), geometry)
+    veda = veda_attention.VedaConfig(dense_layers=frozenset([1]))
+    plans = pipeline.build_plans(pipeline.SparseRequest(veda=veda), geometry,
+                                 lay, _CONFIG)
+    assert plans[1] is None and plans[0] is not None
+
+
+def test_run_clip_with_a_full_budget_equals_the_dense_clip(tmp_path):
+    """The Veda plumbing alone must not move a single bit.
+
+    At this canvas the whole clip is one tile, so the selection keeps
+    everything and the sparse path differs from the dense one only by the
+    permutation, the gather and the scatter -- all pure data movement,
+    hence bitwise equality (AGENTS 1.5).
+    """
+    from miowtion.mlx import convert  # noqa: PLC0415
+    from tests.unit.test_mlx_convert import _write_release
+
+    source = str(tmp_path / 'transformer')
+    _write_release(source, cfg=_CONFIG)
+    slabs = str(tmp_path / 'slabs')
+    reader = convert.ReleaseReader(source)
+    try:
+        convert.write_trunk_slabs(reader, slabs, range(_CONFIG.num_layers))
+        torch.manual_seed(3)
+        text = interop.from_torch(
+            torch.randn(_TEXT_LEN, _CONFIG.text_dim).bfloat16())
+        common = dict(aspect='16:9', seconds=0.2, steps=2, short_edge=64)
+        dense = pipeline.run_clip(
+            reader, slabs, text, pipeline.ClipRequest(**common),
+            options=mlx_block.BlockOptions())
+        sparse = pipeline.run_clip(
+            reader, slabs, text,
+            pipeline.ClipRequest(**common, sparse=pipeline.SparseRequest()),
+            options=mlx_block.BlockOptions())
+    finally:
+        reader.close()
+    assert mx.array_equal(sparse.video, dense.video)
+    assert mx.array_equal(sparse.audio, dense.audio)

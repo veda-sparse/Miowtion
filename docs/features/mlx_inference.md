@@ -120,13 +120,13 @@ mrope 分段都不会执行；三个 mrope 轴此时携带同一个 position，
 |---|---|
 | `miowtion/mlx/block.py` | 一个 trunk block 的前向；`BlockWeights`（发布 layout，含量化）、`BlockOptions`（head / row 分块） |
 | `miowtion/mlx/sparse_attention.py` | Veda 块稀疏：`SparsePlan`、`HeadGroupPlan` / `LayerPlan`（每层两个头组、各自的排列）、gather 版 `block_sparse_attention`、稠密参考、代价模型 |
-| `miowtion/mlx/veda_plan.py` | 把 `veda.mask.Selection` 转成 `SparsePlan` / `LayerPlan`；`layer_plan_from_scores` 从 `TilePlan` + `ClipTiling` + 打分直接得到一层的 plan（真实 Veda 掩码的唯一入口） |
+| `miowtion/mlx/veda_plan.py` | 把 `veda.mask.Selection` 转成 `SparsePlan` / `LayerPlan`；`layer_plan_from_scores` 从 `TilePlan` + `ClipTiling` + 打分直接得到一层的 plan（真实 Veda 掩码的唯一入口）；`clip_plans`（整个 trunk 一次建好）、`uniform_tile_plan`（没有搜索过的方案表时的 baseline）、`random_scores`（替身打分器，**只能用来测速**） |
 | `miowtion/mlx/interop.py` | torch ↔ MLX 的逐位转换（numpy 没有 bf16，按 16 bit 原始位走） |
 | `miowtion/mlx/slab.py` | slab 格式、`SlabReader`（pread 进预分配 buffer）、`BlockPrefetcher`、`convert_checkpoint` |
 | `miowtion/mlx/offload.py` | 不转换的替代方案：直接读发布的 safetensors（`mx.load` 惰性加载 / 每个分片一个 mmap） |
 | `miowtion/mlx/model.py` | 一次速度评估：`clip_inputs`（一条轨迹算一次）、`precompute_adaln`（一遍扫过 26 GB 的 AdaLN 投影，只留下表）、`velocity`（trunk 流式过一遍 block） |
 | `miowtion/mlx/dit.py` | trunk 之外的部分：`NonTrunkWeights`（常驻）、RoPE / 时间步表、AdaLN 表预计算、token refiner、embed、final layer |
-| `miowtion/mlx/pipeline.py` | 去噪循环：`Trajectory`（Euler 步）、`generate`（每步重新流式读一遍 trunk）、`schedule_timestep_sets`、`run_clip`（从发布目录到去噪后的行，整段只有一个入口） |
+| `miowtion/mlx/pipeline.py` | 去噪循环：`Trajectory`（Euler 步）、`generate`（每步重新流式读一遍 trunk）、`schedule_timestep_sets`、`run_clip`（从发布目录到去噪后的行，整段只有一个入口）、`SparseRequest` / `build_plans`（一条轨迹建一次 Veda plan） |
 | `miowtion/mlx/convert.py` | 读发布的 checkpoint（`ShardedSafetensors`：mmap safetensors → MLX array；`ReleaseReader` 另加 H3 的 config 与 schema），融合 q/k/v、写 trunk slab |
 | `miowtion/mlx/text_encoder.py` | Qwen3-VL 文本塔：`TowerConfig`、`LayerWeights`、`layer_forward`（GQA + 因果注意力 + SwiGLU）、`encode`、`token_ids`、`write_tower_slabs` / `slab_layers`（按层流式） |
 | `miowtion/infer/decode.py` | 两套发布布局的 VAE 解码：`Decoder`（发布包，diffusers 0.32.2）与 `DiffusersDecoder`（diffusers 移植版的 `vae/` + `audio_vae/`，需要 diffusers ≥ 0.36），接口一致 |
@@ -136,7 +136,7 @@ mrope 分段都不会执行；三个 mrope 轴此时携带同一个 position，
 | `scripts/mlx_convert.py` | 把发布的 transformer 目录（`--transformer`）或文本编码器（`--text-encoder`）转成 per-block / per-layer slab（可指定区间与量化位宽） |
 | `scripts/mlx_check.py` | 真实权重的对照，一行一个序列长度（`--out` 另存 JSON 行）；`--transformer` 对 trunk block，`--text-encoder` 对文本塔的一层 |
 | `scripts/mlx_encode_text.py` | 用真实 prompt 跑文本塔，写出 DiT 条件用的 hidden states（`--slabs` 走 slab 快路径） |
-| `scripts/mlx_generate.py` | 生成一个片段：prompt（或已编码的 hidden states）→ 去噪后的 video / audio latent 行（`.npy` + `meta.json`） |
+| `scripts/mlx_generate.py` | 生成一个片段：prompt（或已编码的 hidden states）→ 去噪后的 video / audio latent 行（`.npy` + `meta.json`）；`--sparse-ratio` 打开 Veda 稀疏 |
 | `scripts/mlx_decode.py` | 把上面那些行交给两个 VAE（torch/MPS），写出 mp4 |
 
 ### 两套发布命名
@@ -343,6 +343,24 @@ block 一个 plan"，而是 `LayerPlan`：每个头组带自己的 `gather` / `s
 2.0 ms，每个头组每 block 要做 4 次（q / k / v 和反排列），56 个头 28 个 chunk 就是
 0.22 s。这是随机排列的上界，Veda 的排列在 tile 内是连续的，只会更快。
 
+### Veda 接进去噪循环：plan 一条轨迹只建一次
+
+选择只取决于几何和打分，不取决于去噪步，所以 50 层的 `LayerPlan` 在第一步之前
+一次建好（`pipeline.build_plans`），8 步共用。权重则相反：每步都要重新流式读一遍。
+两者的生命周期不同，这也是 plan 不放进 `BlockOptions` 常量、而是按层传给
+`model.velocity` 的原因——`BlockOptions.sparse` 只能表达"每层同一个选择"，而真实
+的 Veda 每层选的 tile 不一样。`velocity` 里按层 `dataclasses.replace(options,
+sparse=plans[index])`，`plans[i] is None` 的层走稠密（`VedaConfig.dense_layers`）。
+
+**打分器**：`layer_plan_from_scores` 要的是 `[H', rows, n_tiles]` 的 tile 分数，
+训练好的 predictor 给的就是这个。手头没有 predictor checkpoint 时用
+`veda_plan.random_scores`：它产生的选择在形状、预算、逐头分布上都和真的一样，
+kernel 干的活一模一样，**但保留哪些 tile 是随机的**。所以它只能用来测速，用它生成
+的片段没有任何质量意义，文档里凡是用它测出来的数字都必须标明。
+
+没有搜索过的方案表（`plans/` 为空）时 `uniform_tile_plan` 退回到该几何 padding
+最少的 tile 形状——搜索本身也是从这个形状出发的，作为测速 baseline 是诚实的。
+
 ### 18 GB 上的序列长度上限
 
 开了稀疏和 `eval_chunks`（`head_chunk=8, row_chunk=4096, q_block=2048`，
@@ -545,6 +563,12 @@ transformers 的 eager 路径是纯 bf16。这同时钉住了 mrope → 普通 r
 `FileNotFoundError`（真实规模下"跑了半小时才发现缺一块"是不可接受的）。为了让
 这两个测试在 CPU 上是秒级的，`ClipRequest.short_edge` 可以把画布压到 64 px——
 这个旋钮只给冒烟测试用。
+
+同一个文件里还有三个 Veda 的测试：`build_plans` 在真实几何上给出的密度落在预算
+附近、每层 plan 覆盖全部头；`VedaConfig.dense_layers` 里的层确实是 `None`（走稠密）；
+以及**满预算的稀疏 `run_clip` 与稠密 `run_clip` 逐位相等**（`mx.array_equal`）——
+64 px 画布下整段只有一个 tile，稀疏路径相对稠密路径就只多了排列、gather 和反排列
+这三步纯数据搬运，按 AGENTS.md 1.5 必须逐位一致，这条把整条链路的排列方向钉死。
 
 `tests/unit/test_mlx_text_encoder.py`（10 个）：
 

@@ -34,12 +34,14 @@ from collections.abc import Callable, Sequence
 
 import torch
 
+from miowtion.h3 import geometry as h3_geometry
 from miowtion.mlx import interop
 from miowtion.mlx import sparse_attention
 from miowtion.veda import attention as veda_attention
 from miowtion.veda import mask as veda_mask
 from miowtion.veda import plan as veda_tile_plan
 from miowtion.veda import tiling
+from miowtion.utils import progress
 
 
 def plan_from_selection(selection: veda_mask.Selection,
@@ -177,3 +179,98 @@ def layer_plan_from_scores(tile_plan: veda_tile_plan.TilePlan,
         groups.append(head_group_plan(group.heads.tolist(), selection,
                                       layout, share_heads))
     return layer_plan(groups, len(tile_plan.head_shape[layer]))
+
+
+def uniform_tile_plan(geometry: h3_geometry.Geometry, num_layers: int,
+                      num_heads: int,
+                      shape: tiling.TileShape | None = None
+                      ) -> veda_tile_plan.TilePlan:
+    """The bootstrap plan: one least-padding tile shape for every head.
+
+    A searched plan (`plans/`) gives each layer up to two shapes; until one
+    exists for a geometry, the least-padding shape is what the search itself
+    starts from, so it is the honest baseline for a speed measurement.
+
+    Args:
+        geometry: The clip's geometry.
+        num_layers: Trunk layers.
+        num_heads: Attention heads per layer.
+        shape: Tile shape; None picks the least-padding one for the grid.
+
+    Returns:
+        The uniform tile plan.
+    """
+    if shape is None:
+        shape = tiling.least_padding_shape(geometry.video_grid)
+    return veda_tile_plan.TilePlan.uniform(geometry, shape, num_layers,
+                                           num_heads)
+
+
+def random_scores(seed: int = 0
+                  ) -> Callable[[tiling.TileLayout, torch.Tensor],
+                                torch.Tensor]:
+    """A stand-in tile scorer drawing uniform logits.
+
+    **Speed only.** The selection it produces has the shape, budget and
+    per-head spread of a real Veda selection, so the kernel does exactly the
+    work the trained predictor would cause, but the tiles it keeps are
+    arbitrary: a clip generated with it says nothing about quality. Use it
+    to measure the sparse path where no predictor checkpoint is at hand, and
+    label the result as such.
+
+    Args:
+        seed: Seed of the generator; each call advances it, so different
+            layers and head groups get different scores.
+
+    Returns:
+        A scorer for `layer_plan_from_scores`.
+    """
+    generator = torch.Generator().manual_seed(seed)
+
+    def scores(layout: tiling.TileLayout, heads: torch.Tensor) -> torch.Tensor:
+        return torch.rand(len(heads), layout.n_video_tiles, layout.n_tiles,
+                          generator=generator)
+
+    return scores
+
+
+def clip_plans(tile_plan: veda_tile_plan.TilePlan,
+               clip: veda_attention.ClipTiling, num_layers: int,
+               scores: Callable[[tiling.TileLayout, torch.Tensor],
+                                torch.Tensor],
+               dense_layers: frozenset[int] = frozenset(),
+               share_heads: bool = True
+               ) -> list[sparse_attention.LayerPlan | None]:
+    """Every trunk layer's plan, or None where the layer stays dense.
+
+    Built once per clip: the selection depends on the tile layout and the
+    scorer, not on the denoise step, so the 50 plans are reused by every
+    step (the trunk weights are not -- they are streamed again).
+
+    Args:
+        tile_plan: The geometry's tile plan; must cover `num_layers`.
+        clip: Tile layouts of the clip.
+        num_layers: Trunk layers.
+        scores: Tile scorer, see `layer_plan_from_scores`.
+        dense_layers: Layers that keep dense attention.
+        share_heads: See `plan_from_selection`.
+
+    Returns:
+        A list of `num_layers` plans, None for the dense layers.
+
+    Raises:
+        ValueError: If the tile plan covers fewer layers than the trunk.
+    """
+    if tile_plan.num_layers < num_layers:
+        raise ValueError(f'tile plan covers {tile_plan.num_layers} layers, '
+                         f'expected at least {num_layers}')
+    bar = progress.Progress('veda plans', num_layers, every=10)
+    plans: list[sparse_attention.LayerPlan | None] = []
+    for layer in range(num_layers):
+        if layer in dense_layers:
+            plans.append(None)
+        else:
+            plans.append(layer_plan_from_scores(tile_plan, clip, layer,
+                                                scores, share_heads))
+        bar.update()
+    return plans

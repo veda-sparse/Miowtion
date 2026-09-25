@@ -27,6 +27,8 @@ from miowtion.mlx import pipeline
 from miowtion.mlx import slab as mlx_slab
 from miowtion.mlx import text_encoder as mlx_text
 from miowtion.train import encode as train_encode
+from miowtion.veda import attention as veda_attention
+from miowtion.veda import mask as veda_mask
 from miowtion.utils import progress
 
 
@@ -64,6 +66,28 @@ def _text_states(args: argparse.Namespace) -> mx.array:
     return hidden
 
 
+def _sparse_request(args: argparse.Namespace
+                    ) -> pipeline.SparseRequest | None:
+    """The Veda request, or None for dense attention.
+
+    Without `--sparse-plan` the scorer is the stand-in one: the sparse run
+    then costs what a real predictor would cost, but the tiles it keeps are
+    random, so its output is a speed measurement and not a clip anyone
+    should look at.
+    """
+    if args.sparse_ratio is None:
+        return None
+    dense = frozenset(int(i) for i in args.dense_layers.split(',')
+                      if i.strip())
+    veda = veda_attention.VedaConfig(
+        target_budget=veda_mask.Budget(ratio=args.sparse_ratio),
+        dense_layers=dense)
+    progress.log(f'veda: keep {args.sparse_ratio}, {len(dense)} dense layers, '
+                 f'scorer {"plan" if args.sparse_plan else "random"}')
+    return pipeline.SparseRequest(veda=veda, plan_path=args.sparse_plan,
+                                  seed=args.sparse_seed)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--transformer', required=True,
@@ -79,6 +103,7 @@ def main() -> None:
                         default=train_encode.TEXT_LAYERS,
                         help='text layers to run')
     parser.add_argument('--prompt', help='prompt text')
+    parser.add_argument('--prompt-file', help='file holding the prompt')
     parser.add_argument('--text-states',
                         help='.npy written by scripts/mlx_encode_text.py')
     parser.add_argument('--aspect', default='16:9')
@@ -88,21 +113,35 @@ def main() -> None:
     parser.add_argument('--short-edge', type=int,
                         default=geometry.BASE_SHORT_EDGE,
                         help='only lower it for smoke tests')
+    parser.add_argument('--sparse-ratio', type=float,
+                        help='Veda keep ratio; omit to run dense attention')
+    parser.add_argument('--sparse-plan',
+                        help='searched tile plan (plans/*.json); the '
+                             'least-padding shape is used without one')
+    parser.add_argument('--sparse-seed', type=int, default=0,
+                        help='seed of the stand-in tile scorer')
+    parser.add_argument('--dense-layers', default='',
+                        help='comma-separated trunk layers to keep dense')
     parser.add_argument('--out', required=True,
                         help='directory for video.npy / audio.npy')
     args = parser.parse_args()
+    if args.prompt_file:
+        with open(args.prompt_file) as f:
+            args.prompt = f.read().strip()
     if bool(args.prompt) == bool(args.text_states):
-        parser.error('pass exactly one of --prompt, --text-states')
+        parser.error('pass exactly one of --prompt, --prompt-file, '
+                     '--text-states')
     if args.prompt and not (args.text_encoder and args.tokenizer):
         parser.error('--prompt needs --text-encoder and --tokenizer')
 
+    sparse = _sparse_request(args)
     text = _text_states(args)
     reader = convert.ReleaseReader(args.transformer)
     out = pipeline.run_clip(
         reader, args.slabs, text,
         pipeline.ClipRequest(aspect=args.aspect, seconds=args.seconds,
                              steps=args.steps, seed=args.seed,
-                             short_edge=args.short_edge))
+                             short_edge=args.short_edge, sparse=sparse))
     reader.close()
     progress.log(pipeline.steps_summary(out.step_seconds))
     progress.log(f'video {tuple(out.video.shape)} '
@@ -123,6 +162,7 @@ def main() -> None:
             'aspect': args.aspect, 'seconds': args.seconds,
             'short_edge': args.short_edge, 'steps': args.steps,
             'seed': args.seed, 'prompt': args.prompt,
+            'sparse_ratio': args.sparse_ratio,
             'step_seconds': list(out.step_seconds)}
     with open(os.path.join(args.out, 'meta.json'), 'w') as f:
         json.dump(meta, f, indent=1)

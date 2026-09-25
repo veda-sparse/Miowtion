@@ -141,6 +141,9 @@ def test_velocity_checks_the_block_source():
         mlx_model.velocity(weights, blocks[:2], *args)
     with pytest.raises(ValueError, match='tables cover'):
         mlx_model.velocity(weights, blocks, clip, tables[:1], *args[2:])
+    with pytest.raises(ValueError, match='plans cover'):
+        mlx_model.velocity(weights, blocks, *args,
+                           plans=[None] * (_CONFIG.num_layers - 1))
 
 
 def test_precompute_adaln_reads_every_block(tmp_path):
