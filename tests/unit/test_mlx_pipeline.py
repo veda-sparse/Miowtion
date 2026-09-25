@@ -12,6 +12,7 @@ from miowtion.h3 import schedule as h3_schedule
 
 mx = pytest.importorskip('mlx.core', reason='requires the mlx extra')
 
+from miowtion.mlx import block as mlx_block  # noqa: E402
 from miowtion.mlx import dit as mlx_dit  # noqa: E402
 from miowtion.mlx import interop  # noqa: E402
 from miowtion.mlx import model as mlx_model  # noqa: E402
@@ -154,3 +155,60 @@ def test_generate_refuses_a_finished_trajectory():
     with pytest.raises(ValueError, match='already at the end'):
         pipeline.generate(weights, lambda: _blocks(model), clip, traj,
                           _tables(model, weights, sets), _CONFIG)
+
+
+def test_run_clip_streams_a_synthetic_release(tmp_path):
+    """The whole entry point: released directory in, denoised rows out."""
+    from miowtion.mlx import convert  # noqa: PLC0415
+    from tests.unit.test_mlx_convert import _write_release
+
+    source = str(tmp_path / 'transformer')
+    _write_release(source, cfg=_CONFIG)
+    slabs = str(tmp_path / 'slabs')
+    reader = convert.ReleaseReader(source)
+    try:
+        convert.write_trunk_slabs(reader, slabs,
+                                  range(_CONFIG.num_layers))
+        torch.manual_seed(3)
+        text = interop.from_torch(
+            torch.randn(_TEXT_LEN, _CONFIG.text_dim).bfloat16())
+        # A 64 px canvas keeps the packed sequence at a few hundred rows;
+        # what is under test is the plumbing, not the picture.
+        out = pipeline.run_clip(
+            reader, slabs, text,
+            pipeline.ClipRequest(aspect='16:9', seconds=0.2, steps=2,
+                                 short_edge=64),
+            options=mlx_block.BlockOptions())
+    finally:
+        reader.close()
+    geometry = h3_geometry.resolve_geometry('16:9', 0.2, 64)
+    assert out.video.shape == (geometry.num_video_tokens,
+                               _CONFIG.video_patch_dim)
+    assert out.audio.shape == (geometry.num_audio_rows,
+                               _CONFIG.audio_channels)
+    assert len(out.step_seconds) == 2
+    assert bool(mx.all(mx.isfinite(out.video)))
+
+
+def test_run_clip_reports_a_missing_slab(tmp_path):
+    from miowtion.mlx import convert  # noqa: PLC0415
+    from tests.unit.test_mlx_convert import _write_release
+
+    source = str(tmp_path / 'transformer')
+    _write_release(source, cfg=_CONFIG)
+    slabs = str(tmp_path / 'slabs')
+    reader = convert.ReleaseReader(source)
+    try:
+        # Only the first block is converted; a half-converted directory
+        # has to fail before the loop, not 30 minutes into it.
+        convert.write_trunk_slabs(reader, slabs, [0])
+        torch.manual_seed(3)
+        text = interop.from_torch(
+            torch.randn(_TEXT_LEN, _CONFIG.text_dim).bfloat16())
+        with pytest.raises(FileNotFoundError, match='slabs missing'):
+            pipeline.run_clip(
+                reader, slabs, text,
+                pipeline.ClipRequest(aspect='16:9', seconds=0.2, steps=1,
+                                     short_edge=64))
+    finally:
+        reader.close()

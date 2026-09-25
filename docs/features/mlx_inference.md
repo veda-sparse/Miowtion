@@ -126,7 +126,7 @@ mrope 分段都不会执行；三个 mrope 轴此时携带同一个 position，
 | `miowtion/mlx/offload.py` | 不转换的替代方案：直接读发布的 safetensors（`mx.load` 惰性加载 / 每个分片一个 mmap） |
 | `miowtion/mlx/model.py` | 一次速度评估：`clip_inputs`（一条轨迹算一次）、`precompute_adaln`（一遍扫过 26 GB 的 AdaLN 投影，只留下表）、`velocity`（trunk 流式过一遍 block） |
 | `miowtion/mlx/dit.py` | trunk 之外的部分：`NonTrunkWeights`（常驻）、RoPE / 时间步表、AdaLN 表预计算、token refiner、embed、final layer |
-| `miowtion/mlx/pipeline.py` | 去噪循环：`Trajectory`（Euler 步）、`generate`（每步重新流式读一遍 trunk）、`schedule_timestep_sets` |
+| `miowtion/mlx/pipeline.py` | 去噪循环：`Trajectory`（Euler 步）、`generate`（每步重新流式读一遍 trunk）、`schedule_timestep_sets`、`run_clip`（从发布目录到去噪后的行，整段只有一个入口） |
 | `miowtion/mlx/convert.py` | 读发布的 checkpoint（`ShardedSafetensors`：mmap safetensors → MLX array；`ReleaseReader` 另加 H3 的 config 与 schema），融合 q/k/v、写 trunk slab |
 | `miowtion/mlx/text_encoder.py` | Qwen3-VL 文本塔：`TowerConfig`、`LayerWeights`、`layer_forward`（GQA + 因果注意力 + SwiGLU）、`encode`、`token_ids`、`write_tower_slabs` / `slab_layers`（按层流式） |
 | `miowtion/mlx/check.py` | 真实权重上的数值对照：同一个发布 block（`compare_block`）或文本塔层（`compare_text_layer`）跑 MLX、torch bf16、torch fp32 三条路，给出 `BlockComparison` |
@@ -135,6 +135,7 @@ mrope 分段都不会执行；三个 mrope 轴此时携带同一个 position，
 | `scripts/mlx_convert.py` | 把发布的 transformer 目录（`--transformer`）或文本编码器（`--text-encoder`）转成 per-block / per-layer slab（可指定区间与量化位宽） |
 | `scripts/mlx_check.py` | 真实权重的对照，一行一个序列长度（`--out` 另存 JSON 行）；`--transformer` 对 trunk block，`--text-encoder` 对文本塔的一层 |
 | `scripts/mlx_encode_text.py` | 用真实 prompt 跑文本塔，写出 DiT 条件用的 hidden states（`--slabs` 走 slab 快路径） |
+| `scripts/mlx_generate.py` | 生成一个片段：prompt（或已编码的 hidden states）→ 去噪后的 video / audio latent 行（`.npy`） |
 
 ### 两套发布命名
 
@@ -520,6 +521,13 @@ transformers 的 eager 路径是纯 bf16。这同时钉住了 mrope → 普通 r
   （`mx.array_equal`，含 AdaLN 投影）。置换写反了在"只走一个方向"的测试里
   是看不出来的，所以这里把回来的方向也钉住。
 - 合成 release 上 `compare_block` 跑通，且 `as_good_as_torch` 成立。
+
+`tests/unit/test_mlx_pipeline.py` 里另有两个 `run_clip` 的测试：合成发布目录
+转 slab 之后整条链路（转 slab → 非 trunk 权重 → AdaLN 表 → 两步去噪）跑通、
+形状与几何一致、输出有限；slab 目录只转了一半时在循环开始前就报
+`FileNotFoundError`（真实规模下"跑了半小时才发现缺一块"是不可接受的）。为了让
+这两个测试在 CPU 上是秒级的，`ClipRequest.short_edge` 可以把画布压到 64 px——
+这个旋钮只给冒烟测试用。
 
 `tests/unit/test_mlx_text_encoder.py`（10 个）：
 

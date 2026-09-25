@@ -16,18 +16,24 @@ reproduces a seed bit for bit.
 from __future__ import annotations
 
 import dataclasses
+import os
 import time
 from collections.abc import Callable, Sequence
 
 import mlx.core as mx
 import numpy as np
+import torch
 
 from miowtion.h3 import config as h3_config
+from miowtion.h3 import geometry as h3_geometry
 from miowtion.h3 import layout as h3_layout
+from miowtion.h3 import noise as h3_noise
 from miowtion.h3 import schedule as h3_schedule
 from miowtion.mlx import block as mlx_block
+from miowtion.mlx import convert as mlx_convert
 from miowtion.mlx import dit
 from miowtion.mlx import model as mlx_model
+from miowtion.mlx import slab as mlx_slab
 from miowtion.utils import progress
 
 _FP32 = mx.float32
@@ -219,3 +225,111 @@ def steps_summary(step_seconds: Sequence[float]) -> str:
     return (f'{sum(step_seconds):.1f} s total, '
             f'{np.mean(step_seconds):.1f} s/step, '
             f'max {max(step_seconds):.1f} s')
+
+
+# The Turbo LoRA's own sampler shifts video and audio on different
+# clocks; these are the scales the released few-step model was tuned
+# with (h3.schedule.ShiftScales).
+TURBO_SHIFT = h3_schedule.ShiftScales(video=5.0, audio=2.0)
+# Head / row chunking of the trunk blocks. 18 GB machines need both;
+# see docs/features/mlx_inference.md.
+CLIP_OPTIONS = mlx_block.BlockOptions(head_chunk=8, row_chunk=4096)
+
+
+@dataclasses.dataclass(frozen=True)
+class ClipRequest:
+    """What to generate.
+
+    Attributes:
+        aspect: Aspect ratio, e.g. '16:9'.
+        seconds: Requested duration; rounded to a legal frame count.
+        steps: Denoise steps of the turbo schedule.
+        seed: Seed of the initial noise (drawn with torch, so the same
+            seed gives the same start as the torch pipeline).
+        shift: Schedule shift scales.
+        short_edge: Short edge of the canvas. Only smoke tests lower it;
+            the released model was trained at the default.
+    """
+
+    aspect: str
+    seconds: float
+    steps: int
+    seed: int = 0
+    shift: h3_schedule.ShiftScales = TURBO_SHIFT
+    short_edge: int = h3_geometry.BASE_SHORT_EDGE
+
+
+def run_clip(reader: mlx_convert.ReleaseReader, slab_dir: str,
+             text_states: mx.array, request: ClipRequest,
+             options: mlx_block.BlockOptions = CLIP_OPTIONS,
+             slots: int = 2) -> Generated:
+    """One clip end to end: released weights in, denoised rows out.
+
+    Everything that is read once per clip (the non-trunk weights, the
+    refined text, the RoPE tables, the AdaLN tables) is built here; the
+    trunk is then streamed from `slab_dir` once per step. `reader` is
+    only needed for that setup and is left open for the caller.
+
+    Args:
+        reader: An open ReleaseReader over `<variant>/transformer`.
+        slab_dir: Directory of the trunk slabs (scripts/mlx_convert.py).
+        text_states: [L, text_dim] bf16 text encoder states.
+        request: What to generate.
+        options: Block chunking and the optional Veda plan.
+        slots: Slab reader slots (2 = one block in flight while one is
+            being used).
+
+    Returns:
+        The denoised target rows and the per-step wall times.
+
+    Raises:
+        FileNotFoundError: When a block slab is missing.
+    """
+    config = reader.config
+    geometry = h3_geometry.resolve_geometry(request.aspect, request.seconds,
+                                            request.short_edge)
+    layout = h3_layout.pack(
+        torch.ones(int(text_states.shape[0]), dtype=torch.long), geometry)
+    progress.log(f'{geometry.name}: seq {layout.seq_len}, '
+                 f'used {layout.used}, {request.steps} steps')
+
+    start = time.time()
+    tensors = mlx_convert.non_trunk_tensors(reader)
+    refiner = [mlx_block.BlockWeights.from_tensors(
+        mlx_convert.refiner_tensors(reader, i))
+        for i in range(config.num_refiner_layers)]
+    weights = dit.NonTrunkWeights.from_tensors(tensors, refiner)
+    mx.eval(*tensors.values())
+    progress.log(f'non-trunk {weights.nbytes / 2**30:.2f} GB in '
+                 f'{time.time() - start:.1f} s')
+    del tensors
+
+    clip = mlx_model.clip_inputs(
+        weights, config, text_states, layout.position_ids.numpy(),
+        layout.img_pos.numpy(), layout.audio_pos.numpy(),
+        layout.target_img_pos.numpy(), layout.target_audio_pos.numpy(),
+        layout.seq_len, layout.used)
+    schedule = h3_schedule.turbo_schedule(request.steps, request.shift)
+    start = time.time()
+    tables = mlx_model.precompute_adaln(
+        reader, weights, schedule_timestep_sets(layout, schedule))
+    progress.log(f'adaln {tables.nbytes / 2**20:.1f} MB, {len(tables)} sets, '
+                 f'{time.time() - start:.1f} s')
+
+    paths = [mlx_slab.slab_path(slab_dir, i)
+             for i in range(config.num_layers)]
+    missing = [p for p in paths if not os.path.exists(p)]
+    if missing:
+        raise FileNotFoundError(
+            f'{len(missing)} trunk slabs missing, first {missing[0]}')
+    video, audio = h3_noise.initial_noise(geometry, request.seed)
+    traj = Trajectory(layout, schedule, mx.array(video.numpy()),
+                      mx.array(audio.numpy()))
+    slabs = mlx_slab.SlabReader(paths, slots=slots)
+    try:
+        return generate(
+            weights,
+            lambda: mlx_slab.BlockPrefetcher(slabs, range(config.num_layers)),
+            clip, traj, tables, config, options)
+    finally:
+        slabs.close()
