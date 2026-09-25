@@ -16,6 +16,12 @@ mismatch is impossible by construction.
 
 EMA is deliberately dropped: which of the two the run should deploy is a
 decision made once, at export time, and recorded in `source_weights`.
+
+Weights are stored in bf16 by default. `LayerPredictor.embed` upcasts the
+projection it selects (`proj.index_select(0, heads).float()`), so the
+scoring arithmetic is fp32 whatever the storage dtype is; keeping fp32 on
+disk only doubles the file and, more importantly, doubles the resident copy
+each inference replica holds on its own card.
 """
 
 from __future__ import annotations
@@ -33,6 +39,14 @@ from miowtion.veda import predictor as veda_predictor
 FORMAT = 'miowtion-veda-predictor-v1'
 
 _PREFIX = 'predictor.'
+
+# Storage dtypes. fp8 is deliberately absent: e4m3 carries 3 mantissa bits,
+# which perturbs the block logits enough to reorder the top-k, and would
+# need a per-head scale to be safe.
+DTYPES = {'float32': torch.float32, 'bfloat16': torch.bfloat16}
+
+# Bundles written before the dtype was recorded are fp32.
+_LEGACY_DTYPE = 'float32'
 
 
 @dataclasses.dataclass
@@ -56,7 +70,8 @@ class Bundle:
 def save(path: str, weights: dict[str, torch.Tensor],
          plans: veda_plan.PlanTable, *, num_layers: int, num_heads: int,
          head_dim: int, keep_ratio: float, source: str,
-         source_weights: str, step: int) -> None:
+         source_weights: str, step: int,
+         dtype: torch.dtype = torch.bfloat16) -> None:
     """Writes a bundle.
 
     Args:
@@ -71,16 +86,22 @@ def save(path: str, weights: dict[str, torch.Tensor],
         source: Checkpoint directory the weights came from (provenance).
         source_weights: 'live' or 'ema' (which of the two was exported).
         step: Training update the checkpoint was written at.
+        dtype: Storage dtype; must be one of `DTYPES`.
 
     Raises:
-        ValueError: If `weights` is empty or mixes prefixed and bare keys.
+        ValueError: If `weights` is empty, mixes prefixed and bare keys, or
+            `dtype` is not a supported storage dtype.
     """
     if not weights:
         raise ValueError('no predictor weights to save')
+    names = {v: k for k, v in DTYPES.items()}
+    if dtype not in names:
+        raise ValueError(f'unsupported storage dtype {dtype}; '
+                         f'expected one of {sorted(DTYPES)}')
     prefixed = [k for k in weights if k.startswith(_PREFIX)]
     if prefixed and len(prefixed) != len(weights):
         raise ValueError('weights mix prefixed and bare keys')
-    tensors = {k[len(_PREFIX):] if prefixed else k: v.contiguous()
+    tensors = {k[len(_PREFIX):] if prefixed else k: v.to(dtype).contiguous()
                for k, v in weights.items()}
     if not plans.plans:
         raise ValueError('bundle without plans; pass the run\'s plan table')
@@ -89,6 +110,7 @@ def save(path: str, weights: dict[str, torch.Tensor],
         'num_layers': str(num_layers),
         'num_heads': str(num_heads),
         'head_dim': str(head_dim),
+        'dtype': names[dtype],
         'keep_ratio': repr(float(keep_ratio)),
         'source': source,
         'source_weights': source_weights,
@@ -130,9 +152,16 @@ def load(path: str, device: torch.device | str = 'cpu') -> Bundle:
     metadata = read_metadata(path)
     with safe_open(path, framework='pt', device='cpu') as f:
         tensors = {k: f.get_tensor(k) for k in f.keys()}
+    stored = metadata.get('dtype', _LEGACY_DTYPE)
+    if stored not in DTYPES:
+        raise ValueError(f'{path}: unknown storage dtype {stored!r}')
     model = veda_predictor.TileScorePredictor(int(metadata['num_layers']),
                                               int(metadata['num_heads']),
                                               int(metadata['head_dim']))
+    # Before the load, not after: load_state_dict copies into the existing
+    # parameter, so an fp32 module would silently upcast a bf16 file back to
+    # fp32 and hold twice the memory the bundle was exported to save.
+    model = model.to(DTYPES[stored])
     shape = (f'{metadata["num_layers"]} layers x {metadata["num_heads"]} '
              f'heads x {metadata["head_dim"]}')
     try:

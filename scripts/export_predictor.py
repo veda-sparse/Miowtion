@@ -34,6 +34,11 @@ def main():
     parser.add_argument('--keep-ratio', type=float, default=0.1,
                         help='keep ratio the run trained with; recorded as '
                         'the default budget for inference')
+    parser.add_argument('--dtype', default='bfloat16',
+                        choices=sorted(veda_bundle.DTYPES),
+                        help='storage dtype; scoring upcasts to fp32 either '
+                        'way, so bf16 just halves the file and the copy '
+                        'every inference replica holds on its card')
     parser.add_argument('--ema', action='store_true',
                         help='export the EMA shadow instead of the live '
                         'weights (the live weights are the default: the '
@@ -54,10 +59,12 @@ def main():
                      num_heads=shape[0], head_dim=shape[2],
                      keep_ratio=args.keep_ratio, source=args.checkpoint,
                      source_weights='ema' if args.ema else 'live',
-                     step=int(payload['step']))
+                     step=int(payload['step']),
+                     dtype=veda_bundle.DTYPES[args.dtype])
     size = os.path.getsize(args.out) / 1024 ** 3
     progress.log(f'wrote {args.out}: {size:.2f} GiB, {num_layers} layers x '
-                 f'{shape[0]} heads x {shape[2]}, step {payload["step"]}, '
+                 f'{shape[0]} heads x {shape[2]} {args.dtype}, '
+                 f'step {payload["step"]}, '
                  f'plans {sorted(plans.plans)}')
 
 

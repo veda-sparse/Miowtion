@@ -20,6 +20,13 @@
   张量是 live（非 EMA）权重，`__metadata__`（safetensors 定义为 str→str）里放整张方案表的 JSON
   以及 `keep_ratio` / 来源 checkpoint / step，于是几何、tile 形状和权重一起走，配错在构造上就不可能。
   导出时选 live 还是 EMA 只决定一次，记在 `source_weights` 里。
+- **bundle 默认存 bf16**。`LayerPredictor.embed` 对取出的投影显式 `.float()`，打分算术无论存什么
+  dtype 都是 fp32，所以 fp32 落盘只是把文件和**每个推理 replica 各自常驻在卡上的那一份**都翻倍
+  （50×56×384×128×2 = 275M 参数，fp32 1.03 GiB，bf16 0.51 GiB；三卡三份就是 3 GiB 对 1.5 GiB，
+  正好压在 24 GB 卡最紧张的地方）。dtype 记在 metadata 里，没有这个键的旧 bundle 按 fp32 读。
+  **`load_state_dict` 是往已有参数里 copy_，会按参数的 dtype 转换**，所以 `load()` 必须先把模块
+  `.to(stored)` 再加载，否则 bf16 文件被静默升回 fp32，省下的显存又还回去了。
+  不提供 fp8：e4m3 只有 3 位尾数，足以打乱 block 的 top-k 排序，要做得先有 per-head scale。
 - **启动参数放在版本化的配置里**（`configs/infer_*.yaml` + `miowtion/infer/config.py`）：推理的
   旋钮和训练一样多（offload 深度、chunk 行数、方案、保留比例），而配错不会立刻失败——24 GB 卡上
   短几何跑得好好的，一小时后到第一条 14.4 s 的 clip 才 OOM。配置合并进 argparse 的默认值，
@@ -76,7 +83,9 @@ prompt 先用 `scripts/encode_samples.py` 编码进样本缓存。`--sample-id` 
 
 ## 测试
 `tests/unit/test_veda_bundle.py`：bundle 往返逐位相等、方案随权重一起走并且能按几何选出来、
-只读 metadata 不读张量、外来的 safetensors 文件被拒、metadata 与张量形状不符被拒。
+只读 metadata 不读张量、外来的 safetensors 文件被拒、metadata 与张量形状不符被拒、
+fp32/bf16 两种存储都逐位往返、bf16 是默认且加载后不被升回 fp32、缺 dtype 键的旧 bundle 按 fp32
+读、不支持的存储 dtype 被拒、bf16 的舍入不改变 block 的 top-k 选择。
 `tests/unit/test_configs.py`：`configs/` 下每个 yaml 都能解析成可运行的参数（`infer_*` 进
 `scripts/generate.py` 的 parser，`search_*` 进 `SearchConfig`，其余进 `TrainConfig`）。
 `tests/unit/test_infer_decode.py`：视频 latent 的反归一化是编码的逆（恒等统计量时逐位相等）、
@@ -100,6 +109,18 @@ prompt 先用 `scripts/encode_samples.py` 编码进样本缓存。`--sample-id` 
   125 GB 的机器上两个进程就只剩十几 GB。改成一个进程驱动多张卡、共享 pinned slab。
 
 ## 验证记录
+- 2026-09-25，CPU，bundle 存储 dtype 的 fp32 ↔ bf16 对照（阶段 1 第 600 次 update 的 live 权重，
+  50 层 × 56 头 × 128，随机池化特征，200 个 tile，保留 10% 即每个 query tile 取 20 个 block）：
+
+  | 层 | max\|Δlogit\| | 相对误差 | top-20 重合率（均值 / 最差） | 完全一致的 query tile |
+  |---|---|---|---|---|
+  | 0 | 4.6e-3 | 7.5e-4 | 0.99943 / 0.95 | 98.86% |
+  | 25 | 3.7e-3 | 7.9e-4 | 0.99927 / 0.95 | 98.54% |
+  | 49 | 5.7e-3 | 5.7e-4 | 0.99936 / 0.95 | 98.72% |
+
+  最差的 query tile 在 20 个 block 里换掉 1 个。**注意这是在随机特征上测的**：真实激活的池化特征
+  相关性强得多，logit 之间的间距分布不同，所以这组数字是量级参考，不是端到端结论；端到端要看下一
+  次带 `--predictor` 的生成与稠密的对比。
 - 2026-09-24，RTX 4090 单卡，解码 14.4 s 16:9（345 帧 1344×768）的同一批 latent：
 
   | 配置 | 时间 | attention 占比 | 峰值显存 | vs fp32 的 PSNR |

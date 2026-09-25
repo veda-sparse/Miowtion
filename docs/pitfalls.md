@@ -89,3 +89,4 @@
 | 真实 Veda plan 下 `q_block` 只能取 128，内存和时间都变差 | Veda 的选择是逐 128 行 query tile 的，gather 量正比于 `S/q_block` | `head_chunk` 降到 2（S=38912：8.78 → 5.99 GB 峰值，8.01 → 7.70 s） | [mlx_inference](features/mlx_inference.md) |
 | 预算不齐的行用"重复已选 tile"补齐，结果不对 | 重复的 key 会在 softmax 里被算两次 | 补位槽用 `SparsePlan.keep` 掩掉，不要重复 | [mlx_inference](features/mlx_inference.md) |
 | torch ↔ MLX 转换后 bf16 精度变差 | numpy 没有 bfloat16，默认路径经过 fp32 | 两边 view 成 int16，按原始 16 bit 搬运 | [mlx_inference](features/mlx_inference.md) |
+| bundle 存 bf16 却占着 fp32 的显存 | `load_state_dict` 往已有参数里 `copy_`，按**参数**的 dtype 转换，fp32 模块会把 bf16 文件静默升回去 | `bundle.load()` 先 `model.to(stored_dtype)` 再加载；单测断言加载后参数是 bf16 | [inference](features/inference.md) |
