@@ -281,8 +281,9 @@ def _fma(x: mx.array, a: mx.array, b: mx.array) -> mx.array:
     return x * a + b
 
 
-def _modulate(x: mx.array, one_plus_scale: mx.array, shift: mx.array,
-              index: mx.array) -> mx.array:
+def modulate(x: mx.array, one_plus_scale: mx.array, shift: mx.array,
+             index: mx.array) -> mx.array:
+    """x * one_plus_scale[index] + shift[index] (torch's rounding)."""
     return _fma(x, mx.take(one_plus_scale, index, axis=0),
                 mx.take(shift, index, axis=0))
 
@@ -404,7 +405,7 @@ def block_forward(x: mx.array, weights: BlockWeights,
     parts = []
     for start, stop in rows:
         idx = adaln_index[start:stop]
-        parts.append(_modulate(rms_norm(x[start:stop], weights.norm1,
+        parts.append(modulate(rms_norm(x[start:stop], weights.norm1,
                                         config.norm_eps),
                                one_plus_msa, shift_msa, idx))
         maybe_eval(parts[-1])
@@ -461,7 +462,7 @@ def block_forward(x: mx.array, weights: BlockWeights,
         o = weights.out(attn[start:stop])
         stages.mark('out_proj', o)
         xr = _gated_residual(x[start:stop], gate_msa, idx, o)
-        h2 = _modulate(rms_norm(xr, weights.norm2, config.norm_eps),
+        h2 = modulate(rms_norm(xr, weights.norm2, config.norm_eps),
                        one_plus_mlp, shift_mlp, idx)
         stages.mark('residual', h2)
         gate, up = mx.split(weights.fc1(h2), 2, axis=-1)

@@ -72,6 +72,15 @@ round 到 bf16：RMSNorm 的统计量和乘权重在 fp32 里算、只 round 一
 结果：**调制、RoPE、SwiGLU 与 torch 逐位相等**；整个 block 不是——RMSNorm 的统计
 量、GEMM、attention 的归约顺序不同（见「踩坑记录」）。
 
+trunk 之外同样的做法：两张超越函数表（RoPE 的 cos/sin、时间步的正弦特征）在主机侧
+用 numpy 算，而不是用 MLX 算子，因为它们很小（`[S, 96]` 和 `[M, 256]`）、纯逐元素，
+放在主机上不花钱却能贴着 torch 参考。**RoPE 的表与 torch 逐位相等**；时间步的正弦
+特征差 **1 ulp**（`freq_dim=256` 的 128 个频率里有 14 个，numpy 与 torch 的 fp32
+`exp` 最后一位不一致，最大绝对误差 2.98e-08；指数的自变量本身是逐位相等的）。
+指数表是常量、只在每条轨迹算一次，之后进的是 fp32 GEMM 再 round 到 bf16，
+1 ulp 远在 bf16 的分辨率之下，所以不另做可视化确认；单测钉住"≤1 ulp 且
+`t = 0` 那一行精确相等"。
+
 ## 代码位置与接口
 
 | 文件 | 作用 |
@@ -82,6 +91,7 @@ round 到 bf16：RMSNorm 的统计量和乘权重在 fp32 里算、只 round 一
 | `miowtion/mlx/interop.py` | torch ↔ MLX 的逐位转换（numpy 没有 bf16，按 16 bit 原始位走） |
 | `miowtion/mlx/slab.py` | slab 格式、`SlabReader`（pread 进预分配 buffer）、`BlockPrefetcher`、`convert_checkpoint` |
 | `miowtion/mlx/offload.py` | 不转换的替代方案：直接读发布的 safetensors（`mx.load` 惰性加载 / 每个分片一个 mmap） |
+| `miowtion/mlx/dit.py` | trunk 之外的部分：`NonTrunkWeights`（常驻）、RoPE / 时间步表、AdaLN 表预计算、token refiner、embed、final layer |
 | `miowtion/mlx/convert.py` | 读发布的 checkpoint（mmap safetensors → MLX array），融合 q/k/v、写 trunk slab |
 | `miowtion/mlx/bench.py` | 测量用：合成权重、进程与系统内存统计、各项 benchmark |
 | `scripts/mlx_bench.py` | 命令行入口，每项测量单独一个进程，结果按 JSON 行输出 |
@@ -458,19 +468,19 @@ block 一个 plan"，而是 `LayerPlan`：每个头组带自己的 `gather` / `s
 - 2026-09-24，Apple M3 Pro / 18 GB / mlx 0.32.2，commit 见本次提交：
   `pytest tests/unit` 127 passed。以上全部数字由 `scripts/mlx_bench.py` 在合成
   权重（真实 shape）上实测。
+- 2026-09-25，同一台机器：加上 `dit.py`（trunk 之外）与其 torch 对照测试后
+  `pytest tests/unit` 172 passed。
 - 块稀疏与稠密掩码路径**逐位相等**（单测），因此不需要 AGENTS.md 1.5 要求的
   可视化人工确认。
-- **尚未用真实权重验证**，也没有做视频层面的可视化对比（本研究不下载权重）。
-  在真实 checkpoint 上跑通并做人工一致性确认之前，这里的结论只覆盖性能，不覆盖
-  生成质量。
+- **尚未用真实权重验证**，也没有做视频层面的可视化对比。在真实 checkpoint 上
+  跑通并做人工一致性确认之前，这里的结论只覆盖性能，不覆盖生成质量。
 
 ## 待办
 
 - 用真实 checkpoint 跑 `slab.convert_checkpoint`，端到端生成一段视频，并按
   AGENTS.md 1.5 做人工可视化确认。
-- 接上 `miowtion/infer` 的去噪循环（目前只有 block 级前向，没有时间步循环、
-  文本条件和 VAE 解码）。
-- AdaLN 表的预计算目前还在 torch 侧，MLX 侧只消费表；考虑一并搬过来。
+- 接上 `miowtion/infer` 的去噪循环：`dit.py` 已经有 embed / refiner / AdaLN 表 /
+  final layer，还缺时间步循环、CFG、文本编码器与 VAE 解码（后两者留在 torch/MPS）。
 - 打分器本身还在 torch 侧：`layer_plan_from_scores` 接受一个"给定 tile layout 和
   头号返回 logits"的回调，真实运行时要么把 `veda.predictor` 移植到 MLX，要么每层
   往返一次 torch（后者会把排列的 3 % 开销变成一次真正的同步，得先测）。
