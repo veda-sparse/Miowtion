@@ -82,8 +82,19 @@ round 到 bf16：RMSNorm 的统计量和乘权重在 fp32 里算、只 round 一
 | `miowtion/mlx/interop.py` | torch ↔ MLX 的逐位转换（numpy 没有 bf16，按 16 bit 原始位走） |
 | `miowtion/mlx/slab.py` | slab 格式、`SlabReader`（pread 进预分配 buffer）、`BlockPrefetcher`、`convert_checkpoint` |
 | `miowtion/mlx/offload.py` | 不转换的替代方案：直接读发布的 safetensors（`mx.load` 惰性加载 / 每个分片一个 mmap） |
+| `miowtion/mlx/convert.py` | 读发布的 checkpoint（mmap safetensors → MLX array），融合 q/k/v、写 trunk slab |
 | `miowtion/mlx/bench.py` | 测量用：合成权重、进程与系统内存统计、各项 benchmark |
 | `scripts/mlx_bench.py` | 命令行入口，每项测量单独一个进程，结果按 JSON 行输出 |
+
+### 两套发布命名
+
+上游重新发布过一次 checkpoint：最早的 `MiniMaxH3DiTModel` 用 H3 原生名字、fused QKV 是
+一个张量；现在 HuggingFace 上的是 diffusers 移植版 `MiniMaxH3Transformer3DModel`，block
+在 `transformer_blocks.N.` 下，attention 拆成 `attn.to_q/to_k/to_v` 三个投影，embedding 和
+输出层也改了名（`proj_in`、`context_embedder`、`norm_out`…）。名字映射集中在
+`miowtion/h3/release.py`（只管名字，不碰张量），`ReleaseReader` 从权重名自动判断是哪一套，
+`check_complete()` 在转换前把缺失的键一次性报出来——少一个层只会在深处炸 shape，或者更糟，
+根本不炸。
 
 权重的 fused QKV 保持发布的 **per-head 交错行序**（`[h0: q k v, h1: q k v, ...]`），
 这样 block 可以直接从 checkpoint 流式读入而不用做行置换，而且连续的一组 head 正好是
@@ -379,6 +390,16 @@ block 一个 plan"，而是 `LayerPlan`：每个头组带自己的 `gather` / `s
   再反排列"**逐位相等**，头也回到输入顺序；头组不构成划分时报错。
 - `layer_plan_from_scores` 走真实几何（16:9、`h3.layout.pack`、`ClipTiling`、
   `TilePlan` 两种形状）：头组、排列长度、密度都对，跑出来的 attention 同样逐位相等。
+
+`tests/unit/test_mlx_convert.py`（7 个）+ `tests/unit/test_h3_release.py`（6 个）：
+
+- `fuse_qkv` 的行序被测试钉住（head h 占 q、k、v 各一段），shape 不对报错。
+- 合成的 diffusers 版 checkpoint：schema 自动识别、config 解析、`check_complete`
+  少张量时报错；trunk / AdaLN / 非 trunk / refiner 张量与写入的值**逐位相等**
+  （`torch.equal`），fp32 的 patch 投影保持 fp32。
+- 转换成 slab 再读回来与直接读 checkpoint **逐位相等**（`mx.array_equal`）。
+- 名字表对着 `third_party/MiniMax-H3` 里锁定的旧版 index 校验：除了重新计算的
+  `rope.inv_freq`，每个张量都被恰好一个名字认领。
 
 `tests/unit/test_mlx_sparse_attention.py`（13 个）：
 
