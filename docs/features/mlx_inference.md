@@ -407,6 +407,27 @@ block 一个 plan"，而是 `LayerPlan`：每个头组带自己的 `gather` / `s
 **4 bit 不能用**：单层就 12.6 %，50 层还要叠。8 bit 只在磁盘放不下 bf16 时用，
 而且它连计算都更慢（+18 %），省的只是 I/O 和内存。
 
+### 真实权重：一条完整轨迹（33B，8 步）
+
+第一次用发布的 33B T2VA transformer 跑完整去噪循环，1 秒 16:9 片段
+（`latent_t 12`，打包后 seq 12 352、有效 12 290），turbo 8 步，文本 embedding
+用随机张量占位（文本编码器还没下下来），trunk 每步重新流式读一遍：
+
+| 阶段 | 时间 | 备注 |
+|---|---|---|
+| trunk 转 slab（50 block，bf16，36 GB） | 91 s | `scripts/mlx_convert.py`，一次性 |
+| 非 trunk 权重 + token refiner | 一次 | 常驻，不随步数增长 |
+| AdaLN 表预计算（8 组时间步，扫过 26 GB 投影） | 43.5 s | 结果只有 138.4 MB，整段只做一次 |
+| 每步（50 block） | **131.3 s**（最大 134.0 s） | ≈ 2.6 s/block |
+| 8 步合计 | **1 050 s ≈ 17.5 min** | MLX 峰值 4.51 GB |
+
+同一步直接从发布的 safetensors 读（不转 slab）要 **213.9 s**：mmap 缺页驱动
+的有效带宽只有 0.17 GB/s，转成 slab 之后读不再是瓶颈，131 s 全花在计算上
+（和合成权重的外推一致：seq 16 384 时 26 min / 8 步，这里 seq 12 352 更短）。
+
+**这条轨迹只说明链路跑得通、时间和内存是多少，不说明生成质量**：文本 embedding
+是随机的，也还没有 VAE 解码，所以 AGENTS.md 1.5 要求的人工可视化确认尚未进行。
+
 ## 18 GB 机器上的推荐配置
 
 - **bf16 slab + `depth=1` 预取（2 个 slot）+ `head_chunk=8, row_chunk=4096`。**
@@ -540,16 +561,21 @@ block 一个 plan"，而是 `LayerPlan`：每个头组带自己的 `gather` / `s
 - 2026-09-25，同一台机器：真实发布权重的 block 0 / block 1 用
   `scripts/mlx_check.py` 做了三方对照（见「真实权重：一个 block 的三方对照」），
   `mlx-vs-fp32` 不比 `torch-vs-fp32` 差；`pytest tests/unit` 190 passed。
-- **整条生成链路仍未用真实权重跑通**，也没有做视频层面的可视化对比（还缺文本
-  编码器与 VAE）。在人工一致性确认之前，这里的结论只覆盖单 block 的数值和性能，
-  不覆盖生成质量。
+- 2026-09-25，同一台机器：真实 33B trunk 转成 bf16 slab 后跑完 8 步去噪
+  （seq 12 352，见「真实权重：一条完整轨迹」），1 050 s、峰值 4.51 GB，输出
+  video `(12096, 96)`、audio `(130, 32)`，数值没有 NaN / 爆炸（video std 0.90、
+  audio std 0.23）。
+- **生成质量仍未验证**：上面那条轨迹的文本 embedding 是随机张量，也还没有 VAE
+  解码，所以没有做视频层面的可视化对比。在人工一致性确认之前，这里的结论只覆盖
+  数值、时间和内存，不覆盖生成质量。
 
 ## 待办
 
-- 用真实 checkpoint 跑 `slab.convert_checkpoint`，端到端生成一段视频，并按
-  AGENTS.md 1.5 做人工可视化确认。
-- 接上 `miowtion/infer` 的去噪循环：`dit.py` 已经有 embed / refiner / AdaLN 表 /
-  final layer，还缺时间步循环、CFG、文本编码器与 VAE 解码（后两者留在 torch/MPS）。
+- 接上真实的文本编码器与 VAE 解码（两者留在 torch/MPS），把上面那条轨迹的随机
+  文本 embedding 换成真实 prompt，解码成视频，再按 AGENTS.md 1.5 做人工可视化
+  确认。DiT 这一侧（转 slab → 去噪循环）已经用真实权重跑通。
+- CFG：现在的循环只算一次速度评估，还没有无条件分支（开了就是两倍时间，18 GB
+  上要先确认值不值）。
 - 打分器本身还在 torch 侧：`layer_plan_from_scores` 接受一个"给定 tile layout 和
   头号返回 logits"的回调，真实运行时要么把 `veda.predictor` 移植到 MLX，要么每层
   往返一次 torch（后者会把排列的 3 % 开销变成一次真正的同步，得先测）。
