@@ -50,8 +50,11 @@ def test_compare_block_on_a_synthetic_release(tmp_path):
     # tiny(): rope_dim fits inside head_dim, as in the real config.
     _write_release(tmp_path, cfg=h3_config.H3Config.tiny())
     with convert.ReleaseReader(str(tmp_path)) as reader:
-        result = check.compare_block(reader, 0, seq_len=32)
-    assert result.index == 0 and result.seq_len == 32
+        # 32 rows of random weights put the mlx/torch ratio anywhere in
+        # [0.94, 1.20] across seeds, which is rounding luck, not signal;
+        # 128 rows keep it within a few percent of 1.
+        result = check.compare_block(reader, 0, seq_len=128)
+    assert result.index == 0 and result.seq_len == 128
     # Random weights are far worse conditioned than trained ones, so what
     # is asserted is the three-way relation, not an absolute error.
     assert result.as_good_as_torch

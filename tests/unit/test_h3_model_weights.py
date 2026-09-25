@@ -204,3 +204,21 @@ def test_config_refuses_an_unknown_schema(tmp_path):
     del raw['ffn_dim']
     with pytest.raises(KeyError, match='ffn_dim'):
         h3_config.H3Config.from_pretrained(_write_config(tmp_path, raw))
+
+
+def test_swiglu_gates_the_second_half_of_fc1():
+    """The release fuses the MLP projections as [up; gate], not [gate; up].
+
+    Swapping the halves leaves every shape and every norm intact, so it
+    only shows up as noise in the generated video; pin it here against
+    diffusers' SwiGLU (`up, gate = proj(x).chunk(2); up * silu(gate)`).
+    """
+    config = h3_config.H3Config.tiny()
+    mlp = h3_model.Mlp(config)
+    torch.manual_seed(0)
+    for param in mlp.parameters():
+        param.data.normal_(std=0.05)
+    x = torch.randn(8, config.hidden_size, dtype=torch.bfloat16)
+    up, gate = mlp.fc1(x).chunk(2, dim=-1)
+    want = mlp.fc2(torch.nn.functional.silu(gate) * up)
+    assert torch.equal(mlp(x), want)

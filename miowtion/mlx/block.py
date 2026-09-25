@@ -514,7 +514,7 @@ def block_forward(x: mx.array, weights: BlockWeights,
         h2 = modulate(rms_norm(xr, weights.norm2, config.norm_eps),
                        one_plus_mlp, shift_mlp, idx)
         stages.mark('residual', h2)
-        gate, up = mx.split(weights.fc1(h2), 2, axis=-1)
+        up, gate = mx.split(weights.fc1(h2), 2, axis=-1)
         m = weights.fc2(swiglu(gate, up))
         stages.mark('mlp', m)
         parts.append(_gated_residual(xr, gate_mlp, idx, m))

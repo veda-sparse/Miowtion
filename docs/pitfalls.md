@@ -11,6 +11,7 @@
 | ref2va prompt 被校验拒绝 | ref2va 是六段式格式，不是 t2va 的三字段 | `validate_prompt(prompt, task)` 按 task 区分 | [training](features/training.md) |
 | 多卡时复制的打分器权重不一致 | 初始化用了全局 RNG，而各 rank 的 RNG 状态不同 | 创建打分器前 `torch.manual_seed(config.seed)` | [training](features/training.md) |
 | VAE 编码结果不可复现 | VAE 的后验是采样得到的 | 每次编码前把全局 RNG 固定为 seed 42 | [h3_model](features/h3_model.md) |
+| 8 步生成出来的视频和"直接解码纯噪声"没有区别，torch / MLX 两条路还完全一致 | SwiGLU 的两半接反：发布权重把 fc1 融成 `[up; gate]`，我们当成 `[gate; up]`。形状、范数、两条自研路径的互相对拍全都看不出来 | 三处改成 `up, gate = chunk(2)`；加单测钉死这个顺序；用 `scripts/check_vs_diffusers.py` 逐模块对 diffusers 参考实现 | [h3_model](features/h3_model.md) |
 
 ## Veda
 
