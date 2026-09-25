@@ -28,16 +28,22 @@ def main() -> None:
     parser.add_argument('--seq-len', type=int, nargs='+', default=[512],
                         help='packed sequence lengths to compare at')
     parser.add_argument('--seed', type=int, default=0)
+    parser.add_argument('--bits', type=int, default=0, choices=(0, 4, 8),
+                        help='quantize the MLX linears; the torch sides keep '
+                             'the released weights, so this measures what '
+                             'quantization costs')
+    parser.add_argument('--group-size', type=int, default=64)
     parser.add_argument('--out', help='append one JSON line per comparison')
     args = parser.parse_args()
 
     with convert.ReleaseReader(args.transformer) as reader:
         for seq_len in args.seq_len:
             result = check.compare_block(reader, args.block, seq_len,
-                                         args.seed)
-            progress.log(result.line() +
-                         ('' if result.as_good_as_torch
-                          else '  [WORSE THAN TORCH BF16]'))
+                                         args.seed, bits=args.bits,
+                                         group_size=args.group_size)
+            flag = ('' if args.bits or result.as_good_as_torch
+                    else '  [WORSE THAN TORCH BF16]')
+            progress.log(f'{result.line()}{flag}')
             if args.out:
                 with open(args.out, 'a') as f:
                     f.write(json.dumps(dataclasses.asdict(result)) + '\n')

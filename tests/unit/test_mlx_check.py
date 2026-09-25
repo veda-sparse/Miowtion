@@ -58,6 +58,17 @@ def test_compare_block_on_a_synthetic_release(tmp_path):
     assert result.mlx_seconds > 0.0 and result.torch_seconds > 0.0
 
 
+def test_quantized_weights_are_worse_but_not_broken(tmp_path):
+    _write_release(tmp_path, cfg=h3_config.H3Config.tiny())
+    with convert.ReleaseReader(str(tmp_path)) as reader:
+        dense = check.compare_block(reader, 0, seq_len=32)
+        # group 32: the tiny ffn_dim (96) is not a multiple of 64.
+        quantized = check.compare_block(reader, 0, seq_len=32, bits=8,
+                                        group_size=32)
+    assert quantized.mlx_vs_fp32 > dense.mlx_vs_fp32
+    assert quantized.mlx_vs_fp32 < 0.2
+
+
 def test_a_worse_than_torch_result_is_flagged():
     assert not check.BlockComparison(0, 32, 0.0, 3e-3, 1e-3, 0.0, 0.0,
                                      0.0).as_good_as_torch

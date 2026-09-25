@@ -89,7 +89,7 @@ def _rel_l2(got: torch.Tensor, want: torch.Tensor) -> float:
 def compare_block(reader: mlx_convert.ReleaseReader, index: int,
                   seq_len: int, seed: int = 0,
                   options: mlx_block.BlockOptions = mlx_block.BlockOptions(),
-                  ) -> BlockComparison:
+                  bits: int = 0, group_size: int = 64) -> BlockComparison:
     """Runs one released trunk block on both backends.
 
     Args:
@@ -99,6 +99,11 @@ def compare_block(reader: mlx_convert.ReleaseReader, index: int,
             is a CPU eager implementation, so this is quadratic and slow.
         seed: Seed of the synthetic inputs.
         options: MLX block chunking.
+        bits: Quantizes the MLX linears (0 keeps bf16). The torch sides
+            stay at the released weights, so the comparison then measures
+            what quantization costs, not a porting difference, and
+            `as_good_as_torch` is expected to be False.
+        group_size: Quantization group.
 
     Returns:
         The comparison.
@@ -108,6 +113,8 @@ def compare_block(reader: mlx_convert.ReleaseReader, index: int,
     adaln = mlx_convert.adaln_tensors(reader, index)
     mx.eval(*tensors.values())
     weights = mlx_block.BlockWeights.from_tensors(tensors)
+    if bits:
+        weights = weights.quantize(bits, group_size)
     block = interop.torch_block(tensors, adaln, config)
     del tensors, adaln
 
