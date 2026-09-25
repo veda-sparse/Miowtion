@@ -91,3 +91,4 @@
 | torch ↔ MLX 转换后 bf16 精度变差 | numpy 没有 bfloat16，默认路径经过 fp32 | 两边 view 成 int16，按原始 16 bit 搬运 | [mlx_inference](features/mlx_inference.md) |
 | bundle 存 bf16 却占着 fp32 的显存 | `load_state_dict` 往已有参数里 `copy_`，按**参数**的 dtype 转换，fp32 模块会把 bf16 文件静默升回去 | `bundle.load()` 先 `model.to(stored_dtype)` 再加载；单测断言加载后参数是 bf16 | [inference](features/inference.md) |
 | 解码阶段 worker 卡死、100% CPU 却不出文件 | `psnr_per_frame` 一次性造两份 4.3 GB fp32，三个 worker 38 GB，内存吃紧后每次触页走 direct reclaim | 生成路径不算 PSNR；取栈要注意 ptrace_scope=1 只允许 attach 自己的后代进程 | [inference](features/inference.md) |
+| 换成只训最长几何后，分配器报 OOM 告警（free 0.6 GiB 却要 3.4 GiB） | 混训时 t102 每 12 条轨迹才来一次，只训 t102 时每次几何切换都是大张量换大张量，缺的是连续性不是总量 | `offload_blocks` 44 → 48，并用 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`；`mlp_chunk_rows` 不能动（影响数值） | [training](features/training.md) |

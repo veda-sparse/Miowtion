@@ -45,9 +45,13 @@ lr_min_ratio: 0.1      # 1e-4 at update 600
 save_every: 100
 keep_optimizer: 1
 out_dir: runs
-# 44, not the 50 inference uses: training shards the trunk over the ranks,
-# inference replicates it per card. 104k token peaks at 20.9 GiB here.
-offload_blocks: 44
+# 48, not the 44 the twelve-geometry run used: that run only visited t102
+# every twelfth trajectory, this one never leaves it. At 44 the allocator
+# already had to flush its cache to find 3.4 GiB at the 78k-token (4:3)
+# transition, with 0.6 GiB free; 16:9 is 104k. Launch with
+# PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True as well -- the failure
+# was fragmentation, not a real shortage.
+offload_blocks: 48
 prefetch: 1
 mlp_chunk_rows: 8192
 offload_optimizer: true

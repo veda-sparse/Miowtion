@@ -202,6 +202,16 @@ kernel 只读 top-k 的排序，两者会分开；见 `docs/features/veda_predic
   测试覆盖 `SparseStudent`。现在只取视频行，新增的 CPU 测试用带全局 tile 的真实打包布局，并检查全
   保留预算时与稠密一致。
 
+- **只训 t102 时 offload 44 不够，分配器在几何切换处清缓存重试**：12 几何混训时 44 是够的
+  （104k token 峰值 20.9 GiB），但那种配比下 t102 每 12 条轨迹才来一次；只训 t102 时每次几何
+  切换都是大张量换大张量，日志里出现
+  `CUDACachingAllocator ... memory allocation failed with OOM ... (free: 0.6 GiB)`——
+  1:1（60k）换到 4:3（78k）就要 3.4 GiB 连续显存。这是 **告警不是崩溃**（分配器清掉缓存后重试
+  成功），但它说明已经没有余量，再往上到 16:9 / 9:16 的 104k 必然硬 OOM。对策：`offload_blocks`
+  提到 48，并用 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` 启动——失败的是连续性
+  （碎片）而不是总量，expandable segments 正好治这个。`mlp_chunk_rows` **不能**动：GEMM 的行数
+  影响数值，必须与 tile 搜索时一致。
+
 ## 验证记录
 - 2026-09-23 macOS CPU：unit 全部通过（阶段 1 端到端 + 恢复；optimizer offload 与不 offload
   逐位一致；Turbo 适配器下表路径与全合并路径逐位一致）。
