@@ -242,7 +242,7 @@ class Trainer:
                         if config.offload_optimizer else None)
         self.opt_params = (self.masters.named() if self.masters
                            else self.trainable)
-        self.clip_groups = _param_groups(self.trainable)
+        self.clip_groups = _clip_groups(self.trainable)
         self.optimizer = torch.optim.AdamW(
             [{'params': ps, 'name': g}
              for g, ps in _param_groups(self.opt_params).items()],
@@ -395,9 +395,10 @@ class Trainer:
             if self.step == self.start_step:
                 monitor_lib.check_gradient_stop(
                     self.model, [p for _, p in self.trainable])
-            norms = {name: torch.nn.utils.clip_grad_norm_(
-                params, config.grad_clip).item()
-                     for name, params in self.clip_groups.items()}
+            norms = summarize_norms(
+                {name: torch.nn.utils.clip_grad_norm_(
+                    params, config.grad_clip).item()
+                 for name, params in self.clip_groups.items()})
             lr = learning_rate(config, self.step)
             for group in self.optimizer.param_groups:
                 group['lr'] = lr
@@ -477,13 +478,51 @@ class Trainer:
 
 
 def _param_groups(named) -> dict[str, list]:
-    """Parameter groups clipped separately: predictor, lora, head."""
+    """Optimizer parameter groups: predictor, lora, head."""
     groups = {}
     for name, p in named:
         key = ('predictor' if name.startswith('predictor.') else
                'lora' if '.lora_' in name else 'head')
         groups.setdefault(key, []).append(p)
     return groups
+
+
+def _clip_groups(named) -> dict[str, list]:
+    """Parameter groups clipped independently, one per predictor layer.
+
+    The layer predictors are independent models: separate parameters,
+    one KL term each, no gradient crossing between them. A single clip
+    over all of them is therefore a coupling, and an asymmetric one --
+    the last layer's gradient runs 50-70x the median layer's and carries
+    ~98% of the total norm, so a shared clip would be triggered by that
+    one layer and would shrink the step of the other 49 with it. lora
+    and head stay whole: those are one model.
+    """
+    groups = {}
+    for name, p in named:
+        key = (name.rsplit('.', 1)[0] if name.startswith('predictor.') else
+               'lora' if '.lora_' in name else 'head')
+        groups.setdefault(key, []).append(p)
+    return groups
+
+
+def summarize_norms(norms: dict[str, float]) -> dict[str, float]:
+    """Collapses the per-layer predictor norms back into one number.
+
+    Clipping is per layer, but the log keeps a single `predictor` entry
+    (the norm the whole predictor would report, i.e. the root sum of
+    squares of the groups). Per-layer detail is already logged as
+    `grad_norm_layers`.
+    """
+    out, layers = {}, []
+    for name, value in norms.items():
+        if name.startswith('predictor.'):
+            layers.append(value)
+        else:
+            out[name] = value
+    if layers:
+        out['predictor'] = math.sqrt(sum(v * v for v in layers))
+    return out
 
 
 class _FrozenTeacher:

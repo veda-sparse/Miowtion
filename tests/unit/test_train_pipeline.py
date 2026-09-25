@@ -357,3 +357,47 @@ def test_lr_schedule_settings_are_validated():
         _lr_config(lr_decay='linear').validate()
     with pytest.raises(ValueError, match='lr_min_ratio'):
         _lr_config(lr_decay='cosine', lr_min_ratio=1.5).validate()
+
+
+def test_clipping_is_per_predictor_layer_and_does_not_couple_layers():
+    from miowtion.veda import predictor as veda_predictor
+    pred = veda_predictor.TileScorePredictor(3, 2, 8)
+    named = [(f'predictor.{n}', p) for n, p in pred.named_parameters()]
+    groups = trainer_lib._clip_groups(named)
+    assert sorted(groups) == ['predictor.layers.0', 'predictor.layers.1',
+                              'predictor.layers.2']
+
+    last = 'predictor.layers.2'
+    others = [(n, p) for n, p in named if not n.startswith(last)]
+
+    def grads(spike: float) -> list[torch.Tensor]:
+        for name, p in named:
+            scale = spike if name.startswith(last) else 1.0
+            p.grad = torch.full_like(p, 0.3 * scale)
+        norms = {name: torch.nn.utils.clip_grad_norm_(ps, 1.0).item()
+                 for name, ps in trainer_lib._clip_groups(named).items()}
+        assert 'predictor' in trainer_lib.summarize_norms(norms)
+        return [p.grad.clone() for _, p in others]
+
+    # The last layer's gradient is what blows up in practice (50-70x the
+    # median layer). Clipped per layer, the other layers must not notice.
+    calm, spiked = grads(1.0), grads(1000.0)
+    assert all(torch.equal(a, b) for a, b in zip(calm, spiked))
+
+    # With one clip over the whole predictor -- what this replaced -- the
+    # same spike drags every other layer down with it.
+    def global_clip(spike: float) -> list[torch.Tensor]:
+        for name, p in named:
+            scale = spike if name.startswith(last) else 1.0
+            p.grad = torch.full_like(p, 0.3 * scale)
+        torch.nn.utils.clip_grad_norm_([p for _, p in named], 1.0)
+        return [p.grad.clone() for _, p in others]
+
+    assert not any(torch.equal(a, b)
+                   for a, b in zip(global_clip(1.0), global_clip(1000.0)))
+
+
+def test_summarize_norms_keeps_one_predictor_entry():
+    got = trainer_lib.summarize_norms(
+        {'predictor.layers.0': 3.0, 'predictor.layers.1': 4.0, 'head': 2.0})
+    assert got == {'predictor': pytest.approx(5.0), 'head': 2.0}
