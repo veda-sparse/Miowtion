@@ -94,3 +94,5 @@
 | 换成只训最长几何后，分配器报 OOM 告警（free 0.6 GiB 却要 3.4 GiB） | 混训时 t102 每 12 条轨迹才来一次，只训 t102 时每次几何切换都是大张量换大张量，缺的是连续性不是总量 | `offload_blocks` 44 → 48，并用 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`；`mlp_chunk_rows` 不能动（影响数值） | [training](features/training.md) |
 | 104k token 时报 `expandable_segments: memory mapping failed ... (free: 20 MB)` | 和碎片无关，是显存真的用尽：收集器同时持有 q / k 两份 512 MiB 的 tile 序副本 | `_COLLECT_BYTES` 512 → 256 MiB、`offload_blocks` → 50、启动加 `garbage_collection_threshold:0.8`；头之间独立，chunk 大小不改结果 | [training](features/training.md) |
 | 训练跑着时另起教师进程，权重刚载完就被静默 kill | 不是显存：再开一份 33B 教师要约 66 GB pinned 主机内存（`HostSlabs`），训练已经占掉了大部分，内核 OOM killer 不留回溯 | 离线探针和训练错开跑；判断依据是日志停在 `load weights ... done` 且进程无回溯地消失 | [quant_scoring](features/quant_scoring.md) |
+| `bf16+smoothk` 不是恒等 | 先把 `x - mean` 落回 bf16 再量化，把减法自己丢掉的位算在平滑头上；真实硬件里这一步在 fp32 累加器里 | `fake_quantize` 全程 fp32，最后才 `.to(x.dtype)` | [quant_scoring](features/quant_scoring.md) |
+| fp8 bundle 在单测里没有"减半" | safetensors 的 header 在玩具尺寸下比权重还大 | 阈值放到 0.75；真实尺寸上才是 550,635,792 → 275,415,648 字节 | [quant_scoring](features/quant_scoring.md) |

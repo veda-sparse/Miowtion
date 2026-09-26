@@ -152,3 +152,62 @@ def test_empty_weights_and_empty_plans_are_rejected(tmp_path):
                          veda_plan.PlanTable([]), num_layers=_LAYERS,
                          num_heads=_HEADS, head_dim=_DIM, keep_ratio=0.1,
                          source='x', source_weights='live', step=0)
+
+
+def test_fp8_round_trip_reproduces_the_stored_values(tmp_path):
+    """fp8 loads back as bf16, exactly the dequantized stored bits."""
+    path, state = _write(tmp_path, dtype=torch.float8_e4m3fn)
+    got = veda_bundle.load(path).predictor.state_dict()
+    with safe_open(path, framework='pt', device='cpu') as f:
+        keys = sorted(f.keys())
+        stored = {k: f.get_tensor(k) for k in keys}
+    assert sorted(state) == [k for k in keys if not k.endswith('.__scale')]
+    for name, value in state.items():
+        assert stored[name].dtype == torch.float8_e4m3fn
+        assert got[name].dtype == torch.bfloat16  # bmm has no e4m3 path
+        expect = veda_bundle._dequantize_fp8(
+            stored[name], stored[name + '.__scale'], torch.bfloat16)
+        assert torch.equal(got[name], expect)
+        # A per-head amax scale: 3 mantissa bits of the head's own range.
+        rel = (got[name].float() - value).abs().amax(dim=(1, 2))
+        assert (rel <= 2.0 ** -4 * value.abs().amax(dim=(1, 2))).all()
+
+
+def test_fp8_halves_the_file_against_bf16(tmp_path):
+    fp8, _ = _write(tmp_path / 'a', dtype=torch.float8_e4m3fn)
+    bf16, _ = _write(tmp_path / 'b', dtype=torch.bfloat16)
+    # The per-head scales and the json header ride along and dominate at
+    # this toy size, so the ratio is well above the asymptotic 0.5.
+    assert os.path.getsize(fp8) < 0.75 * os.path.getsize(bf16)
+
+
+def test_fp8_scale_is_per_head_and_maps_the_amax_onto_the_format():
+    weight = torch.randn(_HEADS, 3 * _DIM, _DIM)
+    weight[1] *= 1000.0  # one head far out of the others' range
+    values, scale = veda_bundle._quantize_fp8(weight)
+    assert scale.shape == (_HEADS,)
+    back = veda_bundle._dequantize_fp8(values, scale, torch.float32)
+    assert values.float().abs().amax().item() == pytest.approx(448.0, rel=0.3)
+    for head in range(_HEADS):
+        amax = weight[head].abs().amax()
+        assert (back[head] - weight[head]).abs().max() <= 2.0 ** -4 * amax
+
+
+def test_fp8_keeps_an_all_zero_head_at_zero():
+    weight = torch.randn(_HEADS, 3 * _DIM, _DIM)
+    weight[0] = 0.0
+    values, scale = veda_bundle._quantize_fp8(weight)
+    back = veda_bundle._dequantize_fp8(values, scale, torch.float32)
+    assert torch.equal(back[0], torch.zeros_like(back[0]))
+    assert not back.isnan().any()
+
+
+def test_fp8_bundle_without_a_scale_is_rejected(tmp_path):
+    path, _ = _write(tmp_path, dtype=torch.float8_e4m3fn)
+    with safe_open(path, framework='pt', device='cpu') as f:
+        metadata = dict(f.metadata())
+        tensors = {k: f.get_tensor(k) for k in f.keys()
+                   if not k.endswith('.__scale')}
+    save_file(tensors, path, metadata=metadata)
+    with pytest.raises(ValueError, match='without a .* scale'):
+        veda_bundle.load(path)

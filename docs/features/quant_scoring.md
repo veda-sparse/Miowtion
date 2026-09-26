@@ -28,6 +28,19 @@ O(S²D)，所以它是最该降精度的地方。问题只有一个：**降精�
 
   NVFP4 的两级 scale 不是我们加的近似：e4m3 的 block scale 自己也要可表示，所以规范里就有
   一个 per-tensor 的 fp32 外层 scale。
+
+- **smooth-K（`+smoothk` 后缀）**：任何方案名后面加 `+smoothk`，先减去 k 的逐通道均值再
+  量化，然后加回来。思路取自 SageAttention（arXiv:2410.02367，只借思路，没有拷贝代码）：
+  k 的各个通道带着一个很大的公共偏移，量化范围被这个偏移吃掉，而它对区分不同的 key 毫无
+  贡献。
+  - **为什么对选择是无损的**：`q·(k − μ) = q·k − q·μ`，而 `q·μ` 只和 query 有关 ——
+    每行一个常数，top-k 不变。所以平滑不是近似，它只是把量化误差挪到一个选择看不见的
+    地方。`tests/unit/test_veda_quant.py::test_smoothing_does_not_move_the_top_k_of_the_
+    exact_scores` 直接对精确分数断言 `argsort` 相等。
+  - **只平滑 k，不平滑 q**：减 q 的均值会引入 `μ_q·k`，这一项随 key 变化，会真的改变每行
+    内部的排序。所以 `QuantHeatProbe` 对 q 一律用 `base_scheme(scheme)`。
+  - **残差保持 fp32**：`x.float() - mean` 之后才交给量化器。减法是量化器在自己的累加器里
+    做的预处理，先把它舍入回输入 dtype 等于让平滑替硬件不会犯的错误背锅（见踩坑记录）。
 - **`bf16` 是对照组**，它必须回报 recall 1.0、rel_l2 0。回报别的数值说明测量本身坏了，
   而不是方案坏了。
 - **LSE 一律用精确值**。top-k 对每行常数不变，所以 LSE 不可能改变选择；统一用精确 LSE 只是
@@ -40,6 +53,24 @@ O(S²D)，所以它是最该降精度的地方。问题只有一个：**降精�
 - 汇总按**头数加权**：一层里的头组大小不同（2 头的组和 30 头的组），不加权的平均会把小组
   放大。
 
+## 打分器权重的存储精度（bf16 / fp8）
+
+上面测的是**激活**（q/k）的精度。另一条正交的线是**打分器权重**的存储精度：bundle 里
+50 层 × 56 头 × 128 的 `proj_q/proj_k/embed`，bf16 是 525 MiB。
+
+- `bundle.save(..., dtype=torch.float8_e4m3fn)` 每个张量按**第 0 维（头）**取 amax，映射到
+  e4m3 的 448.0，scale 以 `<key>.__scale` 的名字并排存 fp32。文件从 550,635,792 字节降到
+  275,415,648 字节。
+- **fp8 省的是文件和加载，不是常驻显存**：`load()` 读回来立刻反量化成 bf16 参数，因为
+  `torch.bmm` 和 `LayerPredictor.embed` 都没有 e4m3 的路径。所以它真正回答的问题是
+  **3 位尾数的权重舍入会不会改变选出来的块**，而不是省显存。
+- 缺 scale 直接 `ValueError`，不静默当成 1.0 —— 一个被当成 1.0 的 fp8 权重看起来还是能跑，
+  只是分数全错。
+- 测量用 `PredictorProbe` / `scripts/predictor_precision.py`：同一 step 的若干 bundle
+  （第一个是参考）在同一条教师轨迹上打分，除了 `recall` / `heat_kept` / `heat_ceiling`
+  之外多报一个 **`agree`** —— 与参考 bundle 自己选择的重合度。recall 混着"打分器好不好"，
+  `agree` 才单独回答"舍入动了多少"。脚本拒绝 step 不同的 bundle，否则舍入和训练会混在一起。
+
 ## 代码位置与接口
 
 - `miowtion/veda/quant.py`
@@ -48,21 +79,33 @@ O(S²D)，所以它是最该降精度的地方。问题只有一个：**降精�
   - `QuantHeatProbe`：插在 `TeacherCollector` 的位置上的注意力函数。残差流走的仍然是稠密
     教师（逐位不变），额外在每个被测层上算一次精确热力图 + 每个方案一次，然后比较 top-k。
     `layer_every` / `q_tile_fraction` 控制成本（指标是对 query tile 的均值，子采样无偏）。
+  - `base_scheme(scheme)`：去掉 `+smoothk` 后缀，拿到底层方案名。
   - `QuantRecord`、`summarize()`。
+  - `PredictorProbe`、`PredictorRecord`、`summarize_predictor()`：同一位置的探针，比较的
+    不是量化方案而是若干个打分器 bundle。
+- `miowtion/veda/bundle.py`：`DTYPES` 增加 `float8_e4m3fn`，`save/load` 处理
+  `.__scale` 伴随张量。
+- `scripts/predictor_precision.py`：多个 `--bundle NAME=PATH`，输出 `records.jsonl` +
+  `summary.json`（overall / per_step，含每个 bundle 的路径、dtype、字节数）。
 - `scripts/quant_topk_error.py`：沿教师的少步轨迹滚一个 sample（全程稠密），把逐
   (step, layer, head group, scheme) 的记录写成 `records.jsonl`，汇总写成 `summary.json`。
   不训练、不需要打分器 —— 这测的是打分这一步本身。
 
 ## 测试
 
-- `tests/unit/test_veda_quant.py`（32 个）：
+- `tests/unit/test_veda_quant.py`（45 个）：
   - 每个方案的形状 / dtype 不变，全零输入不产生 NaN；
   - 每个方案的逐元素误差落在该格式自己的舍入步长内（e4m3 2⁻⁴、e5m2 2⁻³、e2m1 1/3）；
   - e2m1 落在八个电平上、e8m0 scale 向上取到 2 的幂、mxfp8 在它能精确表示的块上逐位还原；
   - per-row e4m3 在尺度失衡的张量上严格优于 per-head e4m3；
   - `summarize` 的头数加权、NaN 跳过；
   - CPU 上的 probe 端到端：返回的输出与稠密逐位相等，`bf16` 对照组 recall 恰为 1.0、
-    误差恰为 0，且 `heat_kept <= heat_ceiling`。
+    误差恰为 0，且 `heat_kept <= heat_ceiling`；
+  - smooth-K：`bf16+smoothk` 是恒等（残差保持 fp32 才成立），平滑不改变精确分数的
+    `argsort`，平滑后的 k 在量化前的动态范围更小，未知后缀直接报错。
+- `tests/unit/test_veda_bundle.py`（16 个）：fp8 往返的 per-head 相对误差在 e4m3 的舍入
+  步长内、文件比 bf16 小、载回来是 bf16 参数、缺 scale 报错、scale 张量不混进权重。
+- `tests/unit/test_scripts_predictor_precision.py`（3 个）：`--bundle` 解析与重名报错。
 
 ## 踩坑记录
 
@@ -71,6 +114,13 @@ O(S²D)，所以它是最该降精度的地方。问题只有一个：**降精�
   静默 kill，日志里没有任何 traceback（不是 CUDA OOM，是内核的 OOM killer）。**判断依据：
   日志停在 `load weights ... done`，进程消失且无回溯。** 对策：这类离线探针要和训练错开跑，
   别和训练抢主机内存；空闲的 GPU 并不代表能再开一份教师。
+- **平滑的残差不能先落回 bf16**：`(x - mean).to(bf16)` 之后再量化，`bf16+smoothk` 就不再是
+  恒等 —— 减法本身丢掉的位被算进了平滑的账上。但真实硬件里这个减法发生在量化器的 fp32
+  累加器中，不存在这次舍入。对策：`fake_quantize` 全程用 `x.float()`，最后才 `.to(x.dtype)`。
+  现象是 `test_smoothing_is_the_identity_for_bf16` 失败。
+- **fp8 bundle 的"减半"在小文件上看不出来**：safetensors 的 header 在玩具尺寸下比权重还
+  大，单元测试里 fp8 文件只比 bf16 小 35%。对策：测试的阈值放到 0.75 并写明原因，真正的
+  一半要在真实尺寸上看（550,635,792 → 275,415,648 字节）。
 
 ## 验证记录
 

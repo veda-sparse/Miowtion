@@ -22,6 +22,11 @@ projection it selects (`proj.index_select(0, heads).float()`), so the
 scoring arithmetic is fp32 whatever the storage dtype is; keeping fp32 on
 disk only doubles the file and, more importantly, doubles the resident copy
 each inference replica holds on its own card.
+
+`float8_e4m3fn` is offered one step below bf16, with a per-head amax scale
+alongside each tensor. It loads back as bf16 parameters (bmm has no e4m3
+path), so it halves the file and the load, not the resident copy; its real
+use is to measure what three mantissa bits do to the selected block set.
 """
 
 from __future__ import annotations
@@ -40,13 +45,48 @@ FORMAT = 'miowtion-veda-predictor-v1'
 
 _PREFIX = 'predictor.'
 
-# Storage dtypes. fp8 is deliberately absent: e4m3 carries 3 mantissa bits,
-# which perturbs the block logits enough to reorder the top-k, and would
-# need a per-head scale to be safe.
-DTYPES = {'float32': torch.float32, 'bfloat16': torch.bfloat16}
+# Storage dtypes. e4m3 carries 3 mantissa bits, so it is only offered with
+# a per-head amax scale (see `_quantize_fp8`): the projections of different
+# heads differ in scale by more than e4m3's exponent range leaves room for
+# once the mantissa is that short. Whether the rounding reorders the top-k
+# is a measurement, not an assumption -- see docs/features/quant_scoring.md.
+DTYPES = {'float32': torch.float32, 'bfloat16': torch.bfloat16,
+          'float8_e4m3fn': torch.float8_e4m3fn}
+
+# Largest finite e4m3 value; the per-head amax is mapped onto it.
+_E4M3_MAX = 448.0
+
+# Suffix of the per-head scale that accompanies every fp8 tensor. It is not
+# a state-dict key, so it is stripped before the weights reach the module.
+_SCALE_SUFFIX = '.__scale'
 
 # Bundles written before the dtype was recorded are fp32.
 _LEGACY_DTYPE = 'float32'
+
+
+def _quantize_fp8(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Splits `[H, ...]` weights into e4m3 values and a per-head scale.
+
+    The scale maps each head's amax onto the largest finite e4m3 value, so
+    the whole exponent budget of the format is spent on that head's own
+    range. A head of all zeros gets a tiny scale and stays zero.
+
+    Returns:
+        (values `[H, ...]` e4m3, scale `[H]` fp32) with
+        `weight ~= values * scale`.
+    """
+    dims = tuple(range(1, weight.dim()))
+    amax = weight.float().abs().amax(dim=dims)
+    scale = (amax / _E4M3_MAX).clamp(min=torch.finfo(torch.float32).tiny)
+    values = weight.float() / scale.view(-1, *([1] * len(dims)))
+    return values.to(torch.float8_e4m3fn).contiguous(), scale.contiguous()
+
+
+def _dequantize_fp8(values: torch.Tensor, scale: torch.Tensor,
+                    dtype: torch.dtype) -> torch.Tensor:
+    """Inverse of `_quantize_fp8`, into `dtype`."""
+    dims = values.dim() - 1
+    return (values.float() * scale.view(-1, *([1] * dims))).to(dtype)
 
 
 @dataclasses.dataclass
@@ -101,8 +141,16 @@ def save(path: str, weights: dict[str, torch.Tensor],
     prefixed = [k for k in weights if k.startswith(_PREFIX)]
     if prefixed and len(prefixed) != len(weights):
         raise ValueError('weights mix prefixed and bare keys')
-    tensors = {k[len(_PREFIX):] if prefixed else k: v.to(dtype).contiguous()
-               for k, v in weights.items()}
+    bare = {k[len(_PREFIX):] if prefixed else k: v
+            for k, v in weights.items()}
+    if dtype is torch.float8_e4m3fn:
+        tensors = {}
+        for key, value in bare.items():
+            values, scale = _quantize_fp8(value)
+            tensors[key] = values
+            tensors[key + _SCALE_SUFFIX] = scale
+    else:
+        tensors = {k: v.to(dtype).contiguous() for k, v in bare.items()}
     if not plans.plans:
         raise ValueError('bundle without plans; pass the run\'s plan table')
     metadata = {
@@ -158,10 +206,29 @@ def load(path: str, device: torch.device | str = 'cpu') -> Bundle:
     model = veda_predictor.TileScorePredictor(int(metadata['num_layers']),
                                               int(metadata['num_heads']),
                                               int(metadata['head_dim']))
+    resident = DTYPES[stored]
+    if stored == 'float8_e4m3fn':
+        # The parameters come back in bf16: `LayerPredictor.embed` reads
+        # them with `.float()` and `torch.bmm`, neither of which takes an
+        # e4m3 tensor. fp8 therefore buys a file (and a host-to-device
+        # copy) half the size of bf16, not a smaller resident copy; what
+        # the bundle keeps is exactly the rounding, so its effect on the
+        # top-k is measurable against the bf16 export of the same step.
+        resident = torch.bfloat16
+        scales = {k[:-len(_SCALE_SUFFIX)]: v for k, v in tensors.items()
+                  if k.endswith(_SCALE_SUFFIX)}
+        values = {k: v for k, v in tensors.items()
+                  if not k.endswith(_SCALE_SUFFIX)}
+        missing = sorted(set(values) - set(scales))
+        if missing:
+            raise ValueError(f'{path}: fp8 tensors without a '
+                             f'{_SCALE_SUFFIX} scale: {missing}')
+        tensors = {k: _dequantize_fp8(v, scales[k], resident)
+                   for k, v in values.items()}
     # Before the load, not after: load_state_dict copies into the existing
     # parameter, so an fp32 module would silently upcast a bf16 file back to
     # fp32 and hold twice the memory the bundle was exported to save.
-    model = model.to(DTYPES[stored])
+    model = model.to(resident)
     shape = (f'{metadata["num_layers"]} layers x {metadata["num_heads"]} '
              f'heads x {metadata["head_dim"]}')
     try:

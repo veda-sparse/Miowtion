@@ -24,6 +24,21 @@ the scaled dot product, so per-row scaling is free at the GEMM level):
   mxfp8_e4m3      e4m3 values, e8m0 (power-of-two) scale per 32 elements
   mxfp4           e2m1 values, e8m0 scale per 32 elements   (finest 4-bit)
 
+Any scheme can carry the `+smoothk` suffix, which subtracts k's
+per-channel mean over rows before the rounding and adds it back after.
+This is SageAttention's smoothing (arXiv:2410.02367; the idea only, no
+code): k's channels carry a large common offset, which eats the quantized
+range without carrying any information -- every key has it, so it cannot
+separate keys. Removing it before the rounding spends the mantissa on the
+part that varies.
+
+On k the correction is free *and* exactly top-k preserving here:
+q . (k - mu) = q . k - q . mu, and the subtracted term depends only on the
+query, so it is one constant per row -- which is precisely what the
+selection is invariant to. On q the mirror term is mu_q . k, which varies
+per key, so smoothing q would need that term computed and added back; it
+is not offered.
+
 `bf16` is the identity, kept as a control: it must come back with recall
 1.0, otherwise the measurement, not the scheme, is broken.
 """
@@ -56,6 +71,9 @@ _E2M1_EDGES = (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)
 # Block sizes of the micro-scaled formats, along the head dimension.
 _NVFP4_BLOCK = 16
 _MX_BLOCK = 32
+
+# Scheme suffix selecting SageAttention-style smoothing of k.
+_SMOOTH_SUFFIX = '+smoothk'
 
 
 def _round_e2m1(x: torch.Tensor) -> torch.Tensor:
@@ -144,27 +162,43 @@ SCHEMES = {
 }
 
 
+def base_scheme(scheme: str) -> str:
+    """`scheme` without its smoothing suffix."""
+    return (scheme[:-len(_SMOOTH_SUFFIX)] if scheme.endswith(_SMOOTH_SUFFIX)
+            else scheme)
+
+
 def fake_quantize(x: torch.Tensor, scheme: str) -> torch.Tensor:
     """Quantizes and dequantizes one tile-ordered tensor.
 
     Args:
         x: [N, H, D] tile-ordered q or k (bf16 in training and inference).
-        scheme: A key of SCHEMES.
+        scheme: A key of SCHEMES, optionally with the `+smoothk` suffix,
+            which subtracts the per-channel mean over rows before the
+            rounding and adds it back after. Apply it to k only: see the
+            module docstring for why it is free on k and not on q.
 
     Returns:
         A tensor of x's shape and dtype, holding only values the scheme can
-        represent (times its scale).
+        represent (times its scale), plus the mean that was added back.
 
     Raises:
         ValueError: On an unknown scheme.
     """
-    if scheme not in SCHEMES:
+    base = base_scheme(scheme)
+    if base not in SCHEMES:
         raise ValueError(f'scheme must be one of {sorted(SCHEMES)}, got '
                          f'{scheme!r}')
     if x.ndim != 3:
         raise ValueError(f'expected [N, H, D] tile-ordered rows, got '
                          f'{tuple(x.shape)}')
-    return SCHEMES[scheme](x)
+    if base == scheme:
+        return SCHEMES[base](x)
+    # The residual stays fp32: the subtraction is a preprocessing step the
+    # quantizer does on its own accumulators, so rounding it to the input
+    # dtype first would charge smoothing for an error hardware never pays.
+    mean = x.float().mean(dim=0, keepdim=True)
+    return (SCHEMES[base](x.float() - mean) + mean).to(x.dtype)
 
 
 @dataclasses.dataclass
@@ -221,7 +255,7 @@ class QuantHeatProbe:
             ValueError: On an unknown scheme or a non-positive setting.
         """
         for scheme in schemes:
-            if scheme not in SCHEMES:
+            if base_scheme(scheme) not in SCHEMES:
                 raise ValueError(f'unknown scheme {scheme!r}')
         if not 0.0 < q_tile_fraction <= 1.0:
             raise ValueError('q_tile_fraction must be in (0, 1]')
@@ -269,7 +303,8 @@ class QuantHeatProbe:
                 norm = exact.float().pow(2).sum().sqrt()
                 for scheme in self.schemes:
                     heat = heatmap.teacher_heat(
-                        fake_quantize(q_tiles, scheme),
+                        # Smoothing is a k-side correction only.
+                        fake_quantize(q_tiles, base_scheme(scheme)),
                         fake_quantize(k_tiles, scheme), lse_tiles,
                         tile_layout, rows)
                     diag = heatmap.mask_diagnostics(
@@ -290,6 +325,31 @@ class QuantHeatProbe:
         return out
 
 
+_MEAN_FIELDS = ('recall', 'heat_kept', 'heat_ceiling', 'rel_l2')
+
+
+def _summarize(records, key: str,
+               fields: tuple[str, ...]) -> dict[str, dict[str, float]]:
+    """Head-weighted means of `fields`, grouped by `record.<key>`."""
+    out: dict[str, dict[str, float]] = {}
+    for record in records:
+        acc = out.setdefault(getattr(record, key), {'weight': 0.0})
+        weight = float(record.heads)
+        acc['weight'] += weight
+        for field in fields:
+            value = getattr(record, field)
+            if not math.isnan(value):
+                acc[field] = acc.get(field, 0.0) + weight * value
+        acc['max_abs'] = max(acc.get('max_abs', 0.0), record.max_abs)
+    for acc in out.values():
+        weight = acc.pop('weight')
+        for field in fields:
+            acc[field] = acc.get(field, 0.0) / weight
+        acc['kept_vs_ceiling'] = (acc['heat_kept']
+                                  / max(acc['heat_ceiling'], 1e-30))
+    return out
+
+
 def summarize(records: list[QuantRecord]) -> dict[str, dict[str, float]]:
     """Head-weighted means per scheme over every step, layer and group.
 
@@ -301,20 +361,150 @@ def summarize(records: list[QuantRecord]) -> dict[str, dict[str, float]]:
         kept_vs_ceiling}, the last being the share of the attainable heat
         mass the scheme's selection actually keeps.
     """
-    out = {}
-    for record in records:
-        acc = out.setdefault(record.scheme, {'weight': 0.0})
-        weight = float(record.heads)
-        acc['weight'] += weight
-        for field in ('recall', 'heat_kept', 'heat_ceiling', 'rel_l2'):
-            value = getattr(record, field)
-            if not math.isnan(value):
-                acc[field] = acc.get(field, 0.0) + weight * value
-        acc['max_abs'] = max(acc.get('max_abs', 0.0), record.max_abs)
-    for acc in out.values():
-        weight = acc.pop('weight')
-        for field in ('recall', 'heat_kept', 'heat_ceiling', 'rel_l2'):
-            acc[field] = acc.get(field, 0.0) / weight
-        acc['kept_vs_ceiling'] = (acc['heat_kept']
-                                  / max(acc['heat_ceiling'], 1e-30))
-    return out
+    return _summarize(records, 'scheme', _MEAN_FIELDS)
+
+
+def summarize_predictor(
+        records: list['PredictorRecord']) -> dict[str, dict[str, float]]:
+    """`summarize` for predictor variants; adds `agree`."""
+    return _summarize(records, 'variant', _MEAN_FIELDS + ('agree',))
+
+
+@dataclasses.dataclass
+class PredictorRecord:
+    """One (step, layer, head group, predictor variant) measurement."""
+
+    step: int
+    layer: int
+    shape: str
+    heads: int
+    variant: str
+    recall: float        # top-k overlap with the teacher's own top-k
+    heat_kept: float     # true heat mass this variant's selection keeps
+    heat_ceiling: float  # the most any predictor could keep at this budget
+    agree: float         # top-k overlap with the reference variant
+    rel_l2: float        # block logits against the reference variant
+    max_abs: float
+
+    def to_json(self) -> dict:
+        return dataclasses.asdict(self)
+
+
+class PredictorProbe:
+    """Dense attention that also scores each layer with several predictors.
+
+    Built to compare storage precisions of one trained predictor (a bf16
+    export against an fp8 one, say). Every variant sees the same tiles, the
+    same sampled query rows and the same teacher heat, so the only thing
+    that differs between their numbers is their own weights.
+
+    Two questions are answered at once. `recall` / `heat_kept` are each
+    variant against the teacher -- the number that decides picture quality.
+    `agree` is each variant against the reference variant's *own*
+    selection, which isolates the effect of the rounding from how good the
+    predictor was to begin with: a variant can lose little recall while
+    picking noticeably different blocks, and only `agree` shows that.
+    """
+
+    def __init__(self, clip, plan: veda_plan.TilePlan,
+                 predictors: dict, reference: str,
+                 q_tile_fraction: float = 1.0, layer_every: int = 1,
+                 dense_backend: str = 'auto',
+                 generator: torch.Generator | None = None):
+        """Initializes the probe.
+
+        Args:
+            clip: ClipTiling of the current clip.
+            plan: Tile plan of the geometry.
+            predictors: variant name -> TileScorePredictor, already on the
+                clip's device and in eval mode.
+            reference: Variant the others are compared against; also the
+                one whose selection `agree` is measured against.
+            q_tile_fraction: Fraction of video query tiles measured per
+                layer and head group.
+            layer_every: Measure every n-th layer.
+            dense_backend: Kernel for the dense teacher.
+            generator: Draws the measured query tiles (CPU generator).
+
+        Raises:
+            ValueError: If `predictors` is empty, `reference` is not one of
+                them, or a setting is non-positive.
+        """
+        if not predictors:
+            raise ValueError('no predictor variants to compare')
+        if reference not in predictors:
+            raise ValueError(f'reference {reference!r} is not one of '
+                             f'{sorted(predictors)}')
+        if not 0.0 < q_tile_fraction <= 1.0:
+            raise ValueError('q_tile_fraction must be in (0, 1]')
+        if layer_every < 1:
+            raise ValueError('layer_every must be >= 1')
+        self.clip = clip
+        self.plan = plan
+        self.predictors = predictors
+        self.reference = reference
+        self.q_tile_fraction = q_tile_fraction
+        self.layer_every = layer_every
+        self.dense_backend = dense_backend
+        self.generator = generator or torch.Generator().manual_seed(0)
+        self.step = 0
+        self.records: list[PredictorRecord] = []
+
+    def _rows(self, tile_layout: tiling.TileLayout) -> torch.Tensor:
+        n_video = tile_layout.n_video_tiles
+        count = max(1, min(n_video, round(self.q_tile_fraction * n_video)))
+        rows = torch.randperm(n_video, generator=self.generator)[:count]
+        return rows.sort().values.to(self.clip.device)
+
+    @torch.no_grad()
+    def __call__(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                 layer_index: int) -> torch.Tensor:
+        from miowtion.veda import attention as veda_attention  # pylint: disable=import-outside-toplevel
+        out, lse = h3_attention.dense_attention(
+            q, k, v, self.clip.layout.used, return_lse=True,
+            backend=self.dense_backend)
+        if layer_index % self.layer_every:
+            return out
+        for group in self.plan.head_groups(layer_index, self.clip.device):
+            tile_layout = self.clip.get(group.shape)
+            blocks = self.clip.blocks(tile_layout)
+            rows = self._rows(tile_layout)
+            chunk = veda_attention._chunk_heads(tile_layout)  # pylint: disable=protected-access
+            for heads in group.heads.split(chunk):
+                q_tiles, feats_q = veda_attention._gather_and_pool(  # pylint: disable=protected-access
+                    q, tile_layout, heads)
+                k_tiles, feats_k = veda_attention._gather_and_pool(  # pylint: disable=protected-access
+                    k, tile_layout, heads)
+                heat = heatmap.teacher_heat(
+                    q_tiles, k_tiles,
+                    veda_attention._gather_lse(lse, tile_layout, heads),  # pylint: disable=protected-access
+                    tile_layout, rows)
+                del q_tiles, k_tiles
+                logits = {
+                    name: model.layers[layer_index](feats_q[:, rows],
+                                                    feats_k, heads)
+                    for name, model in self.predictors.items()}
+                ref = logits[self.reference].float()
+                norm = ref.pow(2).sum().sqrt()
+                for name, value in logits.items():
+                    diag = heatmap.mask_diagnostics(
+                        value, heat, tile_layout, blocks, rows)
+                    # The reference's selection as the oracle: this reads
+                    # only 'recall', the heat shares of that call would be
+                    # against logits, which are not a heat.
+                    agree = heatmap.mask_diagnostics(
+                        value, ref, tile_layout, blocks, rows)['recall']
+                    delta = value.float() - ref
+                    self.records.append(PredictorRecord(
+                        step=self.step, layer=layer_index,
+                        shape=str(group.shape), heads=int(heads.numel()),
+                        variant=name,
+                        recall=float(diag['recall']),
+                        heat_kept=float(diag['heat_kept']),
+                        heat_ceiling=float(diag['heat_ceiling']),
+                        agree=float(agree),
+                        rel_l2=float(delta.pow(2).sum().sqrt()
+                                     / norm.clamp(min=1e-30)),
+                        max_abs=float(delta.abs().max())))
+                del heat, logits, feats_q, feats_k
+        return out

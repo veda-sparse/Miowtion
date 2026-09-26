@@ -38,7 +38,9 @@ def main():
                         choices=sorted(veda_bundle.DTYPES),
                         help='storage dtype; scoring upcasts to fp32 either '
                         'way, so bf16 just halves the file and the copy '
-                        'every inference replica holds on its card')
+                        'every inference replica holds on its card. '
+                        'float8_e4m3fn halves the file again (per-head '
+                        'amax scale) but loads back as bf16')
     parser.add_argument('--ema', action='store_true',
                         help='export the EMA shadow instead of the live '
                         'weights (the live weights are the default: the '

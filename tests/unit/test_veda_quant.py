@@ -183,3 +183,129 @@ def test_probe_skips_layers_outside_the_stride():
     assert not probe.records
     probe(q, k, v, 0)
     assert [r.layer for r in probe.records] == [0]
+
+
+_SMOOTH = ['fp8_e4m3_row+smoothk', 'nvfp4+smoothk', 'mxfp4+smoothk']
+
+
+@pytest.mark.parametrize('scheme', _SMOOTH)
+def test_smoothing_keeps_shape_and_dtype(scheme):
+    x = _rows()
+    out = quant.fake_quantize(x, scheme)
+    assert out.shape == x.shape and out.dtype == x.dtype
+
+
+def test_base_scheme_strips_the_suffix():
+    assert quant.base_scheme('nvfp4+smoothk') == 'nvfp4'
+    assert quant.base_scheme('nvfp4') == 'nvfp4'
+
+
+def test_smoothing_is_the_identity_for_bf16():
+    x = _rows()
+    assert torch.equal(quant.fake_quantize(x, 'bf16+smoothk'), x)
+
+
+@pytest.mark.parametrize('scheme', ['fp8_e4m3_row', 'nvfp4', 'mxfp4'])
+def test_smoothing_helps_when_the_channels_carry_an_offset(scheme):
+    """The case SageAttention's smoothing targets: a large common offset.
+
+    Every key carries it, so it separates no keys; it only eats the
+    quantized range. Subtracting it before the rounding must reduce the
+    error of the part that does vary.
+    """
+    signal = _rows(n=512, dim=64, seed=1).float()
+    offset = 20.0 * torch.randn(1, 4, 64, generator=
+                                torch.Generator().manual_seed(2))
+    x = (signal + offset).bfloat16()
+    ref = x.float()
+    plain = (quant.fake_quantize(x, scheme).float() - ref).abs().mean()
+    smooth = (quant.fake_quantize(x, scheme + '+smoothk').float()
+              - ref).abs().mean()
+    assert smooth < 0.5 * plain
+
+
+def test_smoothing_does_not_move_the_top_k_of_the_exact_scores():
+    """q . (k - mu) differs from q . k by a per-row constant only.
+
+    That is the invariance the whole selection rests on, so it is asserted
+    on the scores themselves, with no quantization in the way.
+    """
+    gen = torch.Generator().manual_seed(4)
+    q = torch.randn(32, 2, 16, generator=gen)
+    k = torch.randn(256, 2, 16, generator=gen)
+    mean = k.mean(dim=0, keepdim=True)
+    plain = torch.einsum('qhd,khd->hqk', q, k)
+    shifted = torch.einsum('qhd,khd->hqk', q, k - mean)
+    assert torch.equal(plain.argsort(dim=-1, descending=True),
+                       shifted.argsort(dim=-1, descending=True))
+
+
+def test_probe_accepts_smoothed_schemes():
+    _, (q, k, v), probe = _tiny_probe_case(['bf16', 'mxfp4+smoothk'])
+    probe(q, k, v, 0)
+    assert sorted({r.scheme for r in probe.records}) == ['bf16',
+                                                         'mxfp4+smoothk']
+
+
+def _tiny_predictor_case(variants, reference='bf16', layer_every=1):
+    from miowtion.veda import predictor as veda_predictor
+    lay, qkv, base = _tiny_probe_case(['bf16'], layer_every=layer_every)
+    torch.manual_seed(5)
+    model = veda_predictor.TileScorePredictor(1, 4, 32).to(torch.bfloat16)
+    models = {}
+    for name in variants:
+        copy = veda_predictor.TileScorePredictor(1, 4, 32).to(torch.bfloat16)
+        state = model.state_dict()
+        if name != 'bf16':
+            from miowtion.veda import bundle as veda_bundle
+            state = {k: veda_bundle._dequantize_fp8(
+                *veda_bundle._quantize_fp8(v.float()), torch.bfloat16)
+                for k, v in state.items()}
+        copy.load_state_dict(state)
+        models[name] = copy.eval()
+    probe = quant.PredictorProbe(base.clip, base.plan, models, reference,
+                                 layer_every=layer_every,
+                                 dense_backend='math')
+    return lay, qkv, probe
+
+
+def test_predictor_probe_measures_every_variant_against_the_reference():
+    from miowtion.h3 import attention as h3_attention
+    lay, (q, k, v), probe = _tiny_predictor_case(['bf16', 'fp8'])
+    out = probe(q, k, v, 0)
+    dense = h3_attention.dense_attention(q, k, v, lay.used, backend='math')[0]
+    assert torch.equal(out, dense)  # the residual stream is untouched
+    by_variant = {r.variant: r for r in probe.records}
+    assert sorted(by_variant) == ['bf16', 'fp8']
+    ref = by_variant['bf16']
+    assert ref.agree == 1.0 and ref.rel_l2 == 0.0 and ref.max_abs == 0.0
+    for record in probe.records:
+        assert 0.0 <= record.heat_kept <= record.heat_ceiling <= 1.0
+        assert 0.0 <= record.agree <= 1.0
+    # Both variants face the same teacher, so the ceiling cannot differ.
+    assert ref.heat_ceiling == by_variant['fp8'].heat_ceiling
+
+
+def test_predictor_probe_rejects_bad_settings():
+    from miowtion.veda import predictor as veda_predictor
+    model = veda_predictor.TileScorePredictor(1, 4, 32)
+    with pytest.raises(ValueError, match='no predictor variants'):
+        quant.PredictorProbe(None, None, {}, 'bf16')
+    with pytest.raises(ValueError, match='reference'):
+        quant.PredictorProbe(None, None, {'bf16': model}, 'fp8')
+    with pytest.raises(ValueError, match='layer_every'):
+        quant.PredictorProbe(None, None, {'bf16': model}, 'bf16',
+                             layer_every=0)
+
+
+def test_summarize_predictor_weighs_by_heads_and_keeps_agree():
+    records = [
+        quant.PredictorRecord(0, 0, '8x4x4', 30, 'fp8', 0.9, 0.5, 0.5, 1.0,
+                              1e-3, 1e-2),
+        quant.PredictorRecord(0, 0, '2x8x8', 10, 'fp8', 0.5, 0.1, 0.5, 0.0,
+                              3e-3, 5e-2),
+    ]
+    out = quant.summarize_predictor(records)['fp8']
+    assert out['recall'] == pytest.approx(0.8)
+    assert out['agree'] == pytest.approx(0.75)
+    assert out['kept_vs_ceiling'] == pytest.approx(0.8)

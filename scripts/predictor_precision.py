@@ -1,16 +1,19 @@
-"""Measures how fp8 / fp4 block scoring moves the Veda top-k selection.
+"""Compares predictor bundles of the same step at different precisions.
 
 Rolls one sample along the teacher's few-step trajectory (dense attention
 throughout, exactly as stage-1 training does) and, at every measured layer,
-compares the block top-k chosen from quantized q / k against the one chosen
-from the bf16 teacher heat. Nothing is trained and no predictor is needed:
-this is about the scoring pass itself.
+scores the blocks with each bundle. Reports each bundle against the teacher
+(recall, heat_kept) and against the first bundle's own selection (agree), so
+a storage precision can be judged on the only thing that matters: the set of
+blocks it picks.
 
-    CUDA_VISIBLE_DEVICES=3 python scripts/quant_topk_error.py \\
+    CUDA_VISIBLE_DEVICES=0 python scripts/predictor_precision.py \\
         --root weights/MiniMax-H3 --adapter weights/turbo_lora/<lora> \\
         --sample-cache artifacts/samples/<cache> --sample-id <id> \\
-        --geometry 16:9@37 --plan-dir runs/<search>/plans \\
-        --out-dir runs/quant_topk/<name>
+        --geometry 16:9@102 \\
+        --bundle bf16=weights/veda/<step>_bf16.safetensors \\
+        --bundle fp8=weights/veda/<step>_fp8.safetensors \\
+        --out-dir runs/predictor_precision/<name>
 """
 
 import argparse
@@ -19,15 +22,14 @@ import os
 
 import torch
 
-from miowtion.h3 import model as h3_model
 from miowtion.train import data
 from miowtion.train import parallel
 from miowtion.train import teacher as teacher_lib
 from miowtion.train import trajectory as traj_lib
 from miowtion.utils import progress
 from miowtion.veda import attention as veda_attention
+from miowtion.veda import bundle as veda_bundle
 from miowtion.veda import mask as veda_mask
-from miowtion.veda import plan as veda_plan
 from miowtion.veda import quant
 
 
@@ -40,17 +42,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument('--adapter', default=None, help='few-step LoRA')
     parser.add_argument('--sample-cache', required=True)
     parser.add_argument('--sample-id', required=True)
-    parser.add_argument('--geometry', required=True, help="e.g. '16:9@37'")
-    parser.add_argument('--plan-dir', required=True)
-    parser.add_argument('--keep-ratio', type=float, default=0.1)
+    parser.add_argument('--geometry', required=True, help="e.g. '16:9@102'")
+    parser.add_argument('--bundle', action='append', required=True,
+                        metavar='NAME=PATH',
+                        help='a predictor bundle to measure; repeatable. '
+                        'The first one is the reference the others are '
+                        'compared against')
+    parser.add_argument('--keep-ratio', type=float, default=None,
+                        help='budget to select at; defaults to the one the '
+                        'reference bundle records')
     parser.add_argument('--seed', type=int, default=0)
-    parser.add_argument('--schemes', nargs='+',
-                        default=['bf16', 'fp8_e4m3_head', 'fp8_e4m3_row',
-                                 'fp8_e5m2_row', 'nvfp4', 'mxfp8_e4m3',
-                                 'mxfp4', 'fp8_e4m3_row+smoothk',
-                                 'nvfp4+smoothk', 'mxfp4+smoothk'],
-                        help='scheme names, optionally with the +smoothk '
-                        f'suffix; bases are {sorted(quant.SCHEMES)}')
     parser.add_argument('--q-tile-fraction', type=float, default=0.25,
                         help='share of query tiles measured per layer')
     parser.add_argument('--layer-every', type=int, default=1,
@@ -62,9 +63,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _parse_bundles(specs: list[str]) -> dict[str, str]:
+    """`['bf16=a.safetensors', ...]` -> ordered {name: path}."""
+    out: dict[str, str] = {}
+    for spec in specs:
+        if '=' not in spec:
+            raise ValueError(f'--bundle wants NAME=PATH, got {spec!r}')
+        name, path = spec.split('=', 1)
+        if name in out:
+            raise ValueError(f'duplicate bundle name {name!r}')
+        out[name] = path
+    return out
+
+
 def main():
     args = parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
+    paths = _parse_bundles(args.bundle)
+    reference = next(iter(paths))
     env = parallel.init_distributed()
     cache = data.SampleCache(args.sample_cache)
     by_id = {s.id: s for s in cache.samples}
@@ -72,27 +88,44 @@ def main():
         raise KeyError(f'{args.sample_id} not in {args.sample_cache}')
     sample = by_id[args.sample_id]
     geometry = data.parse_geometry(args.geometry)
+
+    bundles = {}
+    for name, path in paths.items():
+        with progress.Timer(f'load bundle {name} ({path})'):
+            bundles[name] = veda_bundle.load(path, env.device)
+    steps_recorded = {b.metadata.get('step') for b in bundles.values()}
+    if len(steps_recorded) != 1:
+        # Comparing precisions of *one* trained predictor is the point; two
+        # different steps would confound the rounding with the training.
+        raise ValueError(f'bundles come from different training steps: '
+                         f'{sorted(steps_recorded)}')
+    predictors = {name: b.predictor for name, b in bundles.items()}
+    plan_table = bundles[reference].plans
+    plan = plan_table.select(geometry)
+    keep_ratio = (args.keep_ratio if args.keep_ratio is not None
+                  else bundles[reference].keep_ratio)
+
     tch = teacher_lib.build_teacher(
         args.root, args.variant, args.schedule, args.num_steps, args.adapter,
         env, visual_conditions=sample.task != 't2va',
         audio_references=args.variant == 'Ref2VA',
         offload_blocks=args.offload_blocks, prefetch=args.prefetch,
         mlp_chunk_rows=args.mlp_chunk_rows)
-    plan = veda_plan.PlanTable.load_dir(args.plan_dir).select(geometry)
     veda_config = veda_attention.VedaConfig(
-        target_budget=veda_mask.Budget(ratio=args.keep_ratio))
+        target_budget=veda_mask.Budget(ratio=keep_ratio))
     traj = traj_lib.Trajectory(tch.model, cache, sample, geometry,
                                tch.schedule, args.seed, env.device)
     clip = veda_attention.ClipTiling(traj.layout, veda_config, env.device)
-    probe = quant.QuantHeatProbe(
-        clip, plan, args.schemes, q_tile_fraction=args.q_tile_fraction,
-        layer_every=args.layer_every,
+    probe = quant.PredictorProbe(
+        clip, plan, predictors, reference,
+        q_tile_fraction=args.q_tile_fraction, layer_every=args.layer_every,
         generator=torch.Generator().manual_seed(args.seed))
     progress.log(f'{sample.id} @ {geometry.name}: {traj.layout.used} tokens, '
-                 f'{tch.schedule.num_steps} steps, schemes '
-                 f'{", ".join(args.schemes)}')
-    steps = progress.Progress('quantized scoring', tch.schedule.num_steps,
-                              every=1)
+                 f'{tch.schedule.num_steps} steps, keep {keep_ratio}, '
+                 f'bundles {", ".join(paths)} (reference {reference})')
+
+    bar = progress.Progress('predictor scoring', tch.schedule.num_steps,
+                            every=1)
     with torch.no_grad():
         while not traj.done:
             inputs = traj.inputs()
@@ -102,23 +135,28 @@ def main():
                 inputs.timestep, probe,
                 tch.tables.get(inputs.timestep.timesteps))
             traj.advance(video_v, audio_v)
-            per_step = quant.summarize(
+            per_step = quant.summarize_predictor(
                 [r for r in probe.records if r.step == inputs.step])
-            steps.update('step {}: {}'.format(inputs.step, '  '.join(
+            bar.update('step {}: {}'.format(inputs.step, '  '.join(
                 f'{name} recall {value["recall"]:.4f}'
                 for name, value in per_step.items())))
-    records = [r.to_json() for r in probe.records]
+
     with open(os.path.join(args.out_dir, 'records.jsonl'), 'w') as f:
-        for record in records:
-            f.write(json.dumps(record) + '\n')
+        for record in probe.records:
+            f.write(json.dumps(record.to_json()) + '\n')
     summary = {
         'sample': sample.id, 'geometry': geometry.name,
         'tokens': traj.layout.used, 'steps': tch.schedule.num_steps,
-        'keep_ratio': args.keep_ratio,
+        'keep_ratio': keep_ratio, 'reference': reference,
+        'bundles': {name: {'path': path,
+                           'dtype': bundles[name].metadata.get('dtype'),
+                           'bytes': os.path.getsize(path)}
+                    for name, path in paths.items()},
+        'training_step': int(bundles[reference].metadata['step']),
         'q_tile_fraction': args.q_tile_fraction,
         'layer_every': args.layer_every,
-        'overall': quant.summarize(probe.records),
-        'per_step': {str(step): quant.summarize(
+        'overall': quant.summarize_predictor(probe.records),
+        'per_step': {str(step): quant.summarize_predictor(
             [r for r in probe.records if r.step == step])
                      for step in range(tch.schedule.num_steps)},
     }
@@ -126,10 +164,10 @@ def main():
         json.dump(summary, f, indent=1)
     progress.log(f'wrote {args.out_dir}/summary.json')
     for name, value in summary['overall'].items():
-        progress.log(f'  {name:14s} recall {value["recall"]:.4f}  '
+        progress.log(f'  {name:10s} recall {value["recall"]:.4f}  '
                      f'heat_kept {value["heat_kept"]:.4f} / ceiling '
-                     f'{value["heat_ceiling"]:.4f}  rel_l2 '
-                     f'{value["rel_l2"]:.2e}  max_abs {value["max_abs"]:.2e}')
+                     f'{value["heat_ceiling"]:.4f}  agree '
+                     f'{value["agree"]:.4f}  rel_l2 {value["rel_l2"]:.2e}')
 
 
 if __name__ == '__main__':
