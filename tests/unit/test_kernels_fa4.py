@@ -1,5 +1,8 @@
 """Tests for the CPU-side parts of miowtion.kernels.fa4."""
 
+import threading
+import time
+
 import torch
 
 from miowtion.kernels import fa4
@@ -53,3 +56,30 @@ def test_transposed_index_lists_are_per_key_tile():
     # A block is full iff its key tile (the row here) is full.
     assert torch.equal(full, mask_t & lay.full_tile[:, None])
     assert torch.equal(part, mask_t & ~lay.full_tile[:, None])
+
+
+def test_module_import_is_serialized_across_threads(monkeypatch):
+    """Concurrent first calls must not run the import side by side.
+
+    The SM8x patch puts half-executed modules in sys.modules; a second
+    thread importing flash_attn.cute at that moment sees a module without
+    its attributes. functools.cache alone does not prevent that, because it
+    holds no lock while the wrapped call runs.
+    """
+    state = {'inside': 0, 'peak': 0}
+
+    def slow_import():
+        state['inside'] += 1
+        state['peak'] = max(state['peak'], state['inside'])
+        time.sleep(0.01)
+        state['inside'] -= 1
+        return None
+
+    monkeypatch.setattr(fa4, '_import_modules', slow_import)
+    monkeypatch.setattr(fa4, '_modules', fa4._modules.__wrapped__)
+    threads = [threading.Thread(target=fa4._modules) for _ in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert state['peak'] == 1

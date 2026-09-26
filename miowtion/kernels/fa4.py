@@ -55,6 +55,14 @@ _sm8x_error: str | None = None
 # MLIR, which is not documented as thread-safe. Only the host-side launch is
 # held; kernels still run concurrently on their GPUs.
 _CALL_LOCK = threading.Lock()
+# The import itself is serialized too. functools.cache does not hold a lock
+# while the wrapped call runs, and the SM8x patch registers half-executed
+# modules in sys.modules by hand (module_from_spec + exec_module), which
+# bypasses the per-module import lock Python would otherwise take. A second
+# thread importing flash_attn.cute right then gets the module object without
+# its contents: 'module flash_attn.cute.interface has no attribute
+# flash_attn_func'.
+_IMPORT_LOCK = threading.RLock()
 
 
 def _any_sm8x() -> bool:
@@ -65,6 +73,12 @@ def _any_sm8x() -> bool:
 @functools.cache
 def _modules():
     """Imports FA4 (patched on SM8x); returns None when unavailable."""
+    with _IMPORT_LOCK:
+        return _import_modules()
+
+
+def _import_modules():
+    """The body of `_modules`, run under `_IMPORT_LOCK`."""
     global _sm8x_error
     if torch.cuda.is_available() and _any_sm8x():
         try:

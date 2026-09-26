@@ -106,3 +106,4 @@
 | 真实 Veda plan 一跑就报 `per-head index has 56 heads, expected 8` | trunk 按 head_chunk 切 q，却把整层的每头选择原样传给 kernel；合成 plan 是共用的 2 维 index，测不出来 | `select_heads` 跟着 q 一起切；单测钉分块 / 不分块逐位相等 | [mlx_inference](features/mlx_inference.md) |
 | `bf16+smoothk` 不是恒等 | 先把 `x - mean` 落回 bf16 再量化，把减法自己丢掉的位算在平滑头上；真实硬件里这一步在 fp32 累加器里 | `fake_quantize` 全程 fp32，最后才 `.to(x.dtype)` | [quant_scoring](features/quant_scoring.md) |
 | fp8 bundle 在单测里没有"减半" | safetensors 的 header 在玩具尺寸下比权重还大 | 阈值放到 0.75；真实尺寸上才是 550,635,792 → 275,415,648 字节 | [quant_scoring](features/quant_scoring.md) |
+| 多卡生成时两张卡在第一步就挂，报 `flash_attn.cute.interface has no attribute flash_attn_func` | 每卡一个线程同时首次 import FA4；`functools.cache` 执行期间不持锁，而 SM8x 补丁手工把模块塞进 `sys.modules`，绕过 import lock，别的线程拿到半初始化的模块 | `fa4._IMPORT_LOCK` 串行化 `_modules()`；单测用假的 `_import_modules` 钉并发度为 1 | [veda_kernel](features/veda_kernel.md) |

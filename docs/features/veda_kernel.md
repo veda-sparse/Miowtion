@@ -50,6 +50,13 @@ flash-attn-4 4.0.0b32 @ d15f153：
   (128,64) 块稀疏张量后不报错，输出与稠密结果一致（max err 1.8e-4，与稀疏参考相差 0.28），耗时也
   与稠密相同。对策：`fa4.available()` 按架构白名单返回，其他架构直接抛异常，绝不静默回退。
 - **SM100 的 q_stage=2**：接口按 `seqlen_q > tile_m` 自动选 q_stage=2，稀疏 Q 块粒度因此变成 256。
+- **多卡线程会撞上 import 竞态**：三张卡各一个线程，第一次注意力调用同时进 `_modules()`。
+  `functools.cache` 在被包的函数执行期间不持锁，于是三个线程同时 import；而 `install()` 是
+  手工 `module_from_spec` + `exec_module` 往 `sys.modules` 里塞模块，绕过了 Python 的
+  per-module import lock，别的线程正好拿到"已注册但还没执行完"的模块，报
+  `module 'flash_attn.cute.interface' has no attribute 'flash_attn_func'`。20 条 holdout
+  的批量生成里 cuda:0 一路跑完、另外两张卡在第一步就挂了（异常要等线程 join 才抛出来，所以
+  日志看起来是"跑完才失败"）。对策：`_IMPORT_LOCK` 串行化 `_modules()` 的函数体。
 - **补丁必须在第一次 import `flash_attn.cute` 之前装上**：包的 `__init__` 会 import interface，
   interface 又 import 其他三个模块。`install()` 先用 `module_from_spec` 建出不执行 `__init__` 的包
   对象，把 vendored 模块按依赖顺序注册进 `sys.modules`，最后才执行 `__init__`。
