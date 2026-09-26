@@ -12,6 +12,7 @@
 | transformers + accelerate | pip，`encode` extra | 已验证 5.17 / 1.15 | 离线 prompt 编码（Qwen3-VL） | `Qwen3VLForConditionalGeneration`、`model.model.language_model.norm`（替换为 Identity） |
 | torchvision | pip | 与 torch 匹配 | transformers 的 Qwen3-VL 处理器 | — |
 | diffusers | pip，`encode` extra | `0.32.2`（发布版 `model_index.json` 的版本） | 发布版视频 VAE 的代码依赖它（`ModelMixin` / `ConfigMixin`）：推理解码、fl2va 条件编码 | 只经由发布版 VAE 包间接使用 |
+| diffusers（移植版布局） | 未加入 `pyproject.toml` | 需要 ≥ 0.36（`AutoencoderKLMiniMaxH3` / `AutoencoderKLMiniMaxH3Audio`；0.40.0 上实测可用） | `infer.decode.DiffusersDecoder`：解码上游重新发布的 `vae/` + `audio_vae/` | **和上一行冲突**：发布包里的 VAE 代码要 0.32.2，两个版本不能装在同一个环境里。所以这条路只在 Apple silicon 的 MLX 环境里用，`DiffusersDecoder` 惰性 import 并在类缺失时报错，仓库其他地方不依赖它 |
 | mlx | pip，`mlx` extra | ≥0.32（已验证 0.32.2） | Apple silicon 推理（`miowtion/mlx`）：block 前向、Veda 块稀疏、NVMe offloading | `mx.quantize` / `mx.dequantize` / `mx.quantized_matmul`（affine，`group_size`、`bits`）；`mx.fast.scaled_dot_product_attention`；`mx.load` 对 safetensors 的惰性加载；`mx.array` 的 buffer 可经 `np.asarray` 拿到可写视图（slab 直接读入）；`mx.synchronize` / `mx.get_peak_memory` / `mx.set_cache_limit`；`mx.take`（块稀疏的 key tile gather）。**注意**：融合 SDPA 的布尔掩码在矩阵乘之后施加，不会跳过整块 |
 | safetensors / numpy / pyyaml | pip | 见 pyproject | IO | — |
 

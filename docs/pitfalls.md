@@ -11,6 +11,7 @@
 | ref2va prompt 被校验拒绝 | ref2va 是六段式格式，不是 t2va 的三字段 | `validate_prompt(prompt, task)` 按 task 区分 | [training](features/training.md) |
 | 多卡时复制的打分器权重不一致 | 初始化用了全局 RNG，而各 rank 的 RNG 状态不同 | 创建打分器前 `torch.manual_seed(config.seed)` | [training](features/training.md) |
 | VAE 编码结果不可复现 | VAE 的后验是采样得到的 | 每次编码前把全局 RNG 固定为 seed 42 | [h3_model](features/h3_model.md) |
+| 8 步生成出来的视频和"直接解码纯噪声"没有区别，torch / MLX 两条路还完全一致 | SwiGLU 的两半接反：发布权重把 fc1 融成 `[up; gate]`，我们当成 `[gate; up]`。形状、范数、两条自研路径的互相对拍全都看不出来 | 三处改成 `up, gate = chunk(2)`；加单测钉死这个顺序；用 `scripts/check_vs_diffusers.py` 逐模块对 diffusers 参考实现 | [h3_model](features/h3_model.md) |
 
 ## Veda
 
@@ -94,5 +95,14 @@
 | 换成只训最长几何后，分配器报 OOM 告警（free 0.6 GiB 却要 3.4 GiB） | 混训时 t102 每 12 条轨迹才来一次，只训 t102 时每次几何切换都是大张量换大张量，缺的是连续性不是总量 | `offload_blocks` 44 → 48，并用 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`；`mlp_chunk_rows` 不能动（影响数值） | [training](features/training.md) |
 | 104k token 时报 `expandable_segments: memory mapping failed ... (free: 20 MB)` | 和碎片无关，是显存真的用尽：收集器同时持有 q / k 两份 512 MiB 的 tile 序副本 | `_COLLECT_BYTES` 512 → 256 MiB、`offload_blocks` → 50、启动加 `garbage_collection_threshold:0.8`；头之间独立，chunk 大小不改结果 | [training](features/training.md) |
 | 训练跑着时另起教师进程，权重刚载完就被静默 kill | 不是显存：再开一份 33B 教师要约 66 GB pinned 主机内存（`HostSlabs`），训练已经占掉了大部分，内核 OOM killer 不留回溯 | 离线探针和训练错开跑；判断依据是日志停在 `load weights ... done` 且进程无回溯地消失 | [quant_scoring](features/quant_scoring.md) |
+| 换了一份发布 checkpoint，config 照样能读出来但模型可能是错的 | `from_pretrained` 对认不出的键静默退回默认值，而上游 diffusers 移植版把键全改名了 | `CONFIG_KEYS` 登记两套拼写，缺字段直接报错 | [h3_model](features/h3_model.md) |
+| 主机侧 numpy 算的时间步正弦表与 torch 差 1 ulp，位级对齐的测试挂掉 | numpy 与 torch 的 fp32 `exp` 在 128 个频率里有 14 个最后一位不同（指数的自变量本身逐位相等） | 记录误差（max abs 2.98e-08）、测试改钉"≤1 ulp"；RoPE 的表仍然逐位相等 | [mlx_inference](features/mlx_inference.md) |
+| MLX 的 Euler 步与 torch 差 1 ulp | torch 的 `add_(v, alpha=)` 是 fused multiply-add（单次 round），MLX 分开乘加 | 记录误差（2.4e-07）、测试钉 ≤1 ulp；不要为此把这一步改成 GEMM | [mlx_inference](features/mlx_inference.md) |
+| 真实权重下 MLX block 与 torch 参考相对 L2 = 1.2（完全对不上），合成权重的单测却全过 | 对照脚本把 fused QKV 的行置换用反了（`perm` 的逆）；单测只走"torch → MLX"一个方向，看不出来 | 反方向写成库函数 `interop.torch_block`，并加往返逐位相等的单测；`mlx[perm[r]] == torch[r]`，回来是 gather | [mlx_inference](features/mlx_inference.md) |
+| 用很短的片段（`latent_t` 2）试 VAE 解码，报 `torch.cat(): expected a non-empty list of Tensors` | 视频 VAE 按 `clip_length` 分块解码，并先补上 `token_drop` 个 token；latent 帧数不到一个 chunk 时分块数算成 0 | 冒烟测试压画布（短边）而不是压时长，时长至少取一个完整 chunk | [mlx_inference](features/mlx_inference.md) |
+| bf16 权重集 4.5 GB，载入峰值却是 9.0 GB，`mx.clear_cache()` 无效 | MLX 的 `astype` 惰性，fp32 原张量活到结果被 eval；一个 block 才 eval 一次 | 读一个张量就 `mx.eval`（`_cast`），超额降到一个张量 128 MB | [mlx_inference](features/mlx_inference.md) |
+| 同一份代码、同一个 batch，两次测速差 3.3 倍 | 机器内存紧张时 4.5 GB 常驻权重被换出，每次前向都在重新缺页 | 测速前先看 `memory_pressure`，把当时的空闲内存一起写进文档 | [mlx_inference](features/mlx_inference.md) |
+| 移植 VAE 后两条 fp32 路径相对 L2 是 6e-3 而不是 1e-7 | RoPE 的频率表漏了 `2π` | 逐段对照中间量定位；单测钉 numpy 的解析式，不要钉另一份实现 | [mlx_inference](features/mlx_inference.md) |
+| 真实 Veda plan 一跑就报 `per-head index has 56 heads, expected 8` | trunk 按 head_chunk 切 q，却把整层的每头选择原样传给 kernel；合成 plan 是共用的 2 维 index，测不出来 | `select_heads` 跟着 q 一起切；单测钉分块 / 不分块逐位相等 | [mlx_inference](features/mlx_inference.md) |
 | `bf16+smoothk` 不是恒等 | 先把 `x - mean` 落回 bf16 再量化，把减法自己丢掉的位算在平滑头上；真实硬件里这一步在 fp32 累加器里 | `fake_quantize` 全程 fp32，最后才 `.to(x.dtype)` | [quant_scoring](features/quant_scoring.md) |
 | fp8 bundle 在单测里没有"减半" | safetensors 的 header 在玩具尺寸下比权重还大 | 阈值放到 0.75；真实尺寸上才是 550,635,792 → 275,415,648 字节 | [quant_scoring](features/quant_scoring.md) |

@@ -31,6 +31,35 @@ FP32_PARAM_PREFIXES = (
 FP32_BUFFER_NAMES = ('rope.inv_freq',)
 
 
+# config.json key of every H3Config field, most recent spelling first. Two
+# releases are in circulation: the first one ("MiniMaxH3DiTModel",
+# diffusers 0.32) and the current diffusers port
+# ("MiniMaxH3Transformer3DModel", diffusers 0.36) which renamed most keys.
+# Both describe the same 33B architecture.
+CONFIG_KEYS = {
+    'hidden_size': ('hidden_size',),
+    'num_layers': ('num_layers',),
+    'num_refiner_layers': ('num_refiner_layers',
+                           'token_refiner_num_layers'),
+    'num_heads': ('num_attention_heads',),
+    'head_dim': ('attention_head_dim',),
+    'ffn_dim': ('ffn_dim', 'ffn_hidden_size'),
+    'video_channels': ('in_channels', 'latents_dim'),
+    'audio_channels': ('audio_in_channels', 'audio_latents_dim'),
+    'patch_size': ('patch_size',),
+    'text_dim': ('text_dim',),
+    'freq_dim': ('freq_dim', 'timestep_input_dim'),
+    'time_embed_hidden': ('time_embed_hidden_dim', 'time_embed_hidden_size'),
+    'time_embed_dim': ('time_embed_dim',),
+    'rope_freqs_per_axis': ('rope_freq_dim', 'rope_inv_freq_len'),
+    'norm_eps': ('norm_eps',),
+    'qk_norm_eps': ('qk_norm_eps',),
+    'final_norm_eps': ('final_norm_eps',),
+}
+# The first release does not store rope_theta; both use 10000.0.
+OPTIONAL_CONFIG_KEYS = {'rope_theta': ('rope_theta',)}
+
+
 @dataclasses.dataclass(frozen=True)
 class H3Config:
     """Shape hyper-parameters of the H3 DiT (defaults: the released 33B)."""
@@ -70,33 +99,32 @@ class H3Config:
 
     @classmethod
     def from_pretrained(cls, transformer_dir: str) -> H3Config:
-        """Reads `<checkpoint>/FL2VA/transformer/config.json`."""
+        """Reads `<checkpoint>/<variant>/transformer/config.json`.
+
+        Two releases are in circulation and they spell the same fields
+        differently (see CONFIG_KEYS); every field must be present under one
+        of its spellings, so a third schema fails loudly instead of silently
+        falling back to the defaults of this class.
+
+        Raises:
+            KeyError: When a field is missing under every known spelling.
+            ValueError: When the AdaLN width contradicts hidden_size.
+        """
         with open(os.path.join(transformer_dir, 'config.json')) as f:
             raw = json.load(f)
-        aliases = {
-            'hidden_size': 'hidden_size',
-            'num_layers': 'num_layers',
-            'token_refiner_num_layers': 'num_refiner_layers',
-            'num_attention_heads': 'num_heads',
-            'attention_head_dim': 'head_dim',
-            'ffn_hidden_size': 'ffn_dim',
-            'latents_dim': 'video_channels',
-            'audio_latents_dim': 'audio_channels',
-            'patch_size': 'patch_size',
-            'text_dim': 'text_dim',
-            'timestep_input_dim': 'freq_dim',
-            'time_embed_hidden_size': 'time_embed_hidden',
-            'time_embed_dim': 'time_embed_dim',
-            'rope_inv_freq_len': 'rope_freqs_per_axis',
-            'norm_eps': 'norm_eps',
-            'qk_norm_eps': 'qk_norm_eps',
-            'final_norm_eps': 'final_norm_eps',
-        }
         kwargs = {}
-        for key, field in aliases.items():
-            if key in raw:
-                kwargs[field] = raw[key]
-        kwargs['patch_size'] = tuple(kwargs.get('patch_size', (1, 2, 2)))
+        for field, keys in CONFIG_KEYS.items():
+            present = [k for k in keys if k in raw]
+            if not present:
+                raise KeyError(f'{transformer_dir}/config.json has no key '
+                               f'for {field} (tried {list(keys)})')
+            kwargs[field] = raw[present[0]]
+        for field, keys in OPTIONAL_CONFIG_KEYS.items():
+            for key in keys:
+                if key in raw:
+                    kwargs[field] = raw[key]
+                    break
+        kwargs['patch_size'] = tuple(kwargs['patch_size'])
         config = cls(**kwargs)
         expected_adaln = 6 * MODALITY_NUM * config.hidden_size
         if raw.get('adaln_out_features', expected_adaln) != expected_adaln:

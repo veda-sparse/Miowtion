@@ -196,3 +196,32 @@ def test_layer_plan_from_scores_follows_the_tile_plan():
                                    for x in (q, k, v)))
         mx.eval(want)
         assert mx.array_equal(mx.take(got, heads, axis=0), want).item()
+
+
+def test_layer_attention_over_head_chunks_matches_the_whole_layer():
+    # The trunk runs attention a few heads at a time (BlockOptions
+    # head_chunk), so layer_attention gets a slice of the layer's heads
+    # while the plan still describes all of them. Chunking must not move
+    # a bit -- before this was checked, a chunked call handed the kernel a
+    # selection with more heads than q had.
+    layout_a, layout_b = _layout(), _layout(shape='4x8x4')
+    group_a = veda_plan.head_group_plan(
+        [0, 2], _selection(layout_a, seed=2, heads=2), layout_a)
+    group_b = veda_plan.head_group_plan(
+        [1], _selection(layout_b, seed=3, heads=1), layout_b)
+    layer = veda_plan.layer_plan([group_a, group_b], _HEADS)
+    mx.random.seed(0)
+    q, k, v = (mx.random.normal((_HEADS, layout_a.used, 128))
+               for _ in range(3))
+    mx.eval(q, k, v)
+
+    want = sa.layer_attention(layer, q, k, v)
+    mx.eval(want)
+    for chunk in (1, 3):
+        parts = [sa.layer_attention(
+            layer, *(x[start:start + chunk] for x in (q, k, v)),
+            head_start=start)
+            for start in range(0, _HEADS, chunk)]
+        got = mx.concatenate(parts, axis=0)
+        mx.eval(got)
+        assert mx.array_equal(got, want).item()

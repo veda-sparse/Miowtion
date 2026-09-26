@@ -68,17 +68,46 @@ VAE 代码、`model_index.json` 的 sigma 位移）直接复用，不重写。
 - `tests/unit/test_h3_schedule_noise.py`：两个变体的 sigma 位移、8 步网格、Euler 方向、槽位、
   噪声排列、条件加噪（逐位）。
 - `tests/unit/test_h3_model_weights.py`：config、dtype、QKV 置换、交错格式读写往返、严格加载、
-  确定性、pad 不泄漏、AdaLN 预计算逐位一致。
+  确定性、pad 不泄漏、AdaLN 预计算逐位一致、SwiGLU 的门控半边。
+- `scripts/check_vs_diffusers.py`（需要真实权重和 `diffusers>=0.36`，不在 CI 里）：把同一份
+  发布权重灌进 `H3DiT` 和 diffusers 的参考实现，逐模块比相对 L2。改动权重语义（融合顺序、
+  置换、命名映射）之后必须跑一次。
 
 ## 踩坑记录
 - **长 clip 在 RoPE 处 OOM**：eager 的 RoPE 链（乘积、rotate_half 的 cat、最后的 cat）每一步都是整张
   [S, 56, 128] 的临时张量，78k token 时约 4 GB，训练在 4:3 14.4 s 上 OOM。按行分块后临时显存有界，
   结果逐位不变。之后 16:9 14.4 s（104k token）又在 `_modulate`（`index_select` 出的 [S, 5376]
   调制向量、乘积、和）处 OOM，调制和 gate 残差同样按行分块。
+- **发布的 checkpoint 有两套命名**：最早的 `MiniMaxH3DiTModel`（diffusers 0.32）用
+  `blocks.N.attn.qkv_proj.weight` 这类 H3 原生名字，后来上游改成 diffusers 移植版
+  `MiniMaxH3Transformer3DModel`（diffusers 0.36），config.json 的键几乎全部改名
+  （`ffn_hidden_size` → `ffn_dim`、`latents_dim` → `in_channels`、`rope_inv_freq_len`
+  → `rope_freq_dim` 等），权重也改成 `transformer_blocks.N.attn.to_q/to_k/to_v`。
+  旧的 `from_pretrained` 只认第一套键名，遇到第二套会**静默退回 dataclass 默认值**——
+  这次恰好默认值和真实值一致所以没炸，换个 checkpoint 就会安静地跑错模型。现在
+  `CONFIG_KEYS` 同时登记两套拼写，任何字段找不到就直接 `KeyError`。
 - 浮点恒等式不能直接在测试里用：`a+b−a` 在浮点下不等于 `b`，逐位测试应当直接复算期望值。
+- **SwiGLU 的两半接反，生成出来的就是噪声**：8 步真实权重生成的片段和"直接把纯噪声送进
+  VAE 解码"看不出区别；量化的说法是末态 latent 相对初始噪声只走了 `|x−x0|/|x0| ≈ 0.34`、
+  `cos ≈ 0.94`，而流匹配走完 Σ Δσ = 1 应当是 ≈1.4 且与噪声基本不相关。原因是发布权重把
+  MLP 的两个投影融成 `[up; gate]`（diffusers 的 SwiGLU：`up, gate = proj(x).chunk(2)`，
+  返回 `up * silu(gate)`），我们按 `[gate; up]` 解读，对**每一个 block 和 token refiner**
+  都算错。这个错误保形状、保范数，而且 torch 侧和 MLX 侧是同一个误解，所以两条自研路径
+  互相对拍、以及所有合成权重单测全都是绿的。
+  定位办法是引入**第三方参考实现**：`scripts/check_vs_diffusers.py` 把同一份发布权重同时
+  灌进我们的 `H3DiT` 和 `diffusers.MiniMaxH3Transformer3DModel`，逐模块比相对 L2。修好后
+  token refiner / 打包 embedding / 时间步 embedding / 输出头全部 `rel 0.0`（逐位相等），
+  trunk block 在"同样让真实行去 attend pad 行"的前提下也是 `rel 0.0`；默认屏蔽 pad 时
+  real 行差 3.6e-3，差异全部来自 diffusers 不带 padding mask。
+  教训：只和自己的另一条实现对拍，共享的误解永远测不出来；涉及权重语义（融合顺序、置换、
+  半边划分）的地方必须有外部参照。
 
 ## 验证记录
 - 2026-09-23，macOS CPU：unit 全部通过。GPU 前向（真实权重）待验证。
+- 2026-09-26，macOS CPU（Apple silicon）、真实权重、`scripts/check_vs_diffusers.py
+  --layers 1`：token refiner、打包 embedding、时间步 embedding、AdaLN 索引、视频头、音频头
+  对 diffusers 参考实现逐位相等（`rel 0.0`）；trunk block 0 在让真实行也 attend pad 行时
+  逐位相等，屏蔽 pad 时 real 行 rel 3.6e-3（diffusers 没有 padding mask）。
 
 ## 待办
 - 用真实权重在 GPU 上跑通稠密前向并渲染视频做可视化检查（需要 VAE 解码与人工确认）。
