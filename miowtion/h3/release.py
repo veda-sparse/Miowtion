@@ -27,6 +27,28 @@ SCHEMA_H3 = 'h3'
 SCHEMA_DIFFUSERS = 'diffusers'
 SCHEMAS = (SCHEMA_H3, SCHEMA_DIFFUSERS)
 
+# `_class_name` of the release's transformer/config.json. Detecting the
+# schema from the config is the only option before the tensor index is
+# open (H3Config.from_pretrained); detect_schema() is used once it is.
+_CLASS_NAME_SCHEMA = {
+    'MiniMaxH3DiTModel': SCHEMA_H3,
+    'MiniMaxH3Transformer3DModel': SCHEMA_DIFFUSERS,
+}
+
+# Which half of the fused mlp.fc1 output is the gated one. fc1 emits both
+# SwiGLU projections in one GEMM, and the two releases fused them in
+# opposite orders: the first release stores [gate; up] (H3DiT's own
+# `gate, up = fc1(x).chunk(2)`), the diffusers port stores [up; gate]
+# (diffusers' SwiGLU: `up, gate = proj(x).chunk(2)`).
+#
+# Nothing but the samples can catch a wrong choice here: swapping the
+# halves keeps every shape, dtype and norm identical, so shape checks,
+# completeness checks and synthetic-weight tests all stay green while the
+# real model degenerates into noise. It is therefore pinned per schema and
+# cross-checked against the checkpoint at load time
+# (miowtion.h3.weights.load_dit_weights).
+MLP_GATE_FIRST = {SCHEMA_H3: True, SCHEMA_DIFFUSERS: False}
+
 _BLOCK_PREFIX = {SCHEMA_H3: 'blocks', SCHEMA_DIFFUSERS: 'transformer_blocks'}
 
 # H3DiT name (relative to the block) -> release names, per schema.
@@ -120,6 +142,33 @@ def detect_schema(keys: Iterable[str]) -> str:
         raise ValueError('no transformer blocks found; tried prefixes '
                          f'{sorted(_BLOCK_PREFIX.values())}')
     return found[0]
+
+
+def schema_from_class_name(class_name: str | None) -> str:
+    """Which release a `transformer/config.json` describes.
+
+    Args:
+        class_name: The config's `_class_name` field (None when absent).
+
+    Returns:
+        One of SCHEMAS.
+
+    Raises:
+        ValueError: On a missing or unknown class name. A third release
+            would have its own fused-mlp order (MLP_GATE_FIRST) and its own
+            key spellings, so guessing one is never right.
+    """
+    if class_name not in _CLASS_NAME_SCHEMA:
+        raise ValueError(
+            f'unknown transformer _class_name {class_name!r}; known '
+            f'releases: {sorted(_CLASS_NAME_SCHEMA)}. Add it to '
+            'miowtion.h3.release together with its MLP_GATE_FIRST order')
+    return _CLASS_NAME_SCHEMA[class_name]
+
+
+def mlp_gate_first(schema: str) -> bool:
+    """Whether `schema` fuses mlp.fc1 as [gate; up] (see MLP_GATE_FIRST)."""
+    return MLP_GATE_FIRST[_checked(schema)]
 
 
 def _prefixed(prefix: str, names: dict[str, tuple[str, ...]]

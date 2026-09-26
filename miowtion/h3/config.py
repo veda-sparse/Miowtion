@@ -6,6 +6,8 @@ import dataclasses
 import json
 import os
 
+from miowtion.h3 import release
+
 # Rows of the packed sequence carry one of these modality tags. Padding rows
 # are tagged -1 by the packer; the DiT clamps them to 0 before indexing the
 # AdaLN table, so padding rows are modulated as video rows.
@@ -82,6 +84,10 @@ class H3Config:
     norm_eps: float = 1e-5
     qk_norm_eps: float = 1e-5
     final_norm_eps: float = 1e-5
+    # Half order of the fused SwiGLU projection, a property of the release
+    # the weights come from (miowtion.h3.release.MLP_GATE_FIRST). The
+    # default is the first release, which is what the CUDA path loads.
+    mlp_gate_first: bool = True
 
     @property
     def video_patch_dim(self) -> int:
@@ -104,11 +110,16 @@ class H3Config:
         Two releases are in circulation and they spell the same fields
         differently (see CONFIG_KEYS); every field must be present under one
         of its spellings, so a third schema fails loudly instead of silently
-        falling back to the defaults of this class.
+        falling back to the defaults of this class. The release also decides
+        `mlp_gate_first`, which is read from `_class_name` rather than
+        guessed: the two releases fuse the SwiGLU halves in opposite orders
+        and the wrong order is invisible to every shape and norm check
+        (miowtion.h3.release.MLP_GATE_FIRST).
 
         Raises:
             KeyError: When a field is missing under every known spelling.
-            ValueError: When the AdaLN width contradicts hidden_size.
+            ValueError: When the AdaLN width contradicts hidden_size, or
+                the release is not one this repo knows.
         """
         with open(os.path.join(transformer_dir, 'config.json')) as f:
             raw = json.load(f)
@@ -125,6 +136,8 @@ class H3Config:
                     kwargs[field] = raw[key]
                     break
         kwargs['patch_size'] = tuple(kwargs['patch_size'])
+        kwargs['mlp_gate_first'] = release.mlp_gate_first(
+            release.schema_from_class_name(raw.get('_class_name')))
         config = cls(**kwargs)
         expected_adaln = 6 * MODALITY_NUM * config.hidden_size
         if raw.get('adaln_out_features', expected_adaln) != expected_adaln:

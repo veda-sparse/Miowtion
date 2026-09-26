@@ -25,6 +25,7 @@ from torch.distributed.tensor import _utils as dtensor_utils
 
 from miowtion.h3 import config as h3_config
 from miowtion.h3 import model as h3_model
+from miowtion.h3 import release as h3_release
 from miowtion.utils import progress
 
 _QKV_SUFFIX = 'attn.qkv_proj.weight'
@@ -112,6 +113,30 @@ def _expected_dtype(name: str) -> torch.dtype:
     return torch.bfloat16
 
 
+def _check_mlp_order(config: h3_config.H3Config,
+                     ckpt_keys: Iterable[str]) -> None:
+    """Refuses weights whose fused SwiGLU order the model does not expect.
+
+    The two releases fuse mlp.fc1 as [gate; up] and [up; gate]. Both halves
+    have the same shape and the same norm, so loading one release into a
+    model configured for the other is silently accepted everywhere else and
+    only shows as noise in generated video. This is the one place where the
+    tensor names (the release) and the model's assumption meet.
+
+    Raises:
+        ValueError: On a mismatch, or on an unknown release layout.
+    """
+    schema = h3_release.detect_schema(ckpt_keys)
+    expected = h3_release.mlp_gate_first(schema)
+    if expected != config.mlp_gate_first:
+        raise ValueError(
+            f'checkpoint is the {schema!r} release, whose fused mlp.fc1 is '
+            f'{"[gate; up]" if expected else "[up; gate]"}, but the model '
+            f'was built with mlp_gate_first={config.mlp_gate_first}. Build '
+            'the config with H3Config.from_pretrained(transformer_dir) so '
+            'the order comes from the release itself')
+
+
 def load_dit_weights(model: h3_model.H3DiT, transformer_dir: str,
                      skip_prefixes: Iterable[str] = ()) -> None:
     """Loads a released checkpoint into `model` (plain or FSDP2-sharded).
@@ -122,9 +147,11 @@ def load_dit_weights(model: h3_model.H3DiT, transformer_dir: str,
 
     Raises:
         KeyError: On missing or unexpected tensors.
-        ValueError: On shape or dtype mismatches.
+        ValueError: On shape or dtype mismatches, or when the checkpoint's
+            release disagrees with `model.config.mlp_gate_first`.
     """
     ckpt = Checkpoint(transformer_dir)
+    _check_mlp_order(model.config, ckpt.keys())
     skip_prefixes = tuple(skip_prefixes)
     # LoRA parameters (miowtion.train.lora) are not part of the release.
     state = collections.OrderedDict(

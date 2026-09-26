@@ -30,7 +30,8 @@ def _write_release(root, variant='FL2VA'):
     weights_test._write_checkpoint(m, tdir)
     c = _TINY
     with open(os.path.join(tdir, 'config.json'), 'w') as f:
-        json.dump({'hidden_size': c.hidden_size, 'num_layers': c.num_layers,
+        json.dump({'_class_name': 'MiniMaxH3DiTModel',
+                   'hidden_size': c.hidden_size, 'num_layers': c.num_layers,
                    'token_refiner_num_layers': c.num_refiner_layers,
                    'num_attention_heads': c.num_heads,
                    'attention_head_dim': c.head_dim,

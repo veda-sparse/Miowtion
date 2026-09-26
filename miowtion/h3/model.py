@@ -176,13 +176,16 @@ class Attention(nn.Module):
 
 
 class Mlp(nn.Module):
-    """SwiGLU; fc1 outputs [up; gate] in one GEMM.
+    """SwiGLU: `silu(gate) * up`, both projections fused into one fc1 GEMM.
 
-    The release fuses the two projections in that order (diffusers' SwiGLU:
-    `up, gate = proj(x).chunk(2); up * silu(gate)`), so the *second* half is
-    the gated one. Swapping the halves leaves the norms unchanged, which is
-    why it survived every shape and norm check and only showed up as noise
-    in the generated video.
+    Which half is the gated one depends on the release the weights come
+    from, so it is not a constant here: the first release stores
+    [gate; up], the diffusers port stores [up; gate]
+    (`config.mlp_gate_first`, pinned in miowtion.h3.release.MLP_GATE_FIRST
+    and cross-checked against the checkpoint in
+    miowtion.h3.weights.load_dit_weights). Swapping the halves leaves every
+    shape and norm unchanged, which is why the wrong order survives every
+    synthetic-weight test and only shows up as noise in generated video.
 
     `chunk_rows` bounds the [rows, 2 * ffn_dim] intermediate (5.7 GB for a
     100k-row sequence) by processing rows in chunks. GEMM results may depend
@@ -197,9 +200,11 @@ class Mlp(nn.Module):
         self.fc2 = nn.Linear(config.ffn_dim, config.hidden_size, bias=False,
                              dtype=_BF16)
         self.chunk_rows: int | None = None
+        self.gate_first = config.mlp_gate_first
 
     def _forward(self, x: torch.Tensor) -> torch.Tensor:
-        up, gate = self.fc1(x).chunk(2, dim=-1)
+        first, second = self.fc1(x).chunk(2, dim=-1)
+        gate, up = (first, second) if self.gate_first else (second, first)
         return self.fc2(F.silu(gate) * up)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

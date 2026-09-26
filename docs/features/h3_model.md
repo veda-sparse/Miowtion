@@ -101,8 +101,32 @@ VAE 代码、`model_index.json` 的 sigma 位移）直接复用，不重写。
   real 行差 3.6e-3，差异全部来自 diffusers 不带 padding mask。
   教训：只和自己的另一条实现对拍，共享的误解永远测不出来；涉及权重语义（融合顺序、置换、
   半边划分）的地方必须有外部参照。
+- **上一条的修复本身又是一个坑：融合顺序是"发布版本"的属性，不是常量**。上面的结论
+  （`[up; gate]`）是拿 **diffusers 版发布**（`MiniMaxH3Transformer3DModel`）对出来的，
+  但 CUDA 推理和训练加载的是**第一版发布**（`MiniMaxH3DiTModel`，`weights/MiniMax-H3/
+  FL2VA/transformer`），它融的顺序正好相反（`[gate; up]`，即 H3DiT 自己的
+  `gate, up = fc1(x).chunk(2)`）。把 `Mlp._forward` 改成对所有权重都按 `[up; gate]` 解读
+  之后，MLX 路修好了，CUDA 路反而被改坏，生成结果又退回纯噪声，而 `pytest tests/unit`
+  和 torch↔MLX 对拍依旧全绿——因为合成权重下两种顺序都自洽。
+  排查花了大半天，最省事的几个判据记在这里：
+  - 末态 latent 与**同 seed 的初始噪声** `noise.initial_noise(geometry, seed)` 的
+    `cos ≈ 0.94`：说明几乎没去噪；
+  - 同几何同 seed、**两个不同 prompt** 的末态 latent `cos = 1.0000`（逐位相同）：说明
+    条件通路完全没起作用，问题在 DiT 主干而不在 Veda、打分器或数据；
+  - `__pycache__/*.pyc` 的时间戳（rsync 保留源文件 mtime）能钉死"新代码第一次被执行"的
+    时刻，用来把好坏两批产物和某次合并对上。
+  现在的做法：`release.MLP_GATE_FIRST` 按 schema 钉死两种顺序，`H3Config.from_pretrained`
+  从 config.json 的 `_class_name` 判定发布版本（认不出来直接 `ValueError`，不猜），
+  `Mlp` 用 `config.mlp_gate_first`，`weights.load_dit_weights` 与
+  `mlx.convert.ReleaseReader` 在加载时交叉校验"张量名字所属发布"与"模型假设的顺序"，
+  不一致就报错。单测同时钉死两种顺序以及这个交叉校验。
+  教训：外部参照只能证明**它自己那一版**；结论必须连同"适用于哪个发布"一起落到代码里，
+  否则下一次就是把一条路修好、另一条路改坏。
 
 ## 验证记录
+- 2026-09-26，3×RTX 4090、真实权重、8 步 Turbo LoRA：`[gate; up]`（第一版发布）下
+  dense 生成正常，`[up; gate]` 下同 prompt 同 seed 的末态 latent 与初始噪声 cos 0.94、
+  两个不同 prompt 的结果逐位相同（纯噪声）。
 - 2026-09-23，macOS CPU：unit 全部通过。GPU 前向（真实权重）待验证。
 - 2026-09-26，macOS CPU（Apple silicon）、真实权重、`scripts/check_vs_diffusers.py
   --layers 1`：token refiner、打包 embedding、时间步 embedding、AdaLN 索引、视频头、音频头

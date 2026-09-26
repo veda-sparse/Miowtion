@@ -14,6 +14,13 @@ point is the per-stage numbers, not a full 50-layer forward.
 Needs a diffusers with MiniMaxH3Transformer3DModel (>= 0.36) and the
 diffusers-format release (`<variant>/transformer`).
 
+Its verdict is about *that* release only. Anything the two releases store
+differently - today the fused mlp.fc1 half order
+(miowtion.h3.release.MLP_GATE_FIRST), tomorrow whatever the next port
+renames - is checked here for the diffusers release and stays unchecked for
+the first release, which is what the CUDA inference path loads. A green run
+is not permission to change a release-dependent constant for both.
+
 Examples:
     python scripts/check_vs_diffusers.py --transformer weights/h3/transformer
 """

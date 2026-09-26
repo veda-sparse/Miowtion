@@ -137,6 +137,14 @@ class ReleaseReader(ShardedSafetensors):
         super().__init__(transformer_dir)
         self.config = h3_config.H3Config.from_pretrained(transformer_dir)
         self.schema = h3_release.detect_schema(self._key_to_file)
+        # config.json (_class_name) and the tensor names must name the same
+        # release: they decide the fused mlp.fc1 order together, and a
+        # mismatch is invisible downstream (release.MLP_GATE_FIRST).
+        if h3_release.mlp_gate_first(self.schema) != (
+                self.config.mlp_gate_first):
+            raise ValueError(
+                f'{transformer_dir}: tensor names are the {self.schema!r} '
+                "release but config.json's _class_name is not")
 
     def check_complete(self) -> None:
         """Raises KeyError when a tensor the DiT needs is absent."""

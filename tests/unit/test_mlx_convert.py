@@ -136,8 +136,24 @@ def test_reader_detects_the_release_and_is_complete(tmp_path):
     _write_release(tmp_path)
     with convert.ReleaseReader(str(tmp_path)) as reader:
         assert reader.schema == h3_release.SCHEMA_DIFFUSERS
-        assert reader.config == _CONFIG
+        # The diffusers port fuses mlp.fc1 the other way round.
+        assert reader.config == dataclasses.replace(_CONFIG,
+                                                    mlp_gate_first=False)
         reader.check_complete()
+
+
+def test_reader_refuses_a_config_naming_another_release(tmp_path):
+    """config.json and the tensor names must agree on the release.
+
+    They jointly decide the fused mlp.fc1 half order, which nothing
+    downstream can check (h3.release.MLP_GATE_FIRST).
+    """
+    _write_release(tmp_path)
+    raw = dict(_config_json(_CONFIG), _class_name='MiniMaxH3DiTModel')
+    with open(os.path.join(tmp_path, 'config.json'), 'w') as f:
+        json.dump(raw, f)
+    with pytest.raises(ValueError, match='release'):
+        convert.ReleaseReader(str(tmp_path))
 
 
 def test_missing_tensor_is_reported(tmp_path):

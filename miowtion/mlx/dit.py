@@ -251,7 +251,8 @@ def _refiner_block(block: mlx_block.BlockWeights, x: mx.array,
         v.transpose(1, 0, 2)[None], scale=1.0 / math.sqrt(dim))[0]
     x = x + block.out(out.transpose(1, 0, 2).reshape(seq, heads * dim))
     h = mlx_block.rms_norm(x, block.norm2, config.norm_eps)
-    up, gate = mx.split(block.fc1(h), 2, axis=-1)
+    halves = mx.split(block.fc1(h), 2, axis=-1)
+    gate, up = halves if config.mlp_gate_first else halves[::-1]
     return x + block.fc2(mlx_block.swiglu(gate, up))
 
 
