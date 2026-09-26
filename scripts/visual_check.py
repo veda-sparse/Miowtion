@@ -2,12 +2,12 @@
 
 When a path cannot be bit-aligned against its reference, the evidence is a
 human looking at the frames. This script makes what that person needs, in
-one place and the same way every time: the inputs re-encoded untouched, one
-titled N-up video, a per-frame difference heatmap against the reference,
-and PSNR / SSIM printed and written next to them.
+one place and the same way every time: a copy of every input and one titled
+N-up video. Scalar metrics (--metrics) and difference heatmaps (--heatmap)
+are opt-in; quality is judged by eye (AGENTS.md 1.5.1).
 
-Panes keep the order given on the command line, and the first one is the
-reference unless --reference names another. Output goes to
+Panes keep the order given on the command line, baseline first, and the
+first one is the reference unless --reference names another. Output goes to
 artifacts/visual_checks/<feature>/<date>/ by convention.
 
     python scripts/visual_check.py --feature veda_predictor \\
@@ -52,8 +52,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument('--out-dir', default=None,
                         help='default artifacts/visual_checks/<feature>/'
                         '<today>')
-    parser.add_argument('--no-heatmap', action='store_true',
-                        help='skip the per-frame difference videos')
+    parser.add_argument('--heatmap', action='store_true',
+                        help='also write per-frame difference videos '
+                        '(off by default: only useful when chasing a '
+                        'specific defect)')
+    parser.add_argument('--metrics', action='store_true',
+                        help='also compute PSNR / SSIM against the '
+                        'reference (off by default: quality is judged by '
+                        'eye, see AGENTS.md 1.5.1)')
     parser.add_argument('--heatmap-gain', type=float, default=8.0,
                         help='multiplies the difference before it is '
                         'colored; 1.0 shows the raw difference, which is '
@@ -195,13 +201,15 @@ def main():
     for label, path in videos.items():
         if label == reference:
             continue
-        with progress.Timer(f'psnr / ssim: {label}'):
-            values = parse_metrics(_run(metrics_command(
-                videos[reference], path, args.ffmpeg)))
-        report['metrics'][label] = values
-        progress.log(f'  {label}: PSNR {values.get("psnr_db", float("nan")):.2f}'
-                     f' dB  SSIM {values.get("ssim", float("nan")):.4f}')
-        if not args.no_heatmap:
+        if args.metrics:
+            with progress.Timer(f'psnr / ssim: {label}'):
+                values = parse_metrics(_run(metrics_command(
+                    videos[reference], path, args.ffmpeg)))
+            report['metrics'][label] = values
+            progress.log(
+                f'  {label}: PSNR {values.get("psnr_db", float("nan")):.2f}'
+                f' dB  SSIM {values.get("ssim", float("nan")):.4f}')
+        if args.heatmap:
             name = re.sub(r'[^A-Za-z0-9._-]+', '_', label).strip('_')
             with progress.Timer(f'heatmap: {label}'):
                 _run(heatmap_command(videos[reference], path,
