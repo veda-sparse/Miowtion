@@ -101,7 +101,14 @@ for c in text_encoder video_vae audio_vae; do ln -s ../FL2VA/$c $ROOT/Ref2VA/$c;
 # Few-step teacher (optional): larryvrh/MiniMax-H3-Turbo-Lora
 hf download larryvrh/MiniMax-H3-Turbo-Lora minimax_h3_turbo_v4_step600_ema.safetensors \
     --local-dir weights/turbo_lora
+# Released predictor (inference only; fp8, carries its own tile plans)
+hf download Veda-Sparse/Minimax-H3-T2VA-Veda-8NFE-600Step-Preview \
+    --local-dir weights/veda/h3-t2va-8nfe-600
 ```
+
+Pass the released bundle to `scripts/generate.py` with `--predictor
+weights/veda/h3-t2va-8nfe-600/minimax_h3_t2va_veda_8nfe_600step_preview_fp8.safetensors`;
+it replaces `--checkpoint` and `--plan-dir`.
 
 ### Install with an AI coding agent
 

@@ -127,6 +127,25 @@ O(S²D)，所以它是最该降精度的地方。问题只有一个：**降精�
 - 2026-09-25 macOS CPU：`pytest tests/unit` 212 passed（含本功能 32 个）。
 - GPU 实测待做：要在 24 GB 卡上跑，得等当前的 600 step 训练跑完再用空出来的主机内存跑
   `scripts/quant_topk_error.py`（`runs/quant_topk_t37`）。
+- **2026-09-26，单张 RTX 4090（sm_89），`scripts/predictor_precision.py`**：打分器 bundle
+  的 bf16 vs fp8，同一个 step 200 的权重（`stage1_refine_t102` 的 live 权重），
+  16:9@102、104603 token、8 步、keep 0.1、`layer_every 1`、`q_tile_fraction 0.25`，
+  19m20s：
+
+  | bundle | 字节 | recall | heat_kept / ceiling | agree | rel_l2 |
+  |---|---|---|---|---|---|
+  | bf16 | 550,635,792 | 0.6017 | 0.6153 / 0.7273 | 1.0000 | 0 |
+  | fp8 e4m3 | 275,415,648 | 0.6017 | 0.6153 / 0.7273 | 0.9944 | 5.2e-3 |
+
+  **结论：fp8 存储把文件减半，选择基本不动。** recall 差 2e-5、`heat_kept` 差 6e-6，
+  逐 step 的八个数四位小数全部相同。真正的差别只有 `agree` 0.9944 —— 每约 180 个选中的
+  块换掉 1 个，而且换掉的显然在预算边界上、热量可以忽略（否则 `heat_kept` 会跟着动）。
+  分数本身的 rel_l2 5.2e-3 没有按比例进到选择里，正是 top-k 对每行常数 / 单调缩放不敏感
+  的结果。
+  同一次测量也记下了打分器随噪声的表现：recall 0.5654（step 0）单调升到 0.6143（step 7），
+  `heat_kept/heat_ceiling` 0.812 → 0.861，高噪声步最难选。
+  （测量用的是 t2va prompt，`latent_t` 由 `--geometry` 决定、latent 从噪声起步，所以
+  sample 自己缓存的 latent 长度与此无关。）
 
 ## 待办
 
