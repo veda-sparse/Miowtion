@@ -2184,34 +2184,12 @@ def _flash_attn_bwd(
         causal, window_size_left, window_size_right
     )
 
-    if arch // 10 == 12:
-        # SM120: uses SM80 MMA with 99 KB SMEM, 128 threads (4 warps).
-        m_block_size = 64
-        n_block_size = 64
-        if head_dim <= 64:
-            num_stages_Q = 2
-            num_stages_dO = 2
-        else:
-            num_stages_Q = 1
-            num_stages_dO = 1
-        SdP_swapAB = False
-        dKV_swapAB = False
-        dQ_swapAB = False
-        AtomLayoutMSdP = 4
-        AtomLayoutNdKV = 4
-        AtomLayoutMdQ = 4
-        V_in_regs = False
-        dQ_single_wg = False
-        cluster_size = 1
-        use_2cta_instrs = False
-        num_threads = 128
-        assert not (block_sparse_tensors is not None), "Block sparsity backward not supported on SM 12.0"
-        assert score_mod is None and score_mod_bwd is None, "score_mod backward not supported on SM 12.0"
-        assert mask_mod is None, "mask_mod backward not supported on SM 12.0"
-        assert deterministic is False, "deterministic backward not supported on SM 12.0"
-    elif arch // 10 == 8:
-        # SM80 family (sm80/86/89): SM80 MMA, 64 x 64 tiles, which fit the ~100 KB smem of
-        # sm86/sm89 (and trivially sm80's 164 KB).
+    if arch // 10 in [8, 12]:
+        # SM80 family (sm80/86/89) and SM120, which runs the same SM80 MMA
+        # through FlashAttentionBackwardSm120 (a subclass overriding only
+        # can_implement) and has sm86/sm89's ~100 KB of smem, so the two share
+        # one configuration. 64 x 64 tiles fit both (and trivially sm80's
+        # 164 KB).
         m_block_size = 64
         n_block_size = 64
         if head_dim <= 64:
@@ -2229,9 +2207,10 @@ def _flash_attn_bwd(
         dQ_swapAB = False
         if head_dim > 64:
             # 8 warps, atom layouts (2, 4, 4): measured on RTX 4090 (hdim 128, S=16k, 8 heads)
-            # 18.5 ms dense backward vs 21.9 ms for the SM120 setting (4 warps, (4, 4, 4));
-            # SDPA/FA2 is 18.0 ms. (4, 2, 2) / (4, 4, 2) with 8 warps fail in ptxas (register
-            # allocation), AtomLayoutNdKV = 8 silently gives wrong gradients.
+            # 18.5 ms dense backward vs 21.9 ms for the 4-warp (4, 4, 4) setting that arch 12
+            # used before it shared this branch; SDPA/FA2 is 18.0 ms. (4, 2, 2) / (4, 4, 2) with
+            # 8 warps fail in ptxas (register allocation), AtomLayoutNdKV = 8 silently gives
+            # wrong gradients.
             AtomLayoutMSdP = 2
             AtomLayoutNdKV = 4
             AtomLayoutMdQ = 4
@@ -2247,8 +2226,9 @@ def _flash_attn_bwd(
         use_2cta_instrs = False
         if block_sparse_tensors is not None:
             kv_subtile_factor = get_kv_subtile_factor(block_sparse_tensors, n_block_size)
-        assert score_mod is None and score_mod_bwd is None, "score_mod backward not supported on SM 8.x"
-        assert deterministic is False, "deterministic backward not supported on SM 8.x"
+        which = "SM 8.x" if arch // 10 == 8 else "SM 12.0"
+        assert score_mod is None and score_mod_bwd is None, f"score_mod backward not supported on {which}"
+        assert deterministic is False, f"deterministic backward not supported on {which}"
     elif arch // 10 == 9:
         cfg = _tile_size_bwd_sm90(
             head_dim,
@@ -2606,8 +2586,10 @@ def _flash_attn_bwd(
     normalized_block_sparse_tensors = None
     use_dense_block_mask = isinstance(block_sparse_tensors, DenseBlockMaskTorch)
     if use_dense_block_mask:
-        if arch // 10 != 8:
-            raise NotImplementedError("DenseBlockMaskTorch is only supported on SM8x")
+        if arch // 10 not in [8, 12]:
+            raise NotImplementedError(
+                "DenseBlockMaskTorch is only supported on SM8x and SM120"
+            )
         (
             normalized_block_sparse_tensors,
             q_subtile_factor,
@@ -2780,15 +2762,14 @@ def _flash_attn_bwd(
         ]
         if arch // 10 in [8, 12]:
             flash_bwd_obj_cls = FlashAttentionBackwardSm120 if arch // 10 == 12 else FlashAttentionBackwardSm80
-            sm8x_kwargs = (
-                dict(
-                    mask_mod=mask_mod,
-                    has_aux_tensors=aux_tensors is not None,
-                    q_subtile_factor=q_subtile_factor,
-                    kv_subtile_factor=kv_subtile_factor,
-                )
-                if arch // 10 == 8
-                else {}
+            # FlashAttentionBackwardSm120 subclasses FlashAttentionBackwardSm80
+            # and overrides only can_implement, so it takes the patched SM80
+            # ctor kwargs and inherits the Q-direction block-sparse main loop.
+            sm8x_kwargs = dict(
+                mask_mod=mask_mod,
+                has_aux_tensors=aux_tensors is not None,
+                q_subtile_factor=q_subtile_factor,
+                kv_subtile_factor=kv_subtile_factor,
             )
             fa_bwd_obj = flash_bwd_obj_cls(
                 dtype,
@@ -3011,9 +2992,10 @@ def _flash_attn_bwd(
             num_threads_post_dKV = cfg.num_wg * 128
         else:
             # The fp32 dQ/dK/dV accumulators are laid out by the main kernel's MMA thread
-            # partition; the postprocess must use the same thread count (SM8x may run 256).
-            num_threads_post_dQ = num_threads if arch // 10 == 8 else 128
-            num_threads_post_dKV = num_threads if arch // 10 == 8 else 128
+            # partition; the postprocess must use the same thread count (SM8x / SM120 run 256
+            # at hdim > 64). Getting this wrong corrupts the accumulation silently.
+            num_threads_post_dQ = num_threads if arch // 10 in [8, 12] else 128
+            num_threads_post_dKV = num_threads if arch // 10 in [8, 12] else 128
 
         _bwd_postprocess_convert(
             dq_accum, dq, softmax_scale,

@@ -69,7 +69,7 @@ flash-attn-4 4.0.0b32 @ d15f153：
   对象，把 vendored 模块按依赖顺序注册进 `sys.modules`，最后才执行 `__init__`。
 
 ## SM89 块稀疏：vendored 的 FA4 SM80 补丁（`miowtion/kernels/fa4_sm8x`）
-补丁系列 `patches/0001..0006` 基于 flash-attention d15f153（BSD-3-Clause，`LICENSE` 与 `AUTHORS`
+补丁系列 `patches/0001..0007` 基于 flash-attention d15f153（BSD-3-Clause，`LICENSE` 与 `AUTHORS`
 随目录提供），改动集中在五个模块：`block_sparsity`、`block_sparse_utils`、`flash_fwd`、`flash_bwd`、
 `interface`。仓库里放的是打完补丁后的这五个文件（再生方法见 `fa4_sm8x/__init__.py` 的 docstring），
 运行期由 `install()` 按依赖顺序替换已安装的 FA4 中的同名模块：
@@ -148,7 +148,16 @@ flash-attn-4 4.0.0b32 @ d15f153：
 - 0005 的低开销 launch cache 在 arch 12 上也注册（其 key 第一项是 `q.device`，所以混插 SM8x +
   SM120 的机器上不会串用）。
 
-反向仍然在 arch 12 上拒绝块稀疏（`_flash_attn_bwd` 的 arch-12 分支保留 assert），单独启用。
+`patches/0007` 把反向也打开了：
+- 把 arch-12 的反向配置**并进 arch-8 分支**。两者原本只差"块稀疏时 Q/dO 单级缓冲"这条覆盖和
+  warp 数，而 SM120 的 smem 与 sm86/sm89 一样，所以一个分支就够。副作用是 arch 12 在 hdim>64
+  时从 4 warps (4,4,4) 换成 8 warps (2,4,4)——**实测这本身就让 SM120 的稠密反向快了 16%**，见下。
+- arch-12 分支原来给反向 kernel 传的是**空 kwargs**，`mask_mod` 和两个 subtile factor 都丢了；
+  现在与 SM8x 传同一套。
+- 反向也接受 `DenseBlockMaskTorch`。
+- dQ/dK/dV 的 postprocess 线程数扩到 arch 12。fp32 累加器是按主 kernel 的 MMA 线程划分摆放的，
+  postprocess 用了不同线程数会**静默算错梯度**；而 arch 12 现在在 hdim>64 时是 256 线程，
+  不再是 128，所以这条必须跟着改。
 
 封装侧（`miowtion/kernels/fa4.py`）：`PATCHED_MAJOR_ARCHS = (8, 12)` 取代原先散落的
 `major == 8` 判断——install 触发条件、`available()`、走 `DenseBlockMaskTorch` 的分支。
@@ -206,6 +215,25 @@ MFU 的分母是**稠密** bf16 tensor core 峰值 504 TFLOP/s（厂商宣传的
   `_tile_size_fwd_sm8x_block_sparse` 选出来的 128×32，本身就比默认 tile 更快，所以"稠密×密度"
   这个理想值被略微超过。不是测错，但也说明 eff 不能当成 >1 就是超线性加速。
 
+### 实测：SM120 反向（补丁 0007 之后）
+56 头、d=128、seq 32768。反向的 FLOPs 按前向的 **2.5 倍**算（dQ/dK/dV/dS 四个 S²HD 矩阵乘，
+加上 FA 在反向里重算一遍 S）。
+
+| 路径 | warps | bwd ms | TFLOP/s | MFU |
+|---|---|---|---|---|
+| 稠密，未打补丁的上游 FA4 | 4 (4,4,4) | 270.42 | 284.6 | 56.5% |
+| 稠密，打了 0007 | 8 (2,4,4) | **232.79** | **330.6** | **65.6%** |
+| 块稀疏（密度 0.102），打了 0007 | 8 (2,4,4) | 26.52 | 294.7 | 58.5% |
+
+- **合并分支带来的 8 warps 让 SM120 的稠密反向快了 16%**（270.4 → 232.8 ms）。这不是顺带的，
+  是把 4090 上调出来的配置用到了 SM120 上；前向不受影响（83.6 vs 84.2 ms，在噪声内）。
+- **稀疏反向相对稠密反向的效率是 0.90**（理想值 232.79 × 0.102 = 23.7 ms，实测 26.5 ms），
+  说明跳块在反向里同样兑现了。
+- **但反向的 MFU 只有 58.5%，达不到 70% 的门槛**；注意稠密反向自己也只有 65.6%。也就是说这是
+  FA 反向在这张卡上的天花板（dQ 的 fp32 atomic、以及比前向多得多的访存），不是稀疏路径的问题。
+  要提反向的 MFU 得另做文章（dQ 的 atomic、split-K 之类），与 SM120 适配无关。
+- 前向在同一次测量里是 8.305 ms / MFU 74.7%，与上一节一致。
+
 结论：
 - **90% 稀疏下 56 头达到 MFU 70.2%（16k）与 71.6%（32k），过了 ≥70% 的门槛。**
   8 头 16k 只有 60.3%，是问题规模太小（2.2 ms → 0.37 ms，occupancy 与启动开销占比上去了），
@@ -240,6 +268,12 @@ MFU 的分母是**稠密** bf16 tensor core 峰值 504 TFLOP/s（厂商宣传的
   **SM8x 未回归验证**（本机没有 4090）：改动只是把 `major == 8` 放宽成 `in (8, 12)`，
   `_force_q_stage_one` 由 `< 10` 改成 `not in (10, 11)`——对 major 8/9/10/11 的行为逐一核对过是
   等价的，但仍需在 4090 上重跑一次 `tests/gpu` 才能销掉这条。
+- 2026-09-28，同机，补丁 0007（反向）之后：`tests/gpu` **13 passed, 0 skipped**，新增
+  `test_fa4_block_sparse_backward_matches_reference`（dQ/dK/dV 对参考实现的 autograd 梯度，
+  只比有效 query 行；另外钉两条：梯度不能全零，且**必须离稀疏梯度比离稠密梯度更近**——否则
+  "块 pattern 被忽略、反向偷偷算稠密"这个已知故障模式测不出来）。反向测速见上一节。
+  注意补丁 0007 顺带改了 SM8x 的**共享分支**（原来 arch 8 与 arch 12 各一份配置，现在合并），
+  对 arch 8 的取值逐行核对过没有变化，但同样**未在 4090 上回归验证**。
 
 ## 待办
 - **FP8 sparse**（用户要求，方案待定）：块稀疏 + FP8（或 INT8 QK / FP8 PV，参考 SageAttention /

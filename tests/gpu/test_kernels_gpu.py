@@ -159,3 +159,56 @@ def test_tile_gather_pool_scatter_match_torch(heads):
     tiling.scatter_tiles_(out_ref, ref_tiles, lay, idx)
     tile_gather_triton.scatter_tiles_(out, tiles, lay, idx)
     assert torch.equal(out[:lay.seq_len], out_ref[:lay.seq_len])
+
+
+@pytest.mark.skipif(not fa4.available(), reason='FA4 block sparsity '
+                    'unsupported on this architecture')
+def test_fa4_block_sparse_backward_matches_reference():
+    """dQ/dK/dV of the sparse kernel match autograd through the reference.
+
+    The kernels read the fp32 dQ/dK/dV accumulators with the main kernel's
+    MMA thread partition, so a postprocess launched with a different thread
+    count corrupts the gradients *silently* (see fa4_sm8x/patches/0005).
+    Only the real query rows are compared: padded slots carry no gradient.
+    """
+    lay = _layout(grid=(8, 12, 20))  # padded grid -> partial tiles
+    q, k, v = _qkv(lay.seq_len)
+    heads = torch.arange(4, device='cuda')
+    qt, kt, vt = (tiling.gather_tiles(t, lay, heads) for t in (q, k, v))
+    scores = torch.randn(4, lay.n_tiles, lay.n_tiles, device='cuda')
+    blocks = veda_mask.column_blocks(lay, veda_mask.Budget(ratio=0.3))
+    sel = veda_mask.select_video_blocks(scores[:, :lay.n_video_tiles], lay,
+                                        blocks)
+    block_mask = veda_mask.dense_block_mask(sel, lay)
+    real = lay.slot_valid.bool()
+    grad_out = torch.randn_like(qt)
+
+    def grads(fn):
+        tensors = [t.detach().clone().requires_grad_(True)
+                   for t in (qt, kt, vt)]
+        out = fn(*tensors)
+        out.backward(grad_out)
+        return [t.grad for t in tensors]
+
+    got = grads(lambda a, b, c: fa4.block_sparse_attention(
+        a, b, c, block_mask, lay))
+    want = grads(lambda a, b, c: reference.block_sparse_attention(
+        a, b, c, block_mask, lay.valid_count))
+    # FA4's backward computes *dense* gradients when it is not given the block
+    # pattern (it does so silently on SM90/SM100 without the _bwd lists), so
+    # matching the reference is not enough: the dense gradients must also be
+    # visibly further away, otherwise the test would pass on a dense kernel.
+    dense_mask = torch.ones_like(block_mask)
+    dense = grads(lambda a, b, c: reference.block_sparse_attention(
+        a, b, c, dense_mask, lay.valid_count))
+    for name, g, w, d in zip('qkv', got, want, dense):
+        torch.testing.assert_close(
+            g[real].float(), w[real].float(), rtol=3e-2, atol=3e-2,
+            msg=lambda m, name=name: f'd{name} mismatch\n{m}')
+        assert not g[real].eq(0).all(), f'd{name} is all zeros'
+        sparse_err = (g[real].float() - w[real].float()).abs().max()
+        dense_err = (g[real].float() - d[real].float()).abs().max()
+        assert sparse_err < dense_err, (
+            f'd{name} is as close to the dense gradient ({dense_err:.3e}) as '
+            f'to the sparse one ({sparse_err:.3e}): the block pattern was '
+            'likely ignored')
