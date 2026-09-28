@@ -106,7 +106,7 @@ def _local_rows(param: torch.Tensor) -> torch.Tensor | None:
     return torch.arange(offset[0], offset[0] + local_shape[0])
 
 
-def _expected_dtype(name: str) -> torch.dtype:
+def expected_dtype(name: str) -> torch.dtype:
     if name.startswith(h3_config.FP32_PARAM_PREFIXES) or (
             name in h3_config.FP32_BUFFER_NAMES):
         return torch.float32
@@ -138,19 +138,29 @@ def _check_mlp_order(config: h3_config.H3Config,
 
 
 def load_dit_weights(model: h3_model.H3DiT, transformer_dir: str,
-                     skip_prefixes: Iterable[str] = ()) -> None:
+                     skip_prefixes: Iterable[str] = (),
+                     checkpoint=None) -> None:
     """Loads a released checkpoint into `model` (plain or FSDP2-sharded).
 
     Every model parameter/buffer must be found in the checkpoint and every
     checkpoint tensor must be consumed, except names under `skip_prefixes`
     (e.g. adaln projections that were replaced by precomputed tables).
 
+    Args:
+        model: The DiT to fill.
+        transformer_dir: `<root>/<variant>/transformer`.
+        skip_prefixes: Checkpoint names that are not loaded.
+        checkpoint: Tensor source with `keys()` / `read_rows()`; defaults
+            to `Checkpoint(transformer_dir)`. Benchmarks pass a
+            `miowtion.h3.synthetic.RandomCheckpoint`.
+
     Raises:
         KeyError: On missing or unexpected tensors.
         ValueError: On shape or dtype mismatches, or when the checkpoint's
             release disagrees with `model.config.mlp_gate_first`.
     """
-    ckpt = Checkpoint(transformer_dir)
+    ckpt = checkpoint if checkpoint is not None else Checkpoint(
+        transformer_dir)
     _check_mlp_order(model.config, ckpt.keys())
     skip_prefixes = tuple(skip_prefixes)
     # LoRA parameters (miowtion.train.lora) are not part of the release.
@@ -175,9 +185,9 @@ def load_dit_weights(model: h3_model.H3DiT, transformer_dir: str,
         else:
             rows = local_rows
         value = ckpt.read_rows(name, rows)
-        if value.dtype != _expected_dtype(name):
+        if value.dtype != expected_dtype(name):
             raise ValueError(f'{name}: checkpoint dtype {value.dtype}, '
-                             f'expected {_expected_dtype(name)}')
+                             f'expected {expected_dtype(name)}')
         target = param.to_local() if isinstance(
             param, dtensor.DTensor) else param
         if target.dtype != value.dtype:

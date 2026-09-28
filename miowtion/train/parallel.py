@@ -315,8 +315,8 @@ def replicate(model: h3_model.H3DiT, device: torch.device,
 def build_model(transformer_dir: str, env: DistEnv, drop_adaln: bool,
                 offload_blocks: int = 0, prefetch: int = 1,
                 mlp_chunk_rows: int | None = None,
-                before_shard: Callable[[h3_model.H3DiT], object] | None = None
-                ) -> h3_model.H3DiT:
+                before_shard: Callable[[h3_model.H3DiT], object] | None = None,
+                checkpoint=None) -> h3_model.H3DiT:
     """Meta-initializes, shards and loads the DiT shard-locally.
 
     Args:
@@ -331,6 +331,8 @@ def build_model(transformer_dir: str, env: DistEnv, drop_adaln: bool,
         before_shard: Called on the meta model before sharding (e.g. to add
             LoRA parameters, which must shard with their block). Parameters
             it creates are uninitialized afterwards and must be reset.
+        checkpoint: Tensor source (see h3_weights.load_dit_weights);
+            defaults to the safetensors under `transformer_dir`.
 
     Returns:
         The model on env.device, trunk sharded when distributed.
@@ -366,7 +368,8 @@ def build_model(transformer_dir: str, env: DistEnv, drop_adaln: bool,
                      for i in range(config.num_layers))
     with progress.Timer(f'load weights from {transformer_dir}'):
         h3_weights.load_dit_weights(model, transformer_dir,
-                                    skip_prefixes=skip)
+                                    skip_prefixes=skip,
+                                    checkpoint=checkpoint)
     model.set_mlp_chunk_rows(mlp_chunk_rows)
     if offload and not use_fsdp:
         model.block_streamer = BlockStreamer(model.blocks, offload,

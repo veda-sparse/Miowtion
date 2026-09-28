@@ -33,6 +33,19 @@ one process would only make them fight over the same 24 GB card.
         --sample-cache artifacts/samples/x --sample-id s0 \\
         --geometry 16:9@37 16:9@102 --attention dense veda \\
         --predictor artifacts/bundles/p.safetensors --out runs/bench/a.json
+
+'--random-weights' times the same DiT on a machine without the weights:
+the release's config files (the third_party/MiniMax-H3 submodule) give
+every shape, the tensors are random (miowtion.h3.synthetic), the prompt is
+--text-len random rows and the Veda predictor and plans are random too
+(miowtion.veda.bundle.random_bundle). A step's cost depends only on shapes
+and on the Veda budget, so step time, attention time and MFU are the real
+ones; the startup times are not (no file is read, no LoRA is merged), and
+the samples are noise:
+
+    python scripts/benchmark.py --root third_party/MiniMax-H3 \\
+        --random-weights --geometry 16:9@37 --attention dense veda \\
+        --offload-blocks 0 --out runs/bench/random.json
 """
 
 import argparse
@@ -57,6 +70,13 @@ from miowtion.utils import progress
 from miowtion.veda import attention as veda_attention
 from miowtion.veda import bundle as veda_bundle
 from miowtion.veda import mask as veda_mask
+
+
+# Text rows of holdout14s_0000, the sample of the real-weight records in
+# docs/benchmark/performance.md, so random-weight runs have the same layout.
+RANDOM_TEXT_LEN = 589
+# Seed of the random weights, prompt rows and predictor.
+_RANDOM_SEED = 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -98,6 +118,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--mlp-chunk-rows', type=int, default=8192)
     parser.add_argument('--decode', action='store_true',
                         help='also time the VAE decode (frames are dropped)')
+    parser.add_argument('--random-weights', action='store_true',
+                        help='random DiT, prompt and predictor (only the '
+                        'config files under --root are read); step times '
+                        'are real, samples are noise')
+    parser.add_argument('--text-len', type=int, default=RANDOM_TEXT_LEN,
+                        help='prompt rows with --random-weights')
     parser.add_argument('--out', required=True, help='JSON to write')
     return parser
 
@@ -262,6 +288,9 @@ def _write(args, device_name: str, records: list[dict]) -> None:
                     'mlp_chunk_rows': args.mlp_chunk_rows},
         'schedule': {'kind': args.schedule, 'nfe': args.num_steps,
                      'adapter': bool(args.adapter)},
+        # Random weights time the real shapes but skip every file read, so
+        # a reader must not compare their startup stages with a release run.
+        'weights': 'random' if args.random_weights else 'release',
         'runs': records,
     }
     with open(args.out, 'w') as f:
@@ -279,9 +308,18 @@ def main() -> None:
             json.dump(payload, f, indent=1)
         progress.log(f'wrote {args.out}')
         return
-    if not args.sample_cache or not args.geometry:
-        raise ValueError('--stage dit needs --sample-cache and --geometry')
-    if 'veda' in args.attention and not args.predictor:
+    if not args.geometry:
+        raise ValueError('--stage dit needs --geometry')
+    if args.random_weights:
+        if args.sample_cache or args.predictor or args.adapter:
+            raise ValueError('--random-weights takes no --sample-cache, '
+                             '--predictor or --adapter')
+        if args.decode:
+            raise ValueError('--random-weights cannot --decode: the VAEs '
+                             'are only constructible from their weights')
+    elif not args.sample_cache:
+        raise ValueError('--stage dit needs --sample-cache')
+    elif 'veda' in args.attention and not args.predictor:
         raise ValueError('veda needs --predictor')
     if args.keep_ratio is None:
         args.keep_ratio = (
@@ -289,13 +327,19 @@ def main() -> None:
             if args.predictor else 0.1)
     geometries = [data.parse_geometry(g) for g in args.geometry]
 
-    cache_dir = args.sample_cache
-    cache = data.SampleCache(cache_dir)
-    candidates = [s for s in cache.samples if s.task == args.task
-                  and (args.sample_id is None or s.id == args.sample_id)]
-    if not candidates:
-        raise ValueError(f'no {args.task} sample in {cache_dir}')
-    sample = candidates[0]
+    if args.random_weights:
+        config = h3_config.H3Config.from_pretrained(
+            os.path.join(args.root, args.variant, 'transformer'))
+        cache = data.SyntheticSampleCache(args.text_len, config.text_dim,
+                                          _RANDOM_SEED)
+        sample = cache.samples[0]
+    else:
+        cache = data.SampleCache(args.sample_cache)
+        candidates = [s for s in cache.samples if s.task == args.task
+                      and (args.sample_id is None or s.id == args.sample_id)]
+        if not candidates:
+            raise ValueError(f'no {args.task} sample in {args.sample_cache}')
+        sample = candidates[0]
 
     env = parallel.init_distributed()
     device = env.device
@@ -306,11 +350,18 @@ def main() -> None:
         env, visual_conditions=args.task != 't2va',
         audio_references=args.variant == 'Ref2VA',
         offload_blocks=args.offload_blocks, prefetch=args.prefetch,
-        mlp_chunk_rows=args.mlp_chunk_rows, stages=stages)
+        mlp_chunk_rows=args.mlp_chunk_rows, stages=stages,
+        random_weights_seed=_RANDOM_SEED if args.random_weights else None)
     plans = predictor = veda_config = None
     if 'veda' in args.attention:
         with progress.Timer('load the predictor bundle') as timer:
-            loaded = veda_bundle.load(args.predictor, device)
+            if args.random_weights:
+                config = tch.model.config
+                loaded = veda_bundle.random_bundle(
+                    config.num_layers, config.num_heads, config.head_dim,
+                    geometries, args.keep_ratio, _RANDOM_SEED, device)
+            else:
+                loaded = veda_bundle.load(args.predictor, device)
             plans, predictor = loaded.plans, loaded.predictor
         stages['predictor'] = timer.seconds
         veda_config = veda_attention.VedaConfig(

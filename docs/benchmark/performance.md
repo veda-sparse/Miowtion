@@ -212,12 +212,110 @@ CUDA_VISIBLE_DEVICES=0 python scripts/benchmark.py \
   --max-memory "0=20GiB,cpu=90GiB" \
   --out runs/bench/t2va_text_encoder_4090_1gpu.json
 
+# 随机权重（§11，只需要 third_party/MiniMax-H3 子模块里的配置文件）
+CUDA_VISIBLE_DEVICES=0 python scripts/benchmark.py \
+  --root third_party/MiniMax-H3 --random-weights \
+  --geometry 16:9@37 16:9@72 16:9@102 --attention dense veda \
+  --offload-blocks 0 --mlp-chunk-rows 8192 --out runs/bench/random_pro6000.json
+
 # 训练（阶段 1，accum 1 所以一次 update 就是一个 micro-step）
 CUDA_VISIBLE_DEVICES=0 torchrun --nproc_per_node=1 scripts/train.py \
   --config configs/stage1_bench_16x9_t37_1gpu.yaml
 ```
 
-## 11. Kernel 端到端复测
+## 11. 随机权重实测（不需要真实权重）
+
+`scripts/benchmark.py --random-weights` 在只有 release 配置文件（`third_party/MiniMax-H3`
+子模块）的机器上量同一个 DiT，用于"拿到一张新卡，先看它能跑多快"。
+
+**为什么数字可信**：一步 DiT 的成本只由形状决定——每个 GEMM、每次注意力、每次 offload
+block 的 H2D 拷贝，形状和 dtype 与权重取值无关；Veda 按预算保留固定比例的块，top-k
+保留的块数与打分无关。所以稳态 step、注意力时间、MFU 与真实权重同口径。
+
+**替换了什么**（其余路径——meta 构建、offload 放置、pin、严格的名字 / 形状 / dtype 检查、
+AdaLN 表——原样执行）：
+
+| 真实输入 | 随机替身 | 代码 |
+|---|---|---|
+| DiT 权重（safetensors） | `RandomCheckpoint`：release 自己的 index 给出张量名，meta 模型给出形状；矩阵 N(0, 1/fan_in)、norm 为 1、bias 为 0、RoPE 频率用模型自己的 | `miowtion/h3/synthetic.py` |
+| 编码后的 prompt | `--text-len` 行随机 hidden（默认 589，与 §3 的样本同长，所以布局相同） | `data.SyntheticSampleCache` |
+| 打分器 bundle + 方案表 | 随机初始化的打分器（bf16 常驻，与 fp8 bundle 加载后一致）+ 每个几何一张最小 padding 的 uniform 方案 | `veda.bundle.random_bundle` |
+| 少步 LoRA | 不合并（随机权重上的 LoRA 没有意义，且合并只是启动开销） | — |
+
+**不可比的部分**：启动各 stage（没有读文件、没有合并 LoRA）；生成的样本是噪声。
+搜索出来的方案表每层最多混用几种 tile 形状，padding 与 uniform 方案略有不同，所以 Veda
+的数字与真实 bundle 可能有几个百分点的差别。VAE 解码不支持：release 的 VAE 类只能从
+权重文件构造，`--random-weights --decode` 直接报错。JSON 里 `weights: "random"` 标明来源。
+
+### 11.1 1×RTX PRO 6000 Blackwell Server Edition（96 GB）
+
+2026-09-28，torch 2.14.0+cu130，稠密 bf16 峰值 503.8 TFLOP/s；**offload 0**（DiT 常驻显存，
+约 45 GB 权重）、`mlp_chunk_rows 8192`、TP = SP = DP = 1；请求与 §3 相同（t2va 16:9，
+text_len 589，turbo 8 步，keep 0.1）。每步 FLOP 数与 §3.1 逐位相同（同一布局）。
+
+| latent_t | 注意力 | 稳态 step | 注意力 | 非注意力 | MFU | 4090 同项 step | 相对 4090 |
+|---|---|---:|---:|---:|---:|---:|---:|
+| 37 | 稠密 | 10.89 s | 5.80 s | 5.08 s | 65.3% | 24.48 s | 2.25× |
+| 37 | Veda 10% | 6.35 s | 1.43 s | 4.92 s | 52.8% | 13.81 s | 2.18× |
+| 72 | 稠密 | 31.93 s | 22.00 s | 9.93 s | 66.5% | 71.02 s | 2.22× |
+| 72 | Veda 10% | 13.74 s | 4.05 s | 9.69 s | 52.5% | 29.29 s | 2.13× |
+| 102 | 稠密 | 58.03 s | 44.02 s | 14.00 s | 67.4% | 129.58 s | 2.23× |
+| 102 | Veda 10% | 21.85 s | 8.16 s | 13.68 s | 50.9% | 45.95 s | 2.10× |
+
+注意力加速 4.07× / 5.44× / 5.39×，step 加速 1.71× / 2.32× / 2.66×。算力是 4090 的 3 倍，
+step 却只快 2.2 倍：MFU 从 4090 的 88~92% 掉到 65~67%，原因见 11.2。
+
+### 11.2 一步的 GPU 时间拆解（torch.profiler）
+
+方法：随机权重、eager（与 benchmark 相同），第 0 步预热（FA4 JIT），第 1 步用
+`record_function` 给每个组件打标签、`with_stack` 采集，kernel 通过 launch 的 correlation
+归到发起它的最内层标签；**kernel 时间之和、GPU busy 并集、墙上时间分开报**。profiler
+本身的开销 < 2%（6.27 → 6.38 s）。这次验证拿不到 GPU 性能计数器（`ncu` 报
+`ERR_NVGPUCTRPERM`），所以 kernel 内部的 pipe 利用率没有测，下面对 kernel 的判断以
+"实测 GEMM 上限"为尺子：cuBLAS bf16 8192³ 在这张卡上只有 **432.5 TFLOP/s**（峰值的
+86%；FA4 与 cuBLAS 在 SM120 上都走 SM80 时代的 `mma.sync`）。
+
+Veda t102 一步（21.6 s kernel 时间，busy 并集 21.6 s，墙上 22.0 s）：
+
+| 组件 | GPU 时间 | 占比 | 说明 |
+|---|---:|---:|---|
+| FA4 块稀疏 kernel | 7.37 s | 34.1% | 279 TFLOP/s，峰值的 55%，GEMM 上限的 65% |
+| MLP（fc1 / fc2 GEMM） | 5.90 s | 27.3% | GEMM 392~416 TFLOP/s，已是上限的 91~96% |
+| QKV / out_proj GEMM | 3.89 s | 18.0% | 同上 |
+| 访存型逐元素算子 | ≈3.6 s | ≈17% | RoPE 1.09（cat / mul / add / neg 四类 kernel）、AdaLN modulate 0.73、门控残差 0.66、qk RMSNorm + split 拷贝 0.59、SwiGLU silu×mul 0.52 |
+| Veda 自身（gather / pool / 打分器 / top-k / 掩码 / scatter） | 0.54 s | 2.5% | |
+| GPU 空闲 | 0.41 s | 1.9% | 几乎全在 Veda：`select_video_blocks` 里的 `torch.nonzero` 每次调用同步一次主机（0.21 s），FA4 CuTe 每次调用的主机侧参数适配（0.12 s），`dense_block_mask`（0.08 s） |
+
+稠密一步 GPU 几乎不空闲（t37：idle 0.004 s / 10.8 s），CPU 一直跑在 GPU 前面，launch
+开销不是问题。稠密 FA4 kernel 357~368 TFLOP/s（峰值 71~73%，GEMM 上限 83~85%）。
+
+### 11.3 可优化的点（按收益排序，均未实现）
+
+1. **FA4 块稀疏按头分块太碎**（已实测）：`veda/attention.py` 的 `_COLLECT_BYTES = 256 MiB`
+   是为 24 GB 卡定的，t102 被切成 7 个 head chunk、每步 1050 次 FA4 调用。改成 2 GiB
+   （56 个头一次）后 t102 Veda step **21.73 → 19.88 s（−8.5%）**，块稀疏 kernel
+   7.37 → 5.58 s（−24%，MFU 55% → 73%，与稠密 kernel 持平），GPU 空闲 0.41 → 0.07 s；
+   t37 6.27 → 6.03 s。分块不改变结果（各头独立），所以应按显存余量自适应而不是写死。
+   分块为什么这么贵还没有证据，猜测是全局行（text / audio 的 q tile 看全部 key tile，
+   工作量是视频行的约 8 倍）在每次 launch 的末尾形成长尾——需要 ncu 或按 CTA 计时确认；
+   若属实，24 GB 卡上也可以通过把全局行单独成一次调用或先调度重 CTA 来拿回这部分。
+2. **访存型逐元素算子融合**（t102 占 Veda step 的 ≈17%，t37 约 1.3 s / 6.3 s ≈ 21%）：RoPE
+   （`_rotate_half` 的 cat + neg + mul + add）→ 一个 kernel；RMSNorm + AdaLN modulate
+   （index_select + mul + add）→ 一个 kernel；门控残差 → 一个 kernel；qk-norm 与 RoPE
+   合并；SwiGLU 的 silu×mul 融进 fc1 的 epilogue。按 1.8 TB/s 估算，理想读写量约为现在的
+   1/4~1/5，t102 上可省 ~2.5 s/step（估算，未实测）。这部分在 4090 上被 H2D 掩盖，在
+   PRO 6000 上算力涨了 3 倍、带宽只涨 1.8 倍，于是暴露出来。
+3. **稠密注意力 kernel 只有 GEMM 上限的 83~85%**（稠密 t102 一步 76% 的时间）：`mma.sync`
+   同步发射，softmax 的 exp / 缩放不能与 MMA 重叠；在 3 倍于 4090 的张量算力下，这部分
+   不再被掩盖（4090 上同一 kernel 达到峰值的 ~94%）。方向：warp 专精 / ping-pong softmax、
+   exp2 的 FMA 多项式模拟（FA4 在 SM100 上的做法）。需要 ncu 权限才能确认瓶颈。
+4. **去掉 Veda 路径上的主机同步**（≈2% 的 step）：`select_video_blocks` 的 `nonzero` 可以
+   换成与布局绑定的预计算索引，`bresenham_extra` 可缓存；FA4 块稀疏调用的主机侧开销在
+   调用数减少后（第 1 条）自然下降。
+5. **GEMM** 已在上限的 91~96%，bf16 下空间很小；再往上只能换精度（FP8 `mma.sync` 在
+   SM120 上是 bf16 的 2 倍），会改变数值，需要单独做对齐与人工确认。
+
+## 12. Kernel 端到端复测
 
 `scripts/bench_e2e.py` 对每个序列长度执行多轮独立测量，并把原始轮次和聚合结果写入 JSON。
 这里的 `kernel_ms` 只测已经准备好的掩码，`prep_ms` 包含每次调用的掩码准备、kernel 启动和

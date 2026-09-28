@@ -211,3 +211,20 @@ def test_fp8_bundle_without_a_scale_is_rejected(tmp_path):
     save_file(tensors, path, metadata=metadata)
     with pytest.raises(ValueError, match='without a .* scale'):
         veda_bundle.load(path)
+
+
+def test_random_bundle_covers_every_geometry():
+    geos = [h3_geometry.Geometry('16:9', 256, 128, 22, 7, 8, 16, 37),
+            h3_geometry.Geometry('9:16', 128, 256, 22, 7, 16, 8, 37)]
+    bundle = veda_bundle.random_bundle(2, 4, 32, geos, 0.1, seed=0)
+    assert bundle.keep_ratio == 0.1
+    assert all(p.dtype == torch.bfloat16
+               for p in bundle.predictor.parameters())
+    for geo in geos:
+        plan = bundle.plans.select(geo)
+        assert plan.geometry == geo.name
+        assert plan.shapes == [tiling.least_padding_shape(geo.video_grid)]
+        assert plan.num_layers == 2
+    again = veda_bundle.random_bundle(2, 4, 32, geos, 0.1, seed=0)
+    assert all(torch.equal(a, b) for a, b in zip(
+        bundle.predictor.parameters(), again.predictor.parameters()))

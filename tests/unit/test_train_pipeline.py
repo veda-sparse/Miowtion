@@ -406,3 +406,19 @@ def test_summarize_norms_keeps_one_predictor_entry():
     got = trainer_lib.summarize_norms(
         {'predictor.layers.0': 3.0, 'predictor.layers.1': 4.0, 'head': 2.0})
     assert got == {'predictor': pytest.approx(5.0), 'head': 2.0}
+
+
+def test_synthetic_sample_cache():
+    cache = data.SyntheticSampleCache(7, _TINY.text_dim, seed=1)
+    sample = cache.samples[0]
+    assert sample.task == 't2va' and sample.text_len == 7
+    hidden, tags = cache.text(sample)
+    assert hidden.shape == (7, _TINY.text_dim)
+    assert hidden.dtype == torch.bfloat16
+    assert torch.equal(tags, torch.ones(7, dtype=torch.long))
+    video, audio = cache.conditions(sample)
+    assert video.shape == (0, 96) and audio.shape == (0, 32)
+    again = data.SyntheticSampleCache(7, _TINY.text_dim, seed=1)
+    assert torch.equal(again.text(sample)[0], hidden)
+    with pytest.raises(ValueError):
+        data.SyntheticSampleCache(0, _TINY.text_dim)

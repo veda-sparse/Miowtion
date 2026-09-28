@@ -171,6 +171,47 @@ class SampleCache:
         return video, audio
 
 
+class SyntheticSampleCache:
+    """A SampleCache stand-in holding one random t2va sample.
+
+    For benchmarks without an encoded prompt: a DiT step only sees the
+    prompt through its row count (the text rows of the packed layout and
+    the token refiner), so random rows of the right length cost the same
+    as encoded ones.
+    """
+
+    def __init__(self, text_len: int, text_dim: int, seed: int = 0):
+        """Draws the rows once.
+
+        Args:
+            text_len: Text rows of the prompt (e.g. 589 for a typical
+                structured prompt of the holdout set).
+            text_dim: Width of the text encoder's hidden states.
+
+        Raises:
+            ValueError: On a non-positive `text_len`.
+        """
+        if text_len <= 0:
+            raise ValueError(f'text_len must be positive, got {text_len}')
+        generator = torch.Generator().manual_seed(seed)
+        self._hidden = torch.randn(text_len, text_dim,
+                                   generator=generator).to(torch.bfloat16)
+        self.samples = [Sample(id=f'synthetic_text{text_len}', task='t2va',
+                               split='test', text=(0, text_len))]
+
+    def text(self, sample: Sample) -> tuple[torch.Tensor, torch.Tensor]:
+        """(hidden [L, D] bf16, tags [L] int64); every row is text."""
+        del sample
+        return self._hidden, torch.ones(self._hidden.shape[0],
+                                        dtype=torch.long)
+
+    def conditions(self, sample: Sample
+                   ) -> tuple[torch.Tensor, torch.Tensor]:
+        """t2va has no condition rows."""
+        del sample
+        return torch.empty(0, 96), torch.empty(0, 32)
+
+
 class SampleCacheWriter:
     """Accumulates encoded samples and writes a cache atomically."""
 

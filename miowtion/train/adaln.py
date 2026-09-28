@@ -51,7 +51,7 @@ class AdalnTables:
     @torch.no_grad()
     def build(self, model: h3_model.H3DiT, transformer_dir: str,
               timestep_sets: Iterable[torch.Tensor], device: torch.device,
-              adapter: dict | None = None) -> set[str]:
+              adapter: dict | None = None, checkpoint=None) -> set[str]:
         """Computes tables for every set, reading one block at a time.
 
         Args:
@@ -62,6 +62,8 @@ class AdalnTables:
             adapter: Optional merged LoRA (miowtion.train.lora.load_adapter);
                 its `blocks.{i}.adaln_proj.linear` deltas are merged into the
                 projection weights before the tables are computed.
+            checkpoint: Tensor source (see h3_weights.load_dit_weights);
+                defaults to the safetensors under `transformer_dir`.
 
         Returns:
             Adapter entries consumed here.
@@ -76,7 +78,8 @@ class AdalnTables:
             return consumed
         inputs = {k: F.silu(model.time_embedder(t)).to(torch.bfloat16)
                   for k, t in sets.items()}
-        ckpt = h3_weights.Checkpoint(transformer_dir)
+        ckpt = checkpoint if checkpoint is not None else (
+            h3_weights.Checkpoint(transformer_dir))
         tables = {k: [] for k in sets}
         hidden = model.config.hidden_size
         counter = progress.Progress(

@@ -19,6 +19,7 @@ import os
 
 from miowtion.h3 import model as h3_model
 from miowtion.h3 import schedule as h3_schedule
+from miowtion.h3 import synthetic
 from miowtion.train import adaln
 from miowtion.train import lora
 from miowtion.train import parallel
@@ -55,24 +56,39 @@ def build_teacher(checkpoint_root: str, variant: str, schedule: str,
                   audio_references: bool, offload_blocks: int = 0,
                   prefetch: int = 1, mlp_chunk_rows: int | None = None,
                   before_shard=None,
-                  stages: dict[str, float] | None = None) -> Teacher:
+                  stages: dict[str, float] | None = None,
+                  random_weights_seed: int | None = None) -> Teacher:
     """Loads, merges and tabulates the frozen teacher.
 
     Args:
         stages: Optional dict; the wall time of the three startup phases
             ('load_weights', 'merge_adapter', 'adaln_tables') is written
             into it, for scripts/benchmark.py.
+        random_weights_seed: When set, the weights are random
+            (miowtion.h3.synthetic.RandomCheckpoint) and `checkpoint_root`
+            only needs the release's config files. For benchmarks: the
+            teacher runs at full cost but its outputs are noise.
 
     Raises:
         KeyError: If an adapter entry has no destination.
+        ValueError: If an adapter is given with random weights (a LoRA
+            delta on random weights has no meaning, and its merge is a
+            startup cost, not part of a step).
     """
     variant_dir = os.path.join(checkpoint_root, variant)
     transformer_dir = os.path.join(variant_dir, 'transformer')
+    checkpoint = None
+    if random_weights_seed is not None:
+        if adapter_path:
+            raise ValueError('random weights take no adapter')
+        checkpoint = synthetic.RandomCheckpoint(
+            transformer_dir, random_weights_seed, device=env.device)
     with progress.Timer('load the teacher weights') as timer:
         model = parallel.build_model(
             transformer_dir, env, drop_adaln=True,
             offload_blocks=offload_blocks, prefetch=prefetch,
-            mlp_chunk_rows=mlp_chunk_rows, before_shard=before_shard)
+            mlp_chunk_rows=mlp_chunk_rows, before_shard=before_shard,
+            checkpoint=checkpoint)
     if stages is not None:
         stages['load_weights'] = timer.seconds
     model.requires_grad_(False)
@@ -96,7 +112,7 @@ def build_teacher(checkpoint_root: str, variant: str, schedule: str,
             model, transformer_dir,
             trajectory.schedule_timestep_sets(sched, visual_conditions,
                                               audio_references),
-            env.device, adapter=adapter)
+            env.device, adapter=adapter, checkpoint=checkpoint)
     if stages is not None:
         stages['adaln_tables'] = timer.seconds
     if adapter is not None:

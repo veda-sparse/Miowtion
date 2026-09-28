@@ -33,13 +33,16 @@ from __future__ import annotations
 
 import dataclasses
 import json
+from collections.abc import Sequence
 
 import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
 
+from miowtion.h3 import geometry as h3_geometry
 from miowtion.veda import plan as veda_plan
 from miowtion.veda import predictor as veda_predictor
+from miowtion.veda import tiling
 
 FORMAT = 'miowtion-veda-predictor-v1'
 
@@ -242,3 +245,35 @@ def load(path: str, device: torch.device | str = 'cpu') -> Bundle:
     return Bundle(predictor=model.to(device).eval(), plans=plans,
                   keep_ratio=float(metadata['keep_ratio']),
                   metadata=metadata)
+
+
+def random_bundle(num_layers: int, num_heads: int, head_dim: int,
+                  geometries: Sequence[h3_geometry.Geometry],
+                  keep_ratio: float, seed: int = 0,
+                  device: torch.device | str = 'cpu') -> Bundle:
+    """A bundle with a randomly initialized predictor, for benchmarks.
+
+    What a Veda step costs is fixed by the budget (the kept fraction of
+    blocks), the plan's tile shapes and the predictor's shape, not by the
+    scores: top-k keeps the same number of blocks whatever it ranks. So a
+    random predictor times the same as a trained one; its masks are just
+    arbitrary.
+
+    The plan of each geometry is uniform over the least-padding tile shape
+    of its video grid. A searched plan mixes up to a few shapes per layer
+    (miowtion.veda.search), so its padding, and hence its cost, can differ
+    slightly from this bootstrap plan.
+
+    The predictor is resident in bf16, as a loaded fp8 or bf16 bundle is.
+    """
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(seed)
+        predictor = veda_predictor.TileScorePredictor(num_layers, num_heads,
+                                                      head_dim)
+    plans = veda_plan.PlanTable([
+        veda_plan.TilePlan.uniform(
+            g, tiling.least_padding_shape(g.video_grid), num_layers,
+            num_heads) for g in geometries])
+    return Bundle(predictor=predictor.to(device, torch.bfloat16).eval(),
+                  plans=plans, keep_ratio=keep_ratio,
+                  metadata={'source': 'random', 'seed': str(seed)})

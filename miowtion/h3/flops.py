@@ -40,6 +40,9 @@ from miowtion.h3 import layout as h3_layout
 # every MFU we report.
 PEAK_BF16_FLOPS = {
     'NVIDIA GeForce RTX 4090': 165.2e12,
+    # Same figure as miowtion.kernels.bench (bf16, fp32 accumulate).
+    'NVIDIA RTX PRO 6000 Blackwell Server Edition': 503.8e12,
+    'NVIDIA RTX PRO 6000 Blackwell Workstation Edition': 503.8e12,
     'NVIDIA H100 80GB HBM3': 989.4e12,
     'NVIDIA H100 PCIe': 756.0e12,
     'NVIDIA A100-SXM4-80GB': 312.0e12,
