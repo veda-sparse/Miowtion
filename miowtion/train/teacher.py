@@ -54,18 +54,27 @@ def build_teacher(checkpoint_root: str, variant: str, schedule: str,
                   env: parallel.DistEnv, visual_conditions: bool,
                   audio_references: bool, offload_blocks: int = 0,
                   prefetch: int = 1, mlp_chunk_rows: int | None = None,
-                  before_shard=None) -> Teacher:
+                  before_shard=None,
+                  stages: dict[str, float] | None = None) -> Teacher:
     """Loads, merges and tabulates the frozen teacher.
+
+    Args:
+        stages: Optional dict; the wall time of the three startup phases
+            ('load_weights', 'merge_adapter', 'adaln_tables') is written
+            into it, for scripts/benchmark.py.
 
     Raises:
         KeyError: If an adapter entry has no destination.
     """
     variant_dir = os.path.join(checkpoint_root, variant)
     transformer_dir = os.path.join(variant_dir, 'transformer')
-    model = parallel.build_model(
-        transformer_dir, env, drop_adaln=True, offload_blocks=offload_blocks,
-        prefetch=prefetch, mlp_chunk_rows=mlp_chunk_rows,
-        before_shard=before_shard)
+    with progress.Timer('load the teacher weights') as timer:
+        model = parallel.build_model(
+            transformer_dir, env, drop_adaln=True,
+            offload_blocks=offload_blocks, prefetch=prefetch,
+            mlp_chunk_rows=mlp_chunk_rows, before_shard=before_shard)
+    if stages is not None:
+        stages['load_weights'] = timer.seconds
     model.requires_grad_(False)
     model.eval()
     sched = make_schedule(schedule, num_steps,
@@ -75,17 +84,21 @@ def build_teacher(checkpoint_root: str, variant: str, schedule: str,
     adapter = None
     merged = set()
     if adapter_path:
-        with progress.Timer(f'merge few-step adapter {adapter_path}'):
+        with progress.Timer(f'merge few-step adapter {adapter_path}') as timer:
             adapter = lora.load_adapter(adapter_path)
             merged = lora.merge_adapter(model, adapter, skip=_is_block_adaln,
                                         compute_device=env.device)
+        if stages is not None:
+            stages['merge_adapter'] = timer.seconds
     tables = adaln.AdalnTables()
-    progress.log('precomputing AdaLN tables')
-    consumed = tables.build(
-        model, transformer_dir,
-        trajectory.schedule_timestep_sets(sched, visual_conditions,
-                                          audio_references),
-        env.device, adapter=adapter)
+    with progress.Timer('precompute AdaLN tables') as timer:
+        consumed = tables.build(
+            model, transformer_dir,
+            trajectory.schedule_timestep_sets(sched, visual_conditions,
+                                              audio_references),
+            env.device, adapter=adapter)
+    if stages is not None:
+        stages['adaln_tables'] = timer.seconds
     if adapter is not None:
         missing = set(adapter) - merged - consumed
         if missing:

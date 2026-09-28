@@ -98,6 +98,21 @@ class Decoder:
         with open(os.path.join(audio_dir, 'config.json')) as f:
             self.sample_rate = int(json.load(f)['sample_rate'])
 
+    def to(self, device: torch.device) -> 'Decoder':
+        """Moves both VAEs to `device` and returns self.
+
+        A 24 GB card cannot hold the VAEs and a long clip's attention
+        activations at once: leaving the 2.4B video decoder resident
+        costs ~5 GiB and OOMs the denoise at latent_t 102. A caller that
+        alternates between denoising and decoding parks the decoder on
+        the host in between.
+        """
+        self.device = device
+        if self.video_vae is not None:
+            self.video_vae.to(device)
+        self.audio_vae.to(device)
+        return self
+
     @torch.no_grad()
     def video(self, rows: torch.Tensor,
               geometry: h3_geometry.Geometry) -> np.ndarray:
@@ -186,6 +201,21 @@ class DiffusersDecoder:
         self.audio_mean, self.audio_std = _latent_stats(audio_dir)
         with open(os.path.join(audio_dir, 'config.json')) as f:
             self.sample_rate = int(json.load(f)['sampling_rate'])
+
+    def to(self, device: torch.device) -> 'DiffusersDecoder':
+        """Moves both VAEs to `device` and returns self.
+
+        A 24 GB card cannot hold the VAEs and a long clip's attention
+        activations at once: leaving the 2.4B video decoder resident
+        costs ~5 GiB and OOMs the denoise at latent_t 102. A caller that
+        alternates between denoising and decoding parks the decoder on
+        the host in between.
+        """
+        self.device = device
+        if self.video_vae is not None:
+            self.video_vae.to(device)
+        self.audio_vae.to(device)
+        return self
 
     @torch.no_grad()
     def video(self, rows: torch.Tensor,

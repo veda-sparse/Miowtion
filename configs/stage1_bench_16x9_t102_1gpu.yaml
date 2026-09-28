@@ -1,0 +1,33 @@
+# Stage-1 training performance on ONE 4090 (docs/benchmark/performance.md).
+#
+# Not a run that learns anything: 8 updates from a fresh predictor, at
+# accum 1 so an update is exactly one micro-step and the logged per-update
+# time is the per-micro-step time. Everything else (offloading, chunking,
+# keep ratio, teacher_q_tiles) matches the real phase-B run
+# (stage1_refine_t102_4090) so the numbers describe that run's cost per
+# gradient step, on one card instead of two.
+run_name: stage1_bench_16x9_t102_1gpu
+checkpoint_root: weights/MiniMax-H3
+sample_cache: artifacts/samples/moviegen_multigeo_train
+geometries: ['16:9@102']
+geometry_sampling: cycle
+variant: FL2VA
+tasks: [t2va]
+plan_dir: runs/search_turbo8_multigeo_4090/plans
+schedule: turbo
+num_steps: 8
+teacher_adapter: weights/turbo_lora/minimax_h3_turbo_v4_step600_ema.safetensors
+keep_ratio: 0.1
+teacher_q_tiles: 1.0
+accum: 1
+steps: 8
+lr: 1.0e-3
+warmup: 20
+save_every: 1000    # only the mandatory final checkpoint
+keep_optimizer: 1   # the minimum the checkpointer allows
+out_dir: runs
+offload_blocks: 50
+prefetch: 1
+mlp_chunk_rows: 4096
+offload_optimizer: true
+monitor_updates: false

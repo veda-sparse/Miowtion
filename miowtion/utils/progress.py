@@ -69,11 +69,17 @@ class Progress:
 
 
 class Timer:
-    """Context manager logging the start and duration of a phase."""
+    """Context manager logging the start and duration of a phase.
+
+    After a successful exit `seconds` holds the duration, so a caller that
+    reports stage times (scripts/benchmark.py) reads the same clock the log
+    line was printed from instead of timing the phase a second time.
+    """
 
     def __init__(self, phase: str):
         self.phase = phase
         self.start = 0.0
+        self.seconds = 0.0
 
     def __enter__(self):
         self.start = time.time()
@@ -82,5 +88,6 @@ class Timer:
 
     def __exit__(self, *exc):
         if exc[0] is None:
-            log(f'{self.phase} done in {_fmt(time.time() - self.start)}')
+            self.seconds = time.time() - self.start
+            log(f'{self.phase} done in {_fmt(self.seconds)}')
         return False

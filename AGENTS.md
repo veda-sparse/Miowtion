@@ -168,7 +168,8 @@ plans/               已采纳的 tile 方案表（json，小文件，入库）
 tests/unit/          CPU 单元测试（每次提交前必须全过）
 tests/gpu/           GPU 测试（@pytest.mark.gpu，无 GPU 时自动 skip）
 tests/fixtures/      小型 golden 数据（必须可再生，附生成脚本与来源 commit）
-docs/                知识库：INDEX.md + features/*.md + pitfalls.md + dependencies.md
+docs/                知识库：INDEX.md + features/*.md + pitfalls.md + dependencies.md +
+                     benchmark/（实测性能记录：每条记录带几何、硬件、并行与 offload 配置）
 third_party/         外部仓库的 git submodule（只读，锁定 commit）
 runs/                [gitignore] 实验输出：日志、本地 checkpoint、评测结果
 artifacts/           [gitignore] 大文件：q/k/v 转储、渲染视频、样本缓存、可视化对比
