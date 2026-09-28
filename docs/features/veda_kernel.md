@@ -24,7 +24,14 @@
   - **SM8x（4090 等）**：上游 FA4 **不支持**，并且是静默失败（详见踩坑记录）。我们 vendor 了补丁后
     的四个 FA4 模块（`miowtion/kernels/fa4_sm8x`，见下文），`install()` 成功后 `available()` 才对
     SM8x 返回 True；其他情况一律抛 `NotImplementedError`（附带 install 失败的原因），绝不静默回退。
-- 所有 FA4 的 import 都经过 `fa4._modules()`：机器上有 SM8x GPU 时先 `fa4_sm8x.install()`。
+  - **SM120（RTX PRO 6000 Blackwell 等）**：上游 FA4 直接 `assert` 拒绝块稀疏，**不会**静默算稠密。
+    不需要为它另写 kernel：上游的 `FlashAttentionForwardSm120` 只是
+    `FlashAttentionForwardSm80` 的子类，唯一的 override 是 `can_implement`（SMEM 99 KB 而不是
+    163 KB），并且在 `__init__` 末尾把 `self.arch` 改回 `sm_80`；块稀疏主循环在基类里，因此**被继承
+    下来**。所以 SM120 走的就是 SM8x 那条 `DenseBlockMaskTorch` 路径，见下文的 SM120 一节。
+- 走 `PATCHED_MAJOR_ARCHS = (8, 12)` 的架构由 vendored 补丁提供块稀疏；`available()` 对它们要求
+  `fa4_sm8x.installed()`。
+- 所有 FA4 的 import 都经过 `fa4._modules()`：机器上有 SM8x 或 SM120 GPU 时先 `fa4_sm8x.install()`。
   `flash_attn.cute` 的 `__init__` 会 import interface，所以任何地方提前 `import flash_attn.cute`
   都会拿到未打补丁的版本；`install()` 检测到这种情况直接报错。
 - 训练阶段 2 只接受 FA4 路径；参考实现（`kernels/reference.py`）仅用于 CPU 单元测试。
@@ -62,12 +69,16 @@ flash-attn-4 4.0.0b32 @ d15f153：
   对象，把 vendored 模块按依赖顺序注册进 `sys.modules`，最后才执行 `__init__`。
 
 ## SM89 块稀疏：vendored 的 FA4 SM80 补丁（`miowtion/kernels/fa4_sm8x`）
-补丁系列 `patches/0001..0005` 基于 flash-attention d15f153（BSD-3-Clause，`LICENSE` 与 `AUTHORS`
+补丁系列 `patches/0001..0006` 基于 flash-attention d15f153（BSD-3-Clause，`LICENSE` 与 `AUTHORS`
 随目录提供），改动集中在五个模块：`block_sparsity`、`block_sparse_utils`、`flash_fwd`、`flash_bwd`、
 `interface`。仓库里放的是打完补丁后的这五个文件（再生方法见 `fa4_sm8x/__init__.py` 的 docstring），
 运行期由 `install()` 按依赖顺序替换已安装的 FA4 中的同名模块：
 - 要求已安装的 flash-attn-4 版本恰好是 `4.0.0b32`，且其中五个原始模块的 sha256 与锁定的基线一致；
   否则报错，不打补丁（防止把补丁套在不匹配的 FA4 上）。
+- 另外校验**不替换但依赖其内容**的两个模块 `flash_fwd_sm120` / `flash_bwd_sm120` 的 sha256
+  （`_INHERITED_SHA256`）：SM120 的块稀疏完全靠"它们是 SM80 类的薄子类"这一点得到。万一上游给
+  SM120 写了独立 kernel，打过补丁的 SM80 主循环就会悄悄不再被用到，SM120 会在稀疏掩码下算出稠密
+  结果——这是最难发现的一类错误，所以宁可在 `install()` 阶段直接报错。
 - 升级 FA4 时：在新基线上重新 `git am` 补丁、重新生成五个文件并更新哈希，重跑
   `tests/gpu/test_kernels_gpu.py`。
 
@@ -111,6 +122,104 @@ flash-attn-4 4.0.0b32 @ d15f153：
   AtomLayoutNdKV=8 能编译但梯度静默出错（误差 1.4）；postprocess 的线程数必须等于主 kernel 的
   线程数，否则 dQ/dK/dV 的累加器布局对不上。
 
+## SM120 块稀疏（`patches/0006`，前向）
+**结论：SM120 不需要新 kernel，只需要拆掉 interface 里的 arch-12 门禁。**
+上游的 `flash_fwd_sm120.py` / `flash_bwd_sm120.py` 各只有 61 / 55 行：
+`FlashAttentionForwardSm120(FlashAttentionForwardSm80)` 唯一的 override 是 `can_implement`
+（把 SMEM 上限从 163 KB 换成 `get_smem_capacity_in_bytes("sm_120")` 的 99 KB），并在
+`__init__` 末尾把 `self.arch` 从 `sm_120` 改回 `sm_80`。反向那个子类只 override `can_implement`。
+于是：
+
+- 块稀疏主循环、`DenseBlockMask` 的 bitmask 遍历、launch cache 全都在被补丁改过的基类里，
+  **SM120 原样继承**。
+- `FlashAttentionForwardSm80` 自己没有 `__init__`，基类 `__init__` 不做任何 arch 相关的判断
+  （`self.arch = ...` 是最后一行）；真正读 `self.arch` 的 `use_tma_O`、`use_dense_block_mask`、
+  `_setup_attributes()` 都在 `__call__` 里，也就是在子类把 arch 改回 `sm_80` **之后**才跑。
+  所以那个 arch 覆盖对块稀疏路径是完全生效的，这也是补丁能"白拿"的原因。
+- SM120 的 SMEM 容量（99 KB）与 sm86/sm89 相同，所以 `_tile_size_fwd_sm8x_block_sparse` 的
+  128×32 / `kv_subtile_factor=4`（48 KB → 2 CTA/SM）直接沿用，只是要在 SM120 上重新实测确认。
+
+`patches/0006` 在 interface 里做的事（前向）：
+- `_get_fwd_config`：arch 12 且给了块稀疏张量时改用 `_tile_size_fwd_sm8x_block_sparse`
+  （否则会拿到稠密用的 128×64）。
+- 去掉 arch-12 前向分支里的 `assert not use_block_sparsity`，并把 `q_subtile_factor` /
+  `kv_subtile_factor` 传给 `FlashAttentionForwardSm120`（SM8x 分支本来就传，arch-12 分支漏了）。
+- `DenseBlockMaskTorch` 与 `allow_kv_subtile` 接受 arch 12。
+- 0005 的低开销 launch cache 在 arch 12 上也注册（其 key 第一项是 `q.device`，所以混插 SM8x +
+  SM120 的机器上不会串用）。
+
+反向仍然在 arch 12 上拒绝块稀疏（`_flash_attn_bwd` 的 arch-12 分支保留 assert），单独启用。
+
+封装侧（`miowtion/kernels/fa4.py`）：`PATCHED_MAJOR_ARCHS = (8, 12)` 取代原先散落的
+`major == 8` 判断——install 触发条件、`available()`、走 `DenseBlockMaskTorch` 的分支。
+`_force_q_stage_one` 收窄成只对 `(10, 11)` 生效：只有 SM100/SM101 会选 q_stage=2，SM120 本来就是
+1，没必要去 patch FA4 内部符号。
+
+### 部署前提（SM120）
+- **torch 必须是 cu128 或更新的构建**：cu126 的 wheel 里没有 sm_120，装了也跑不起来。
+  用 `torch.cuda.get_arch_list()` 确认含 `sm_120`。实测 torch 2.14.0+cu130 的 arch_list 为
+  `['sm_75','sm_80','sm_86','sm_90','sm_100','sm_120']`。
+- 先装 torch 再装 flash-attn-4；实测 `nvidia-cutlass-dsl` 4.7.1 也能用（不止 4.2.0）。
+- `pip install` 那条 git 依赖会跑 `git submodule update --init --recursive`，把 flash-attention
+  的 `csrc/composable_kernel`（ROCm，与 `flash_attn/cute` 无关）也拉一遍并且经常失败。对策：自己
+  浅克隆（不带 submodule）到本地再 `pip install <clone>/flash_attn/cute`。
+
+### 实测：SM120 前向（2026-09-28，RTX PRO 6000 Blackwell Server Edition，96 GB）
+`scripts/bench_sparse_attention.py`，d=128，密度 0.1（稀疏度 90%），torch 2.14.0+cu130，
+flash-attn-4 4.0.0b32 @ d15f153，cutlass-dsl 4.7.1，独占整卡。
+MFU 的分母是**稠密** bf16 tensor core 峰值 504 TFLOP/s（厂商宣传的 1 PFLOPS 是 2:1 结构化稀疏的
+数字，不能用）；`gemm%` 的分母是同一次运行里实测的 cuBLAS bf16 GEMM 上限（419–438 TFLOP/s）。
+
+真实几何（`H3Config` 的 56 头）：
+
+| seq | kernel | ms | eff | TFLOP/s | MFU | gemm% |
+|---|---|---|---|---|---|---|
+| 16384 | FA4 稠密 | 21.209 | — | 362.9 | 72.0% | 83.9% |
+| 16384 | **FA4 块稀疏** | **2.209** | **0.98** | **353.9** | **70.2%** | **81.8%** |
+| 16384 | FA4 DenseBlockMask | 2.277 | 0.95 | 343.3 | 68.1% | 79.3% |
+| 16384 | flex（对照） | 2.634 | 0.82 | 296.7 | 58.9% | 68.6% |
+| 32768 | FA4 稠密 | 84.650 | — | 363.7 | 72.2% | 83.6% |
+| 32768 | **FA4 块稀疏** | **8.664** | **0.99** | **360.9** | **71.6%** | **82.9%** |
+| 32768 | FA4 DenseBlockMask | 8.841 | 0.97 | 353.7 | 70.2% | 81.3% |
+| 32768 | flex（对照） | 10.000 | 0.86 | 312.7 | 62.1% | 71.8% |
+
+8 头（与 4090 那张表同条件，便于横向比）：16384 稀疏 0.368 ms / eff 0.90 / MFU 60.3%；
+32768 稀疏 1.252 ms / eff 0.97 / MFU 70.8%。
+
+56 头的扫描（`fa4_block_sparse` 一列；seq 32768 扫密度，密度 0.1 扫 seq）：
+
+| 变量 | 值 | ms | eff | MFU | gemm% |
+|---|---|---|---|---|---|
+| 密度 | 0.05 | 4.189 | 1.02 | 74.1% | 84.3% |
+| 密度 | 0.10 | 8.381 | 1.03 | 74.0% | 84.3% |
+| 密度 | 0.20 | 16.556 | 1.02 | 73.5% | 83.9% |
+| seq | 8192 | 0.560 | 0.92 | 64.0% | 73.1% |
+| seq | 16384 | 2.209 | 0.98 | 70.2% | 81.8% |
+| seq | 32768 | 8.381 | 1.03 | 74.0% | 84.3% |
+| seq | 65536 | 33.718 | 1.00 | 72.2% | 89.5% |
+
+- **同一配置两次跑的差异约 3%**（32768 / 56 头 / 0.1 两次分别是 8.664 ms 与 8.381 ms，
+  MFU 71.6% 与 74.0%）。所以这里的门槛要按区间看：56 头、seq ≥ 16k 时 MFU 落在 **70–74%**。
+  seq 8192 是 64%，低于门槛，原因同 8 头 16k：问题规模小到 0.56 ms，启动与 occupancy 占比上来了。
+- 密度从 0.05 到 0.2，MFU 稳在 73.5–74.1%，说明跳块的收益是线性兑现的，没有随密度退化。
+- **eff 会略大于 1**（1.02–1.03）：分母用的是 FA4 默认 tile 的稠密耗时，而稀疏路径用的是
+  `_tile_size_fwd_sm8x_block_sparse` 选出来的 128×32，本身就比默认 tile 更快，所以"稠密×密度"
+  这个理想值被略微超过。不是测错，但也说明 eff 不能当成 >1 就是超线性加速。
+
+结论：
+- **90% 稀疏下 56 头达到 MFU 70.2%（16k）与 71.6%（32k），过了 ≥70% 的门槛。**
+  8 头 16k 只有 60.3%，是问题规模太小（2.2 ms → 0.37 ms，occupancy 与启动开销占比上去了），
+  不是稀疏路径的问题：同样 8 头，32k 就回到 70.8%。
+- **原先担心"SM120 走 SM80 的 `mma.sync`，到不了 Blackwell 第五代 tensor core 峰值"并没有成立。**
+  稠密 FA4 就有 363 TFLOP/s（MFU 72%、实测 GEMM 上限的 84%），稀疏路径紧跟其后。也就是说这条
+  kernel 的天花板不是指令代次，而是 attention 本身的 84% GEMM 效率；要再往上就得动 UMMA
+  kernel，收益上限只有 ~16%，暂时不值得。
+- eff 0.98–0.99 说明稀疏跳块几乎无损地兑换成了时间。`max_err` 5e-4 ~ 9e-4（对 fp32 参考），
+  并且没有触发"输出与稠密一致"的告警，确认不是偷偷算稠密。
+- 索引列表路径与 `DenseBlockMask` 路径在 SM120 上基本打平（含 prep 时 2.18 vs 2.19、8.81 vs
+  8.85 ms）。4090 上 DenseBlockMask 的优势主要来自省掉的约 30 µs 主机开销，在 56 头、毫秒级的
+  kernel 时间面前已经无关紧要。
+
 ## 验证记录
 - 2026-09-23 RTX 4090：见上表。结论：上游 FA4 在 SM89 上不支持块稀疏；我们的补丁达到效率门槛，
   已作为 vendored 模块合入（`miowtion/kernels/fa4_sm8x`）。
@@ -123,6 +232,14 @@ flash-attn-4 4.0.0b32 @ d15f153：
   配置不同）。`scripts/bench_sparse_attention.py`（8 头，密度 0.1，每次调用换新掩码；GPU 与别人的
   轻负载进程共用，数字略有噪声）：含掩码准备的效率，DenseBlockMask 16k 0.90 / 32k 1.04，索引列表
   0.84 / 0.99，flex 0.80 / 0.85。
+- 2026-09-28，RTX PRO 6000 Blackwell Server Edition（sm120，96 GB，独占），补丁 0006 之后：
+  `pytest tests/gpu -m gpu` **12 passed, 0 skipped**（其中 `test_fa4_block_sparse_matches_reference`
+  与 `test_dense_block_mask_all_blocks_match_dense_with_mask_mod` 是稀疏的两条；CuTe 的日志里
+  编译出来的类名是 `...flash_fwd_sm120FlashAttentionForwardSm120...`，确认走的确实是 SM120 子类
+  继承来的块稀疏主循环，不是回退到别的路径）。测速与 MFU 见上一节。`pytest tests/unit` 342 passed。
+  **SM8x 未回归验证**（本机没有 4090）：改动只是把 `major == 8` 放宽成 `in (8, 12)`，
+  `_force_q_stage_one` 由 `< 10` 改成 `not in (10, 11)`——对 major 8/9/10/11 的行为逐一核对过是
+  等价的，但仍需在 4090 上重跑一次 `tests/gpu` 才能销掉这条。
 
 ## 待办
 - **FP8 sparse**（用户要求，方案待定）：块稀疏 + FP8（或 INT8 QK / FP8 PV，参考 SageAttention /

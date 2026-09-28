@@ -34,6 +34,55 @@ from miowtion.veda import tiling
 
 _TILE = tiling.TILE_SIZE
 
+# Dense bf16 tensor-core peak, FLOP/s, per torch.cuda.get_device_name(). These
+# are the *dense* figures; the 2:1-structured-sparsity numbers the vendors also
+# publish are twice these and unreachable here, so quoting them would halve
+# every MFU. NB RTX PRO 6000's headline "1 PFLOPS BF16" is the sparse figure.
+# TODO(#mfu): miowtion.h3.flops has its own PEAK_BF16_FLOPS for whole-model
+# MFU; fold the two tables into one place once that module settles.
+PEAK_BF16_DENSE_FLOPS = {
+    'NVIDIA GeForce RTX 4090': 165.2e12,
+    'NVIDIA RTX PRO 6000 Blackwell Server Edition': 503.8e12,
+    'NVIDIA RTX PRO 6000 Blackwell Workstation Edition': 503.8e12,
+    'NVIDIA H100 80GB HBM3': 989.4e12,
+    'NVIDIA A100-SXM4-80GB': 312.0e12,
+}
+
+
+def attention_flops(seq: int, heads: int, head_dim: int,
+                    density: float) -> float:
+    """Useful FLOPs of one forward pass: QK^T and PV, 2 FLOP per MAC.
+
+    Skipped blocks are not counted, so a sparse kernel and a dense one are
+    credited only for the arithmetic they actually had to do. Softmax
+    exponentials are excluded (they are not tensor-core work).
+    """
+    return 4.0 * seq * seq * heads * head_dim * density
+
+
+def gemm_ceiling_tflops(device: torch.device, size: int = 8192,
+                        iters: int = 20) -> float:
+    """Measured cuBLAS bf16 GEMM throughput: the achievable matmul ceiling.
+
+    FA4's SM120 path issues SM80-era mma.sync, not Blackwell's 5th-gen tensor
+    core instructions, so this is the honest yardstick for how much of the
+    GPU's matmul throughput an attention kernel is leaving unused, separate
+    from the vendor's peak.
+    """
+    a = torch.randn(size, size, device=device, dtype=torch.bfloat16)
+    b = torch.randn(size, size, device=device, dtype=torch.bfloat16)
+    for _ in range(3):
+        torch.mm(a, b)
+    torch.cuda.synchronize()
+    start, end = (torch.cuda.Event(enable_timing=True) for _ in range(2))
+    start.record()
+    for _ in range(iters):
+        torch.mm(a, b)
+    end.record()
+    torch.cuda.synchronize()
+    seconds = start.elapsed_time(end) / 1e3 / iters
+    return 2.0 * size**3 / seconds / 1e12
+
 
 @dataclasses.dataclass
 class Result:
@@ -43,6 +92,9 @@ class Result:
     max_err: float | None = None
     efficiency: float | None = None
     efficiency_prep: float | None = None
+    tflops: float | None = None
+    mfu: float | None = None
+    gemm_frac: float | None = None
     note: str = ''
 
 
@@ -161,13 +213,18 @@ class _Fa4Sparse(_Backend):
 
 
 class _Fa4DenseMask(_Backend):
-    """SM8x only: the vendored DenseBlockMaskTorch input (no index lists)."""
+    """SM8x / SM120 only: the vendored DenseBlockMaskTorch input.
+
+    No index lists are built; the kernels read the block mask directly.
+    """
 
     name = 'fa4_dense_block_mask'
 
     def __init__(self, q, k, v):
-        if torch.cuda.get_device_capability(q.device)[0] != 8:
-            raise NotImplementedError('DenseBlockMaskTorch is SM8x only')
+        if (torch.cuda.get_device_capability(q.device)[0]
+                not in fa4.PATCHED_MAJOR_ARCHS):
+            raise NotImplementedError(
+                'DenseBlockMaskTorch is SM8x / SM120 only')
         _, _, block_sparsity, iface, _ = fa4._modules()  # pylint: disable=protected-access
         self.bs, self.fn = block_sparsity, iface.flash_attn_func
         self.q, self.k, self.v = q[None], k[None], v[None]
@@ -294,16 +351,39 @@ def run(seq: int = 32768, heads: int = 8, head_dim: int = 128,
         if r.note == 'sparse' and r.max_err is not None and r.max_err < 0.1:
             r.efficiency = dense_ms * real_density / r.kernel_ms
             r.efficiency_prep = dense_ms * real_density / r.prep_ms
+    peak = PEAK_BF16_DENSE_FLOPS.get(torch.cuda.get_device_name(dev))
+    ceiling = gemm_ceiling_tflops(dev)
+    for r in results:
+        if r.max_err is None or r.max_err >= 0.1 or r.kernel_ms != r.kernel_ms:
+            continue
+        flops = attention_flops(seq, heads, head_dim,
+                                real_density if r.note == 'sparse' else 1.0)
+        r.tflops = flops / (r.kernel_ms / 1e3) / 1e12
+        r.gemm_frac = r.tflops / ceiling
+        if peak is not None:
+            r.mfu = r.tflops * 1e12 / peak
     return results
 
 
 def format_results(results: list[Result], header: str) -> str:
+    """Formats a run's results.
+
+    TFLOP/s counts only the arithmetic a kernel had to do (skipped blocks
+    excluded), MFU divides that by the device's dense bf16 tensor-core peak,
+    and gemm% divides it by the measured cuBLAS bf16 GEMM ceiling. The last
+    column separates "sparsity is not paying off" from "this kernel cannot
+    reach the tensor cores' peak in the first place".
+    """
     lines = [header, f'{"kernel":20s} {"kernel ms":>10s} {"+prep ms":>9s} '
-             f'{"max_err":>8s} {"eff":>5s} {"eff+prep":>8s}  note']
+             f'{"max_err":>8s} {"eff":>5s} {"eff+prep":>8s} {"TFLOP/s":>8s} '
+             f'{"MFU":>6s} {"gemm%":>6s}  note']
     fmt = lambda x, spec: '-' if x is None or x != x else format(x, spec)
     for r in results:
         lines.append(f'{r.name:20s} {fmt(r.kernel_ms, ".3f"):>10s} '
                      f'{fmt(r.prep_ms, ".3f"):>9s} {fmt(r.max_err, ".4f"):>8s} '
                      f'{fmt(r.efficiency, ".2f"):>5s} '
-                     f'{fmt(r.efficiency_prep, ".2f"):>8s}  {r.note}')
+                     f'{fmt(r.efficiency_prep, ".2f"):>8s} '
+                     f'{fmt(r.tflops, ".1f"):>8s} '
+                     f'{fmt(r.mfu, ".1%"):>6s} '
+                     f'{fmt(r.gemm_frac, ".1%"):>6s}  {r.note}')
     return '\n'.join(lines)

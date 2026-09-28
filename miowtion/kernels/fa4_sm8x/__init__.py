@@ -1,8 +1,17 @@
-"""FA4 CuTe with block sparsity on the SM80 family (sm80 / sm86 / sm89).
+"""FA4 CuTe with block sparsity on the SM80 family (sm80 / sm86 / sm89) and
+on SM120 (sm120: RTX PRO 6000 Blackwell, Blackwell GeForce, DGX Spark).
 
 Upstream FlashAttention-4 accepts block-sparse tensors on SM8x but its SM80
-kernels ignore them and compute dense attention. This package vendors the
-five FA4 modules changed by the patch series in `patches/`, applied on top of
+kernels ignore them and compute dense attention; on SM120 it rejects them
+outright. SM120 needs no kernel of its own: upstream's
+FlashAttentionForward/BackwardSm120 subclass the SM80 classes and override
+only can_implement (99 KB of SMEM instead of 163 KB), the forward also forcing
+self.arch back to sm_80, so patching the SM80 kernels covers SM120 too and
+only the interface's arch-12 gates have to be lifted. SM120's SMEM capacity
+equals sm86/sm89's, so the sm8x sparse tile tuning carries over.
+
+This package vendors the five FA4 modules changed by the patch series in
+`patches/`, applied on top of
 flash-attention d15f1531a460ba456f41b01a774f33ab2db8febf (modified copies;
 BSD-3-Clause, see LICENSE and AUTHORS):
   * block-sparse forward and backward main loops for the SM80 kernels that
@@ -21,7 +30,8 @@ BSD-3-Clause, see LICENSE and AUTHORS):
 anything imports `flash_attn.cute` (whose __init__ imports the interface), so
 all FA4 access in Miowtion goes through miowtion.kernels.fa4. The installed
 package must be exactly the pinned base: its unpatched copies of the five
-modules are hash-checked, and anything else raises.
+modules are hash-checked, as are the two SM120 modules that are left in place
+but relied on for inheritance, and anything else raises.
 
 Regenerate the vendored files from the patches:
     git clone https://github.com/Dao-AILab/flash-attention && cd flash-attention
@@ -56,6 +66,19 @@ _BASE_SHA256 = {
     'interface':
         '144a3dd6f72f955e43834500808c7d47b3b4a76fdcd0b7188f9b459d85007cab',
 }
+# Modules we do NOT replace but whose contents we depend on: SM120 gets block
+# sparsity purely by inheritance, because both classes below subclass their
+# SM80 counterpart and override only can_implement (the SMEM bound), with the
+# forward additionally forcing self.arch back to sm_80. If upstream ever gives
+# SM120 a real kernel of its own, the patched SM80 main loops would quietly
+# stop being used and SM120 would compute dense attention behind a sparse
+# mask, so pin them by hash too.
+_INHERITED_SHA256 = {
+    'flash_fwd_sm120':
+        'abd017add69914e46f0fcfc017ad51c3d07d79fd87d15f969036ddd82bcc7da2',
+    'flash_bwd_sm120':
+        'ad2d802c97dbf654fd03724bcfa91702b18acec8518e5dd4a33f137ba238bf7d',
+}
 _PACKAGE = 'flash_attn.cute'
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _installed = False
@@ -71,7 +94,7 @@ def _sha256(path: str) -> str:
 
 
 def install() -> None:
-    """Replaces the five FA4 modules with the SM8x block-sparse versions.
+    """Replaces the five FA4 modules with the block-sparse versions.
 
     Raises:
         RuntimeError: If flash_attn.cute was imported already, or the
@@ -93,6 +116,12 @@ def install() -> None:
         if _sha256(os.path.join(base_dir, f'{name}.py')) != digest:
             raise RuntimeError(f'installed {_PACKAGE}.{name} differs from '
                                'the pinned base; refusing to patch')
+    for name, digest in _INHERITED_SHA256.items():
+        if _sha256(os.path.join(base_dir, f'{name}.py')) != digest:
+            raise RuntimeError(
+                f'installed {_PACKAGE}.{name} differs from the pinned base; '
+                'SM120 block sparsity relies on it subclassing the patched '
+                'SM80 kernel, so refusing to patch')
     # Create the package without running its __init__ (which would import
     # the upstream interface), register the patched modules, then run it.
     package = importlib.util.module_from_spec(spec)

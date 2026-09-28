@@ -76,10 +76,12 @@ def test_fa4_block_sparse_matches_reference():
                                rtol=2e-2, atol=2e-2)
 
 
-@pytest.mark.skipif(not fa4.available() or torch.cuda.get_device_capability()[0] != 8,
-                    reason='DenseBlockMask path is SM8x only')
-def test_sm8x_all_blocks_match_dense_with_mask_mod():
-    """Every block selected: the SM8x sparse walk matches the dense kernel.
+@pytest.mark.skipif(
+    not fa4.available()
+    or torch.cuda.get_device_capability()[0] not in fa4.PATCHED_MAJOR_ARCHS,
+    reason='DenseBlockMask path is SM8x / SM120 only')
+def test_dense_block_mask_all_blocks_match_dense_with_mask_mod():
+    """Every block selected: the sparse walk matches the dense kernel.
 
     Bitwise equality needs the dense kernel on the sparse path's tile config;
     FA4's default dense config differs, which costs up to ~1 bf16 ulp.

@@ -1,13 +1,13 @@
 """FlashAttention-4 (CuTe DSL): the single entry point for FA4 in Miowtion.
 
-Every FA4 import goes through `_modules()`, which on SM8x first installs the
-vendored block-sparse patch (miowtion.kernels.fa4_sm8x; it must precede any
-`flash_attn.cute` import).
+Every FA4 import goes through `_modules()`, which on SM8x / SM120 first
+installs the vendored block-sparse patch (miowtion.kernels.fa4_sm8x; it must
+precede any `flash_attn.cute` import).
 
-The block pattern is given as a dense block mask. On SM8x it goes to the
-kernels as is (`DenseBlockMaskTorch` of the vendored patch: no index lists,
-and backward reads the same mask column-wise). On SM90 / SM100 it is packed
-into full / partial index lists here.
+The block pattern is given as a dense block mask. On SM8x / SM120 it goes to
+the kernels as is (`DenseBlockMaskTorch` of the vendored patch: no index
+lists, and backward reads the same mask column-wise). On SM90 / SM100 it is
+packed into full / partial index lists here.
 
 Block-sparse integration rules (each one silently costs speed or
 correctness if broken):
@@ -21,9 +21,9 @@ correctness if broken):
     (varlen), not the block size; block_size must be passed by keyword.
   * Kernels process q_stage * tile_m query rows per CTA and require the
     sparse Q block to be a multiple of it. SM90 uses tile_m = 128 with
-    q_stage = 1; SM8x (patched) splits 128x128 blocks into sub-tiles. SM100
-    picks q_stage = 2 whenever seqlen_q > 128, so the forward config is
-    overridden to q_stage = 1 there (_force_q_stage_one; pending B200
+    q_stage = 1; SM8x / SM120 (patched) split 128x128 blocks into sub-tiles.
+    SM100 picks q_stage = 2 whenever seqlen_q > 128, so the forward config
+    is overridden to q_stage = 1 there (_force_q_stage_one; pending B200
     validation).
   * SM90/SM100 backward needs Q-direction (transposed) block lists. Without
     them FA4's backward silently computes dense gradients, so they are
@@ -46,10 +46,16 @@ from miowtion.kernels import fa4_sm8x
 from miowtion.veda import tiling
 
 _TILE = tiling.TILE_SIZE
-# Architectures (compute capability major) whose FA4 kernels implement block
-# sparsity; 8 only with the vendored SM8x patch installed.
+# Architectures (compute capability major) whose upstream FA4 kernels implement
+# block sparsity.
 _SPARSE_MAJOR_ARCHS = (9, 10, 11)
-_sm8x_error: str | None = None
+# Architectures that get block sparsity only from the vendored patch. SM120
+# (12) runs the SM80 kernels -- FlashAttentionForward/BackwardSm120 subclass
+# the SM80 classes purely to raise the SMEM bound -- so patching the SM80
+# kernels covers it, and upstream's arch-12 "not supported" asserts are what
+# the patch lifts.
+PATCHED_MAJOR_ARCHS = (8, 12)
+_patch_error: str | None = None
 # FA4 calls are serialized across threads (one thread per GPU in multi-GPU
 # inference): the first call of a signature JIT-compiles through CuTe DSL /
 # MLIR, which is not documented as thread-safe. Only the host-side launch is
@@ -65,26 +71,26 @@ _CALL_LOCK = threading.Lock()
 _IMPORT_LOCK = threading.RLock()
 
 
-def _any_sm8x() -> bool:
-    return any(torch.cuda.get_device_capability(i)[0] == 8
+def _any_patched_arch() -> bool:
+    return any(torch.cuda.get_device_capability(i)[0] in PATCHED_MAJOR_ARCHS
                for i in range(torch.cuda.device_count()))
 
 
 @functools.cache
 def _modules():
-    """Imports FA4 (patched on SM8x); returns None when unavailable."""
+    """Imports FA4 (patched on SM8x / SM120); None when unavailable."""
     with _IMPORT_LOCK:
         return _import_modules()
 
 
 def _import_modules():
     """The body of `_modules`, run under `_IMPORT_LOCK`."""
-    global _sm8x_error
-    if torch.cuda.is_available() and _any_sm8x():
+    global _patch_error
+    if torch.cuda.is_available() and _any_patched_arch():
         try:
             fa4_sm8x.install()
         except (RuntimeError, ImportError) as e:
-            _sm8x_error = str(e)
+            _patch_error = str(e)
     try:
         import cutlass  # pylint: disable=import-outside-toplevel
         import cutlass.cute as cute  # pylint: disable=import-outside-toplevel
@@ -111,7 +117,7 @@ def available(device: torch.device | None = None) -> bool:
     if not torch.cuda.is_available() or _modules() is None:
         return False
     major = torch.cuda.get_device_capability(device)[0]
-    if major == 8:
+    if major in PATCHED_MAJOR_ARCHS:
         return fa4_sm8x.installed()
     return major in _SPARSE_MAJOR_ARCHS
 
@@ -175,7 +181,9 @@ def _install_q_stage_hook() -> None:
 
 @contextlib.contextmanager
 def _force_q_stage_one(device: torch.device):
-    if torch.cuda.get_device_capability(device)[0] < 10:
+    # Only SM100/SM101 ever pick q_stage=2 (interface: arch // 10 in [10, 11]).
+    # SM120 is already q_stage=1, so leave FA4's internals alone there.
+    if torch.cuda.get_device_capability(device)[0] not in (10, 11):
         yield
         return
     _install_q_stage_hook()
@@ -241,7 +249,7 @@ def block_sparse_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
         ValueError: If gradients are required for a subset of query tiles.
     """
     if not available(q.device):
-        reason = f' ({_sm8x_error})' if _sm8x_error else ''
+        reason = f' ({_patch_error})' if _patch_error else ''
         raise NotImplementedError(
             'FA4 block sparsity unavailable on sm'
             f'{"".join(map(str, torch.cuda.get_device_capability(q.device)))}'
@@ -252,7 +260,7 @@ def block_sparse_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
     if needs_grad and block_mask.shape[1] != layout.n_tiles:
         raise ValueError('backward needs the block mask of all query tiles')
     tensors_bwd = None
-    if torch.cuda.get_device_capability(q.device)[0] == 8:
+    if torch.cuda.get_device_capability(q.device)[0] in PATCHED_MAJOR_ARCHS:
         tensors = block_sparsity.DenseBlockMaskTorch(
             block_mask=(block_mask & layout.kv_ok)[None],
             partial_kv_blocks=~layout.full_tile, block_size=(_TILE, _TILE))

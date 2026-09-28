@@ -32,9 +32,14 @@ def main():
         results = bench.run(seq=seq, heads=args.heads,
                             head_dim=args.head_dim, density=args.density,
                             patterns=args.patterns, calls=args.calls)
+        peak = bench.PEAK_BF16_DENSE_FLOPS.get(name)
+        peak_str = f'{peak / 1e12:.0f}' if peak is not None else '?'
         print(bench.format_results(
             results, f'\n== {name} sm{cap[0]}{cap[1]} seq={seq} '
-            f'heads={args.heads} d={args.head_dim} density={args.density}'),
+            f'heads={args.heads} d={args.head_dim} density={args.density} '
+            f'peak={peak_str} TFLOP/s bf16 dense, '
+            f'measured GEMM ceiling '
+            f'{bench.gemm_ceiling_tflops(torch.device("cuda")):.0f} TFLOP/s'),
               flush=True)
 
 
