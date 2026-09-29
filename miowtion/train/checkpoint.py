@@ -217,6 +217,46 @@ def _write(path: str, payload) -> str:
     return path
 
 
+def write_init_payload(directory: str, weights: dict[str, torch.Tensor],
+                       config: dict | None = None) -> str:
+    """Writes a weights-only checkpoint that `TrainConfig.init_from` accepts.
+
+    For continuing a published run: a released predictor bundle carries the
+    weights and the plans but not the optimizer moments, the EMA shadow or
+    the sampler states, so what it can seed is a new stage, not a resume.
+    The same tensors are stored as both the live weights and the EMA shadow
+    (`init_from` reads the shadow), and the fields `resume()` needs are left
+    empty on purpose: this directory must not be mistaken for a run's own
+    checkpoint, which it would be if it landed in `<run_dir>/ckpt`.
+
+    Args:
+        directory: Written (created) here.
+        weights: Parameter name -> full tensor, e.g. `predictor.layers.0
+            .proj_q`. Stored in fp32, which is what the trainer holds.
+        config: Optional provenance recorded in the payload.
+
+    Returns:
+        `directory`, once the completion marker is in place.
+    """
+    os.makedirs(directory, exist_ok=True)
+    tensors = {name: value.detach().cpu().float()
+               for name, value in weights.items()}
+    payload = {
+        'step': 0,
+        'weights': tensors,
+        'ema': dict(tensors),
+        'param_groups': [],
+        'rank_states': [],
+        'shared_generator': None,
+        'config': config or {},
+    }
+    path = _write(os.path.join(directory, _FILE), payload)
+    with open(os.path.join(directory, _MARKER), 'w') as f:
+        json.dump({'step': 0, 'bytes': os.path.getsize(path),
+                   'init_only': True}, f)
+    return directory
+
+
 def load(directory: str) -> dict:
     """Payload of a checkpoint; 'optimizer' is empty once pruned."""
     if not os.path.exists(os.path.join(directory, _MARKER)):
