@@ -42,6 +42,7 @@
 | 融合的 silu 对次正规数输出 -0.0 | Triton 默认让 libdevice 走 flush-to-zero | 启动参数 `enable_reflect_ftz=False`；GPU 测试遍历全部 bf16 值 | [h3_model](features/h3_model.md) |
 | 猴补 FA4 的 num_stages / num_threads 后测速完全不变、diff 恰好为 0 | FA4 的编译缓存键不含这些参数，第一次编译的 kernel 被复用 | 每个变体前换一个新的 `get_jit_cache()` | [performance](benchmark/performance.md) |
 | SM120 上 FA4 `Q_in_regs=True` + 2 stage 结果错误（max diff 5e-2） | 未查明；SM80 主循环的该组合在 SM120 上没有验证过 | 不用；只作为调参时的已知坏组合 | [performance](benchmark/performance.md) |
+| 以为 SM120 是 SM100 的小号、照搬 SM100 前向 | SM100 的主循环建在 tcgen05 + TMEM 累加器上，SM120 没有；反过来 SM120 有 SM100 没有的 warp 级块缩放 MMA | 用 `scripts/probe_ptx_isa.py` 让 ptxas 判决，再决定搬哪部分（结构可搬，MMA 不可搬） | [performance](benchmark/performance.md) |
 
 ## 训练与分布式
 

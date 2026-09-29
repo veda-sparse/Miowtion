@@ -333,14 +333,37 @@ micro-step，稳态值）：
    更大的 tile 全都更慢——t102 上 128×64 慢 18%、128×128 慢 44%（hdim 128 下 128×128 要
    96 KB smem，只剩 1 CTA/SM，而稀疏工作量本身不均匀）。256 线程在 t37 上快 1%，噪声级别。
    所以 bf16 下块稀疏 kernel 距上限只剩 ~20%，即整个 Veda step 的 ~5%。
-5. **不能把 SM100 的 kernel 搬过来**：SM100 前向建立在 tcgen05（UMMA）+ TMEM 累加器 +
-   2-CTA MMA 之上，**SM120 没有这三样**（它是 Blackwell 家族里仍用 warp 级 `mma.sync` 的那一支，
-   既没有 Hopper 的 wgmma 也没有 SM100 的 tcgen05）。强行 `_arch=90` 直接被
-   `Only SM 9.x is supported` 拒掉。能跨过来的只有**软件结构**：TMA 载入、warp 专精
-   （load / MMA / softmax 分工）、mbarrier 多级流水（SageAttention3 的 sm120a kernel 正是
-   用 `SM90_TMA_LOAD` + `PipelineTmaAsync` + SM120 的 blockscaled MMA atom 搭起来的）。
-   按第 3 条的上限，这套重写在 bf16 下最多值 ~5% 的 step，**性价比低**。
-6. **真正的杠杆是精度**：SM120 的 `mma.sync` 在 fp8 下是 bf16 的两倍。实测（稠密、非 causal、
+5. **SM120 上能用什么、不能用什么（ptxas 实测，不是查表）**：`scripts/probe_ptx_isa.py`
+   把每条指令单独塞进一个最小 kernel 让 ptxas 判决（`no` = 汇编器明确说这个目标不支持，
+   `operands?` = 指令存在、只是这个探针的寄存器数写错了）：
+
+   | 指令 | sm_89 | sm_90a | sm_100a | sm_120a |
+   |---|---|---|---|---|
+   | `mma.sync` bf16 m16n8k16 | yes | yes | yes | **yes** |
+   | `mma.sync` fp8 e4m3 m16n8k32 | yes | yes | yes | **yes** |
+   | `mma.sync` int8 m16n8k32 | yes | yes | yes | **yes** |
+   | `mma.sync` **block_scale** mxf8f6f4 1X / nvf4 4X | no | no | **no** | **yes** |
+   | `wgmma.mma_async`（Hopper 的 warpgroup MMA） | no | yes | **no** | **no** |
+   | `tcgen05.alloc` / `tcgen05.ld`（TMEM） | no | no | **yes** | **no** |
+   | `cp.async.bulk.tensor`（TMA） | — | yes | yes | **yes** |
+   | `stmatrix` / `setmaxnreg` | — | yes | yes | **yes** |
+   | `clusterlaunchcontrol`（CLC 持久调度） | no | no | yes | **yes** |
+
+   三个结论，都和"直觉上 SM120 应该继承谁"不一样：
+   - **wgmma 是 Hopper 独有**的，SM100 也没有；**tcgen05 + TMEM 是 SM100 独有**的，SM120 没有。
+     所以 SM120 的 MMA 只能是 warp 级的 `mma.sync`——这一条决定了 SM100 前向的**主循环
+     不能照搬**：它的累加器住在 TMEM 里，由 tcgen05 指令驱动。
+   - 但 SM100 的**流水与调度机制 SM120 全都有**：TMA、`stmatrix`、`setmaxnreg`、CLC。
+     所以"基于 SM100 做 SM120"是对的做法，只是要把 `tcgen05 + TMEM 累加器` 换成
+     `mma.sync + 寄存器累加器`，其余（TMA 载入、warp 专精的 load / MMA / softmax 分工、
+     mbarrier 多级流水、CLC 持久 tile 调度）原样保留。SageAttention3 的 sm120a kernel
+     就是这么搭的（`SM90_TMA_LOAD` + `PipelineTmaAsync` + SM120 的 blockscaled MMA atom）。
+     FA4 现在的 SM120 前向反过来——它继承 SM80，**一个都没用**：`cp.async` 载入、128 线程、
+     单级流水、无 warp 专精。
+   - **块缩放 MMA（mxf8f6f4 / mxf4 / nvf4）是 SM120 独有的 warp 级指令**，sm_100a 都没有
+     （SM100 走 tcgen05 的块缩放路径）。也就是说 fp4 / fp8 的每 16~32 值一个 scale，在这张卡上
+     是 `mma.sync` 就能发的。
+6. **真正的杠杆是精度**：fp8 的 `mma.sync` 是 bf16 的两倍，nvf4 是四倍。实测（稠密、非 causal、
    D=128、56 头，误差对 FA4 bf16）：
 
    | kernel | seq 38299 | seq 73975 | 相对 FA4 | rel L2 | 最差行 cos |
@@ -349,12 +372,13 @@ micro-step，稳态值）：
    | SageAttention2（INT8 QK + FP8 PV） | 654 | 668 | **1.78~1.82×** | 3.9e-2 | 0.998 |
    | SageAttention3（NVFP4） | 645 | 崩 | 1.75× | 1.9e-1 | 0.915 |
 
-   NVFP4 在这张卡上**不比 fp8 快**（645 vs 654），误差却大一个数量级，而且 seq 73975 时 TMA
-   描述符初始化失败、`illegal instruction` 崩掉——不是我们要的方向。fp8 才是。
-   但 SageAttention 是**稠密**的：要拿到这 1.8×，得把 fp8 接进 FA4 的 SM120 **块稀疏** kernel，
-   而 `flash_fwd_sm120.can_implement` 现在只接受 fp16 / bf16（`q_descale` / `k_descale` /
-   `v_descale` 这些接口参数已经在了，只有 SM90/SM100 用得上）。这是下一个补丁（0008）的范围，
-   属于"数值会变"的改动：按 AGENTS.md 1.5 需要误差记录 + 可视化对比 + 人工确认。
+   注意这两行都远低于各自的指令峰值（fp8 理论 1007 TFLOP/s，nvf4 2015）：量化本身要读写一遍
+   q/k/v，kernel 也没有为这张卡调过。NVFP4 在这里**没比 fp8 快**、误差大一个数量级，而且
+   seq 73975 时 TMA 描述符初始化失败、`illegal instruction` 崩掉——所以先做 fp8，不做 fp4。
+   要拿到这 1.8×，得把 fp8 接进 FA4 的 SM120 **块稀疏** kernel：`q_descale` / `k_descale` /
+   `v_descale` 这些接口参数已经在了（只有 SM90/SM100 用），而 `flash_fwd_sm120.can_implement`
+   现在只接受 fp16 / bf16。这是下一个补丁（0008）的范围，属于"数值会变"的改动：按 AGENTS.md
+   1.5 需要误差记录 + 可视化对比 + 人工确认。
 
 ## 12. Kernel 端到端复测
 
