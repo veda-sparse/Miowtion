@@ -306,6 +306,7 @@ class Trainer:
         self.samples = data.SampleSampler(
             self.cache.select('train', config.tasks), config.seed,
             self.env.rank)
+        self._check_geometry_coverage()
         self.noise_gen = torch.Generator().manual_seed(
             config.seed * 977 + self.env.rank)
         self.step = 0
@@ -318,6 +319,34 @@ class Trainer:
         self.trajectory = None
 
     # --- setup -----------------------------------------------------------
+
+    def _check_geometry_coverage(self) -> None:
+        """Refuses a geometry no sample can serve, before the first step.
+
+        A prompt is written for a duration, so a sample only fits a
+        geometry whose latent_t it declares (data.SampleSampler). Without
+        this the run dies whenever the sampler first happens to draw the
+        unusable geometry -- with `uniform` sampling that is a random
+        number of updates in, after the teacher has been loaded and the
+        tables built.
+
+        Raises:
+            ValueError: Naming every geometry with no compatible sample.
+        """
+        samples = self.samples.samples
+        orphans = []
+        for geometry in self.geometries.geometries:
+            if not any(
+                    (s.aspect in (None, geometry.aspect))
+                    and (s.latent_t in (None, geometry.latent_t))
+                    for s in samples):
+                orphans.append(geometry.name)
+        if orphans:
+            have = sorted({s.latent_t for s in samples if s.latent_t})
+            raise ValueError(
+                f'no sample fits {orphans}: the cache holds prompts written '
+                f'for latent_t {have}. Drop those geometries or encode '
+                'prompts for them.')
 
     def _check_param_budget(self) -> None:
         # numel() of a sharded DTensor is its global size.

@@ -422,3 +422,18 @@ def test_synthetic_sample_cache():
     assert torch.equal(again.text(sample)[0], hidden)
     with pytest.raises(ValueError):
         data.SyntheticSampleCache(0, _TINY.text_dim)
+
+
+def test_a_geometry_with_no_sample_is_refused_at_startup():
+    """Better than dying whenever `uniform` first draws the orphan."""
+    from miowtion.train import trainer as trainer_lib
+    samples = [data.Sample(id='a', task='t2va', split='train', text=(0, 4),
+                           latent_t=37)]
+    checker = trainer_lib.Trainer.__new__(trainer_lib.Trainer)
+    checker.samples = data.SampleSampler(samples, seed=0, rank=0)
+    checker.geometries = data.GeometrySampler(['16:9@37'], seed=0)
+    checker._check_geometry_coverage()          # the corpus covers this one
+    checker.geometries = data.GeometrySampler(['16:9@37', '16:9@102'],
+                                              seed=0)
+    with pytest.raises(ValueError, match='no sample fits'):
+        checker._check_geometry_coverage()

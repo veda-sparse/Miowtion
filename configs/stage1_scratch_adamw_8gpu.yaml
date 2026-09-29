@@ -30,8 +30,11 @@
 run_name: stage1_scratch_adamw_8gpu
 checkpoint_root: weights/MiniMax-H3
 sample_cache: artifacts/samples/moviegen_video_bench
+# Eight geometries, not twelve: the corpus
+# (data/prompts/moviegen_video_bench_h3.jsonl) was expanded at 5.17 s and
+# 14.4 s only, so a latent_t 72 geometry has no sample whose prompt was
+# written for it and SampleSampler refuses to substitute one.
 geometries: ['1:1@37', '4:3@37', '16:9@37', '9:16@37',
-             '1:1@72', '4:3@72', '16:9@72', '9:16@72',
              '1:1@102', '4:3@102', '16:9@102', '9:16@102']
 geometry_sampling: uniform
 variant: FL2VA
