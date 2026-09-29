@@ -263,6 +263,17 @@ kernel 只读 top-k 的排序，两者会分开；见 `docs/features/veda_predic
   - 几何归一化的 `heat_kept / heat_ceiling` 是最适合跨几何看趋势的量：81.3% → 84.2%
     （step 1→4），同几何 83.1%→83.9%（4:3）、82.7%→83.6%（9:16）。
   - `logit_std` 2.4~2.7，没有塌缩（塌缩会趋于 0）。
+  - **`grad_cos` 的高低主要由"这一步换没换几何"决定，不是 batch 噪声**：step 8→9 恰好连着
+    抽到同一个 1:1（轮次边界），`grad_cos` = **0.92**；跨几何的相邻 update 只有 0.05~0.57，
+    偶尔为负。也就是说四个纵横比的梯度方向本来就彼此不同，加大 batch 解决不了这件事。
+  - 到 step 18 为止，日志里的 `heat_kept / heat_ceiling` 在 82~85% 之间来回，**看不出趋势**
+    ——每个 update 换一条片子，`heat_ceiling` 在同一几何下能差 0.70~0.745。趋势只能靠固定
+    片子测（见 [evaluation](evaluation.md)）：那里 15 个 update 的净提升是
+    heat_kept 0.5745 → 0.5840、recall 0.5592 → 0.5768，**真实但幅度不大**。
+- 2026-09-29，同一运行：为了让出显卡做解码，训练在 step 18 被杀掉后从
+  `ckpt/step_0000015` 重启。**重跑的 step 16 与被杀前逐项一致**（kl 0.4931、recall 0.5862、
+  heat_kept 0.5841，只有耗时差 0.4 s），说明 checkpoint 恢复了采样器位置、几何轮次和 RNG
+  状态——续训是确定性的，不是"从这个权重重新开始"。
 - 2026-09-25 2×4090，`configs/stage1_refine_t102_4090.yaml`（全部 latent_t 102，四个宽高比
   轮转，accum 2，offload_blocks 50，`_COLLECT_BYTES` 256 MiB，
   `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.8`）：
