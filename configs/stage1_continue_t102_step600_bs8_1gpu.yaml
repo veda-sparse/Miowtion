@@ -1,6 +1,6 @@
 # Stage 1 continued from the published 8-NFE predictor (step 600) on ONE
 # RTX PRO 6000 Blackwell: the longest geometry, all four aspect ratios,
-# batch 32.
+# batch 8.
 #
 # Warm start: the release
 # (huggingface.co/Veda-Sparse/Minimax-H3-T2VA-Veda-8NFE-600Step-Preview)
@@ -8,10 +8,13 @@
 # resume -- a bundle carries no optimizer moments, so Adam restarts cold
 # (hence the warmup below) and the weights come back fp8-rounded.
 #
-# Batch 32 = 1 rank x accum 32. The release was trained at batch 8
-# (2 ranks x accum 4) and its logs showed the two micro-batch gradients
-# disagreeing on ~1 step in 4 at batch 4; 32 is the next step up on a box
-# with one card, where batch can only come from accumulation.
+# Batch 8 = 1 rank x accum 8, the batch the release itself trained at
+# (2 ranks x accum 4). Eight micro-steps and an eight-step trajectory are
+# the same number on purpose: an update is then exactly one clip rolled
+# from noise to the end of its schedule, so every update sees all eight
+# noise levels once and, because the geometry sampler advances per
+# trajectory, exactly one geometry. lr stays at the 1e-3 phase A used at
+# this batch.
 #
 # Geometry: the four aspect ratios at latent_t 102 -- the longest clips
 # (14.4 s, 104576 tokens at 16:9) and the geometry the release was NOT
@@ -20,10 +23,11 @@
 # from the same corpus; latent_t must match, so the eligible half is the one
 # written for 14.4 s.
 #
-# Cost: a micro-step at latent_t 102 is ~84 s on this card, so batch 32 is
-# ~45 min per update. That is the price of the longest geometry at this
-# batch on one card, and it sets the monitoring cadence.
-run_name: stage1_continue_t102_step600_1gpu
+# Cost on this card, measured in the run itself: a micro-step is 30 s at
+# 1:1 (60427 tokens), 50 s at 4:3 (79997) and 84 s at 16:9 / 9:16
+# (104567), so an update is 4 / 6.7 / 11.2 min depending on which geometry
+# the cycle is on -- ~8.3 min on average.
+run_name: stage1_continue_t102_step600_bs8_1gpu
 checkpoint_root: weights/MiniMax-H3
 sample_cache: artifacts/samples/moviegen_video_bench
 geometries: ['1:1@102', '4:3@102', '16:9@102', '9:16@102']
@@ -37,9 +41,9 @@ teacher_adapter: weights/turbo_lora/minimax_h3_turbo_v4_step600_ema.safetensors
 init_from: artifacts/init/veda_8nfe_step600
 keep_ratio: 0.1
 teacher_q_tiles: 1.0   # supervise every query tile
-accum: 32              # 1 rank x 32 = batch 32
+accum: 8               # 1 rank x 8 = batch 8, one trajectory per update
 steps: 100
-lr: 1.0e-3             # the rate phase A ran at, at 1/4 of this batch
+lr: 1.0e-3             # the rate phase A ran at, at this same batch
 # Longer than phase A's 20 relative to the run, because the moments start
 # empty here: the first updates of a cold Adam are the ones that can undo a
 # warm start.
