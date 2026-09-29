@@ -51,6 +51,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument('--keep-ratio', type=float, default=None,
                         help='budget to select at; defaults to the one the '
                         'reference bundle records')
+    parser.add_argument('--across-steps', action='store_true',
+                        help='allow bundles from different training steps. '
+                        'Off by default because this script exists to '
+                        'isolate storage precision, and two steps would '
+                        'confound rounding with training. On, it becomes a '
+                        'checkpoint comparison: one trajectory, one clip, '
+                        'every bundle scored on identical inputs, which is '
+                        'the only way to read a training trend without the '
+                        'per-clip variation that a training log carries.')
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--q-tile-fraction', type=float, default=0.25,
                         help='share of query tiles measured per layer')
@@ -94,11 +103,12 @@ def main():
         with progress.Timer(f'load bundle {name} ({path})'):
             bundles[name] = veda_bundle.load(path, env.device)
     steps_recorded = {b.metadata.get('step') for b in bundles.values()}
-    if len(steps_recorded) != 1:
+    if len(steps_recorded) != 1 and not args.across_steps:
         # Comparing precisions of *one* trained predictor is the point; two
         # different steps would confound the rounding with the training.
         raise ValueError(f'bundles come from different training steps: '
-                         f'{sorted(steps_recorded)}')
+                         f'{sorted(steps_recorded)}; pass --across-steps to '
+                         'compare checkpoints instead of precisions')
     predictors = {name: b.predictor for name, b in bundles.items()}
     plan_table = bundles[reference].plans
     plan = plan_table.select(geometry)
