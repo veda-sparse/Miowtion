@@ -72,6 +72,7 @@
 |---|---|---|---|
 | 第三方扩展编译失败，报 "C++20 or later compatible compiler is required" | torch 2.14 需要 C++20 | 编译参数改为 `-std=c++20` | [dependencies](dependencies.md) |
 | 运行 transformers 的 Qwen3-VL 报缺少 torchvision | 视频处理器依赖 torchvision | 安装与 torch 匹配的 torchvision | [dependencies](dependencies.md) |
+| 20 条片子去噪跑完 35 分钟，写 mp4 时才报 `No module named 'diffusers'` / `torchvision` / `ffmpeg` | 训练机只装了训练依赖，解码链缺件，而解码是流程最后一步 | 按 [dependencies](dependencies.md) 一次补齐；已跑的去噪不用重来，`generate.py --decode-only` 从 `<mode>_latents.pt` 续 | [dependencies](dependencies.md) |
 
 ## Prompt 扩写
 
