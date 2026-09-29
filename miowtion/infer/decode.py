@@ -302,24 +302,46 @@ def write_mp4(path: str, frames: np.ndarray,
                        check=True)
 
 
-def add_title(frames: np.ndarray, title: str) -> np.ndarray:
-    """Prepends a black bar with the centered white title to every frame."""
+def title_bar(title: str, bar_height: int,
+              width: int | None = None) -> np.ndarray:
+    """A black bar carrying the centered white title, [bar_height, W, 3].
+
+    Args:
+        title: Text to draw.
+        bar_height: Bar height in pixels.
+        width: Bar width. None sizes it to the text plus a margin, which is
+            what a streaming compositor wants: there the pane width is known
+            to ffmpeg and not to Python, so the bar is overlaid centered
+            instead of being drawn at the pane's width.
+
+    Returns:
+        uint8 RGB array.
+    """
     from PIL import Image, ImageDraw, ImageFont  # pylint: disable=import-outside-toplevel
-    num_frames, height, width, _ = frames.shape
-    bar_height = 2 * max(16, round(height * _TITLE_BAR_FRACTION / 2))
     size = round(bar_height * 0.6)
     try:
         font = ImageFont.truetype(_TITLE_FONT, size)
     except OSError:
         font = ImageFont.load_default(size=size)
+    measure = ImageDraw.Draw(Image.new('RGB', (1, 1)))
+    left, top, right, bottom = measure.textbbox((0, 0), title, font=font)
+    if width is None:
+        width = (right - left) + 2 * size
     bar = Image.new('RGB', (width, bar_height), 'black')
     draw = ImageDraw.Draw(bar)
-    left, top, right, bottom = draw.textbbox((0, 0), title, font=font)
     draw.text(((width - (right - left)) / 2 - left,
                (bar_height - (bottom - top)) / 2 - top), title,
               fill='white', font=font)
+    return np.asarray(bar)
+
+
+def add_title(frames: np.ndarray, title: str) -> np.ndarray:
+    """Prepends a black bar with the centered white title to every frame."""
+    num_frames, height, width, _ = frames.shape
+    bar_height = 2 * max(16, round(height * _TITLE_BAR_FRACTION / 2))
+    bar = title_bar(title, bar_height, width)
     out = np.empty((num_frames, bar_height + height, width, 3), np.uint8)
-    out[:, :bar_height] = np.asarray(bar)
+    out[:, :bar_height] = bar
     out[:, bar_height:] = frames
     return out
 

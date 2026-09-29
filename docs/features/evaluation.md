@@ -133,13 +133,21 @@ CUDA_VISIBLE_DEVICES=0 python scripts/predictor_precision.py \
 
 ## 已有的基线视频（v1 集合上）
 
-| 路 | 目录 |
-|---|---|
-| Dense | `artifacts/generate/holdout20_step600/<clip>/dense.mp4` |
-| Veda t37 step600（已发布的打分器） | `artifacts/generate/holdout20_step600/<clip>/veda.mp4` |
-| Veda t102 step200 fp8 | `artifacts/generate/holdout20_step200fp8_fixed/<clip>/veda.mp4` |
+| 路 | 目录 | 可用 |
+|---|---|---|
+| Dense | `artifacts/generate/holdout20_step600_raw/<clip>/dense.mp4` | 是 |
+| Veda t37 step600（已发布的打分器） | `artifacts/generate/holdout20_step600_raw/<clip>/veda.mp4` | 是 |
+| Veda t102 step200 fp8 | `artifacts/generate/holdout20_step200fp8/<clip>/veda.mp4` | **否：花屏**，不要拿它当基线 |
 
-三路的拼接结果在 `artifacts/visual_checks/holdout20_step200/2026-09-26/<clip>/`。
+注意 `holdout20_step600/<clip>/` 里只剩 `dense_vs_veda.mp4`（单独视频被清过），**单独的
+`dense.mp4` / `veda.mp4` 在 `holdout20_step600_raw/`**。拼接需要单独视频。
+
+## 拼接方向：横版竖着拼，竖版横着拼
+
+三路 16:9 并排是 4032 px 宽，屏幕上没法看；竖着堆是 1344 宽。三路 9:16 竖着堆有 4000 px 高，
+所以要并排。`visual_check.py --stack` 默认 `auto`：用 ffprobe 读参考那一路的宽高，
+**横版（含正方形）竖堆、竖版横排**。拿不到 ffprobe 就直接报错要求显式 `--stack h/v`，
+不猜——猜错了产出的是一个没人能看的对比。
 
 ## 另一个集合：训练语料自己的 holdout
 
@@ -149,6 +157,11 @@ CUDA_VISIBLE_DEVICES=0 python scripts/predictor_precision.py \
 （`predictor_precision`），不适合和 v1 的历史视频拼对比——prompt 与几何都不同。
 
 ## 踩坑记录
+- **`visual_check.py` 的标题栏依赖 ffmpeg 的 `drawtext`**，而这个滤镜要 ffmpeg 链接
+  libfreetype——工作站的 homebrew 9.0.2 和 GPU 机器的静态 7.0.2 **都没有**。现在标题用
+  Pillow 预渲染成紧凑 PNG 再 `overlay` 居中：不缩放所以字清晰，不用探测每路宽高，标签里
+  的特殊字符也不再需要为 drawtext 转义。字体策略与 `infer.decode.title_bar` 共用一份，
+  所以 `generate.py` 的并排图和这里的拼接图标题长得一样。
 
 - **拿新 cache 去和旧视频拼**：id、几何、初始噪声全都不同，拼出来的对比毫无意义。要么
   用同一个 cache，要么把每一路都重跑一遍（dense 也要重跑，代价是小时级）。
@@ -160,6 +173,11 @@ CUDA_VISIBLE_DEVICES=0 python scripts/predictor_precision.py \
 
 ## 验证记录
 
+- 2026-09-29，1×RTX PRO 6000 Blackwell：v1 集合 20 条的三路对比
+  （Dense / Veda t37 step600 / Veda 续训 step15）已生成，在
+  `artifacts/visual_checks/holdout20_step200/2026-09-29/<clip>/`：每路一个单独 mp4 +
+  一个 `side_by_side.mp4`（横版竖堆、竖版横排）。**人工确认尚未进行**（AGENTS.md 1.5
+  要求确认人 / 日期 / commit / 结论）。t102 step200 fp8 那一路因为花屏没有参与。
 - 2026-09-29，1×RTX PRO 6000 Blackwell：v1 集合的 cache 从 4090 机器复制过来后，
   `predictor_precision.py --across-steps` 在 `holdout14s_0000`（16:9@102）上比较
   已发布 step600 与续训 step5 / step15，8 个去噪步全部 step15 > step5 > release

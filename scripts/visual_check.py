@@ -25,12 +25,12 @@ import re
 import shutil
 import subprocess
 
+from miowtion.infer import decode
 from miowtion.utils import progress
 
 # Height of the title bar drawn above each pane, in pixels. Big enough to
 # read in a 3-up of a 720p clip without eating into the picture.
 _TITLE_HEIGHT = 48
-_TITLE_FONT_SIZE = 28
 
 # ffmpeg writes the metric summary to stderr; these pick the mean out of
 # lines like 'PSNR y:.. u:.. v:.. average:31.94 min:.. max:..' and
@@ -52,6 +52,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument('--out-dir', default=None,
                         help='default artifacts/visual_checks/<feature>/'
                         '<today>')
+    parser.add_argument('--stack', choices=('auto', 'h', 'v'),
+                        default='auto',
+                        help="pane layout: 'h' left to right, 'v' top to "
+                        "bottom, 'auto' (default) picks the opposite of the "
+                        "clip's orientation with ffprobe -- landscape clips "
+                        'stack vertically, portrait ones horizontally')
     parser.add_argument('--heatmap', action='store_true',
                         help='also write per-frame difference videos '
                         '(off by default: only useful when chasing a '
@@ -83,32 +89,65 @@ def parse_videos(specs: list[str]) -> dict[str, str]:
     return out
 
 
-def escape_text(label: str) -> str:
-    """Escapes a label for ffmpeg's drawtext, which parses its own syntax."""
-    for char in ('\\', ':', "'", '%', ',', '[', ']', ';'):
-        label = label.replace(char, '\\' + char)
-    return label
+def write_title(label: str, path: str,
+                bar_height: int = _TITLE_HEIGHT) -> str:
+    """Renders `label` as a tight title-bar PNG; returns `path`.
+
+    The bar is drawn here rather than by ffmpeg's drawtext, which needs an
+    ffmpeg built against libfreetype -- neither the workstation nor the GPU
+    box in use has one, and a comparison that cannot be labelled is not a
+    comparison (AGENTS.md 1.5.1). It also shares its font policy with
+    miowtion.infer.decode, so a stacked video from this script and the
+    dense-vs-veda video generate.py writes carry identical-looking titles.
+    """
+    from PIL import Image  # pylint: disable=import-outside-toplevel
+    Image.fromarray(decode.title_bar(label, bar_height)).save(path)
+    return path
 
 
-def stack_command(videos: dict[str, str], out_path: str,
-                  ffmpeg: str = 'ffmpeg') -> list[str]:
+def stack_command(videos: dict[str, str], titles: dict[str, str],
+                  out_path: str, ffmpeg: str = 'ffmpeg',
+                  stack: str = 'h') -> list[str]:
     """ffmpeg argv for the titled 1xN stack.
 
-    Every pane is padded with a title bar of its own and then hstacked, so
-    the labels stay attached to their pane whatever the aspect ratio is.
+    Every pane is padded with a bar of its own and the pane's title image is
+    overlaid centered on it, then the panes are hstacked, so the labels stay
+    attached to their pane whatever the aspect ratio is. The title is
+    composited at its natural size (never scaled), which keeps the text
+    crisp and needs no probing of the pane's dimensions; a label wider than
+    its pane is cropped.
+
+    Args:
+        videos: Ordered {label: video path}.
+        titles: {label: PNG path} from write_title, one per pane.
+        out_path: Destination.
+        ffmpeg: Binary to call.
+        stack: 'h' places the panes left to right, 'v' top to bottom. The
+            useful choice is the opposite of the clip's own orientation:
+            three 16:9 panes side by side are 4032 px wide and unwatchable,
+            stacked they are 1344 wide; three 9:16 panes stack to 4000 px
+            tall and belong side by side instead.
+
+    Raises:
+        ValueError: On an unknown `stack`.
     """
+    if stack not in ('h', 'v'):
+        raise ValueError(f"stack must be 'h' or 'v', got {stack!r}")
     args = [ffmpeg, '-y']
     for path in videos.values():
         args += ['-i', path]
+    for label in videos:
+        args += ['-i', titles[label]]
     parts = []
+    count = len(videos)
     for index, label in enumerate(videos):
         parts.append(
-            f'[{index}:v]pad=iw:ih+{_TITLE_HEIGHT}:0:{_TITLE_HEIGHT}:black,'
-            f"drawtext=text='{escape_text(label)}':fontcolor=white:"
-            f'fontsize={_TITLE_FONT_SIZE}:x=(w-text_w)/2:'
-            f'y={(_TITLE_HEIGHT - _TITLE_FONT_SIZE) // 2}[p{index}]')
-    inputs = ''.join(f'[p{i}]' for i in range(len(videos)))
-    parts.append(f'{inputs}hstack=inputs={len(videos)}[v]')
+            f'[{index}:v]pad=iw:ih+{_TITLE_HEIGHT}:0:{_TITLE_HEIGHT}:black'
+            f'[b{index}]')
+        parts.append(f'[b{index}][{count + index}:v]'
+                     f'overlay=(W-w)/2:0[p{index}]')
+    inputs = ''.join(f'[p{i}]' for i in range(count))
+    parts.append(f'{inputs}{stack}stack=inputs={count}[v]')
     args += ['-filter_complex', ';'.join(parts), '-map', '[v]']
     # The audio of the reference pane: the panes are the same clip, so N
     # copies of one track would only phase against each other.
@@ -157,6 +196,34 @@ def parse_metrics(stderr: str) -> dict[str, float]:
     return out
 
 
+def probe_stack(path: str, ffprobe: str = 'ffprobe') -> str:
+    """'v' for a landscape (or square) clip, 'h' for a portrait one.
+
+    Stacks against the clip's orientation, which is what keeps the result
+    watchable on a screen (see stack_command).
+
+    Raises:
+        RuntimeError: If ffprobe is missing or reports no video stream. It
+            is not guessed: the wrong choice makes a comparison nobody can
+            watch, and `--stack` states it explicitly.
+    """
+    try:
+        done = subprocess.run(
+            [ffprobe, '-v', 'error', '-select_streams', 'v:0',
+             '-show_entries', 'stream=width,height', '-of', 'csv=p=0', path],
+            capture_output=True, text=True, check=False)
+    except FileNotFoundError as error:
+        raise RuntimeError(
+            f'{ffprobe} not found, so the stack direction cannot be probed; '
+            "pass --stack h or --stack v") from error
+    fields = done.stdout.strip().split(',')
+    if done.returncode or len(fields) < 2:
+        raise RuntimeError(f'{ffprobe} found no video stream in {path}: '
+                           f'{done.stderr[-500:]}')
+    width, height = int(fields[0]), int(fields[1])
+    return 'v' if width >= height else 'h'
+
+
 def _run(args: list[str]) -> str:
     done = subprocess.run(args, capture_output=True, text=True, check=False)
     if done.returncode:
@@ -194,8 +261,15 @@ def main():
             shutil.copyfile(path, copy)
 
     stack = os.path.join(out_dir, 'side_by_side.mp4')
-    with progress.Timer(f'stack {len(videos)} panes'):
-        _run(stack_command(videos, stack, args.ffmpeg))
+    titles = {label: write_title(
+        label, os.path.join(out_dir, f'.title_{index}.png'))
+        for index, label in enumerate(videos)}
+    direction = (probe_stack(videos[reference]) if args.stack == 'auto'
+                 else args.stack)
+    with progress.Timer(f'stack {len(videos)} panes ({direction})'):
+        _run(stack_command(videos, titles, stack, args.ffmpeg, direction))
+    for path in titles.values():
+        os.remove(path)
 
     report = {'reference': reference, 'panes': videos, 'metrics': {}}
     for label, path in videos.items():

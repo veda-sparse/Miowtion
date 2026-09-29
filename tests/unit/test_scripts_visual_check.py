@@ -35,21 +35,31 @@ def test_bad_pane_specs_raise(specs, match):
 def test_stack_titles_every_pane_and_hstacks_them():
     module = _module()
     videos = {'Dense': 'a.mp4', 'Veda 90%': 'b.mp4', 'fp8': 'c.mp4'}
-    args = module.stack_command(videos, 'out.mp4')
+    titles = {label: f'{label}.png' for label in videos}
+    args = module.stack_command(videos, titles, 'out.mp4')
     assert args[:2] == ['ffmpeg', '-y']
-    assert args.count('-i') == 3
+    # Three panes and three title images, panes first.
+    assert args.count('-i') == 6
+    assert args[2:8:2] == ['-i'] * 3
     chain = args[args.index('-filter_complex') + 1]
-    assert chain.count('drawtext') == 3
+    # Each pane gets a bar and its own title overlaid centered on it.
+    assert chain.count('overlay=(W-w)/2:0') == 3
+    assert '[b0][3:v]overlay' in chain and '[b2][5:v]overlay' in chain
     assert '[p0][p1][p2]hstack=inputs=3[v]' in chain
-    # Percent and colon are drawtext syntax; a label must survive them.
-    assert 'Veda 90\\%' in chain
+    # No drawtext: the titles are pre-rendered, so no label needs escaping
+    # and a label may contain any character.
+    assert 'drawtext' not in chain
     assert args[-1] == 'out.mp4'
 
 
-def test_labels_with_ffmpeg_syntax_are_escaped():
-    escape = _module().escape_text
-    assert escape('a:b') == 'a\\:b'
-    assert escape("it's") == "it\\'s"
+def test_title_png_is_written_and_sized_to_the_text(tmp_path):
+    module = _module()
+    short = module.write_title('A', str(tmp_path / 'a.png'))
+    long = module.write_title('A much longer label', str(tmp_path / 'b.png'))
+    from PIL import Image
+    with Image.open(short) as a, Image.open(long) as b:
+        assert a.height == b.height
+        assert b.width > a.width
 
 
 def test_metrics_are_read_out_of_ffmpeg_stderr():
@@ -79,3 +89,43 @@ def test_heatmap_is_a_difference_blend_against_the_reference():
     assert 'blend=all_mode=difference' in chain
     assert 'pseudocolor' in chain
     assert args[args.index('-i') + 1] == 'ref.mp4'
+
+
+def test_stack_direction_switches_the_filter():
+    module = _module()
+    videos = {'A': 'a.mp4', 'B': 'b.mp4'}
+    titles = {label: f'{label}.png' for label in videos}
+    for direction in ('h', 'v'):
+        args = module.stack_command(videos, titles, 'out.mp4',
+                                    stack=direction)
+        chain = args[args.index('-filter_complex') + 1]
+        assert f'{direction}stack=inputs=2[v]' in chain
+    with pytest.raises(ValueError, match='stack must be'):
+        module.stack_command(videos, titles, 'out.mp4', stack='diagonal')
+
+
+def test_probe_stack_opposes_the_clip_orientation(monkeypatch):
+    module = _module()
+    import subprocess as sp
+
+    def fake(args, **kwargs):
+        wh = {'wide.mp4': '1344,768', 'tall.mp4': '768,1344',
+              'square.mp4': '768,768'}[args[-1]]
+        return sp.CompletedProcess(args, 0, stdout=wh + '\n', stderr='')
+
+    monkeypatch.setattr(module.subprocess, 'run', fake)
+    # Landscape and square stack vertically, portrait horizontally.
+    assert module.probe_stack('wide.mp4') == 'v'
+    assert module.probe_stack('square.mp4') == 'v'
+    assert module.probe_stack('tall.mp4') == 'h'
+
+
+def test_probe_stack_refuses_to_guess_without_ffprobe(monkeypatch):
+    module = _module()
+
+    def missing(args, **kwargs):
+        raise FileNotFoundError(args[0])
+
+    monkeypatch.setattr(module.subprocess, 'run', missing)
+    with pytest.raises(RuntimeError, match='--stack'):
+        module.probe_stack('a.mp4')
