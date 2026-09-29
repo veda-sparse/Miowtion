@@ -317,6 +317,23 @@ micro-step，稳态值）：
 训练的收益远小于推理：一次 update 里那次稠密 teacher 前向占绝大部分，而教师热力图
 （Triton）和打分器都不经过这三处改动。
 
+**真实权重下的阶段 1 micro-step**（`configs/stage1_continue_t102_step600_bs8_1gpu.yaml`，
+8 步 turbo 教师 + 少步 LoRA、keep 0.1、`teacher_q_tiles 1.0`、offload 0、
+`mlp_chunk_rows 8192`、`veda_collect_mib 2048`；accum 8 所以一次 update = 一条完整轨迹）：
+
+| 几何 | 序列 | micro-step | 一次 update（8 micro） | 1×4090 同几何 micro-step |
+|---|---:|---:|---:|---:|
+| 1:1@102 | 60427 | 30.0 s | 245 s | — |
+| 4:3@102 | 79997 | 49.7 s | 399 s | — |
+| 9:16@102 | 104445 | 84.0 s | 674 s | — |
+| 16:9@102 | 104567 | 83.6~84.5 s | 668 s | **182.71 s**（§7，offload 50） |
+
+同几何（16:9@102）比 1×4090 快 **2.18×**，但其中一部分是容量而非算力：4090 必须
+`offload_blocks: 50` + `mlp_chunk_rows: 4096` 才跑得起来，那个数字里含每步的 block H2D，
+而这张卡 50 个 block 全常驻（峰值 54.4 GiB / 96）。换句话说这是"各自最优可行配置"的对比。
+按 batch 8 折算：1×4090 约 24.4 min/update，2×4090（accum 4，发布 checkpoint 的配置）约
+12.2 min，这张卡 11.2 min——**一张卡略快于当时的两张 4090**。
+
 ### 11.4 还能往哪里走（SM120 的实测天花板）
 
 先把尺子定死：这张卡的**实测 bf16 GEMM 上限是 432.5 TFLOP/s**（cuBLAS 8192³，标称峰值

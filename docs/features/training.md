@@ -248,6 +248,21 @@ kernel 只读 top-k 的排序，两者会分开；见 `docs/features/veda_predic
   影响数值，必须与 tile 搜索时一致。
 
 ## 验证记录
+- 2026-09-29，1×RTX PRO 6000 Blackwell（SM120），从发布的 8NFE step600 bundle 续训
+  （`scripts/import_predictor.py` 解包 → `init_from`，Adam 冷启动、权重是 fp8 舍入后的值）：
+  4 个纵横比 @ latent_t 102、batch 8（1 rank × accum 8，一次 update = 一条完整 8 步轨迹）。
+  日志确认 `{"event": "initialized"}` 与 `adapter applied: 209 weights merged, 50 AdaLN
+  projections tabulated`。前 6 个 update 的 dynamics：
+  - **batch 8 够用**：`grad_cos` = 0.56 / 0.57 / 0.22 / −0.12 / 0.19（相邻 update 之间，
+    且每次换几何），围绕正均值震荡。对比阶段 A 在 batch 4 + `teacher_q_tiles 0.25` 时
+    `grad_cos` 低到 −0.12 的系统性分歧，这里没有必要再把 batch 往上加（batch 32 实测
+    33 min/update，4 倍代价换一个本来就一致的梯度）。
+  - **跨几何的 kl 不能直接比**：step 1→4 的 kl 单调上升（0.5325→0.5533）只是几何难度，
+    同几何对比是下降或持平的：4:3 step 2→5 kl 0.5349→0.5076、recall 0.5813→0.5937；
+    9:16 step 3→6 kl 0.5451→0.5480、recall 0.5783→0.5863。
+  - 几何归一化的 `heat_kept / heat_ceiling` 是最适合跨几何看趋势的量：81.3% → 84.2%
+    （step 1→4），同几何 83.1%→83.9%（4:3）、82.7%→83.6%（9:16）。
+  - `logit_std` 2.4~2.7，没有塌缩（塌缩会趋于 0）。
 - 2026-09-25 2×4090，`configs/stage1_refine_t102_4090.yaml`（全部 latent_t 102，四个宽高比
   轮转，accum 2，offload_blocks 50，`_COLLECT_BYTES` 256 MiB，
   `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.8`）：
