@@ -66,6 +66,7 @@
 | 训练慢，但诊断量的 FLOPs 明明可以忽略 | 逐层 `kl.item()` 和对设备张量的 Python 分支把 CPU 与 GPU 串起来 | 诊断量留在设备上，每个 micro-step 只做一次 `torch.stack(...).cpu()` | [training](features/training.md) |
 | 4090 上第 2 次 update 时 OOM | 打分器的 Adam 状态、梯度和 EMA（约 5.5 GB）常驻显存 | `offload_optimizer`：主权重、动量、EMA 放 pinned 主机内存 | [training](features/training.md) |
 | 8 卡训练启动要 23 分钟，其中 18 分钟在 AdaLN 建表 | 表是复制的，每块 `adaln_proj` 1.04 GB × 50 块 = 52 GB，8 个 rank 各读一遍 = 416 GB 走网络盘 | 把 transformer 拷进 `/dev/shm` 再用软链接指过去；启动降到 10 秒 | [training](features/training.md) |
+| 训练跑完发现 checkpoint 不在共享盘上，随实例停机丢失 | `ln -sfn 目标 runs` 在 `runs/` **已经是目录**时会把链接建进目录里（`runs/runs`），输出仍写本地盘，且完全没有报错 | 建链接前先确认目标不是已存在的目录（`ls -ld`），建完用 `ls -l` 确认是 `runs -> ...` 而不是 `runs/runs -> ...`；长任务开跑后先确认第一个 checkpoint 落在预期位置 | [training](features/training.md) |
 
 ## 环境
 
