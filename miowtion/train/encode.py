@@ -54,7 +54,6 @@ class TextEncoder:
     def __init__(self, variant_dir: str, device_map: str | dict = 'auto',
                  max_memory: dict | None = None):
         from transformers import AutoConfig  # pylint: disable=import-outside-toplevel
-        from transformers import AutoProcessor  # pylint: disable=import-outside-toplevel
         from transformers import AutoTokenizer  # pylint: disable=import-outside-toplevel
         from transformers import Qwen3VLForConditionalGeneration  # pylint: disable=import-outside-toplevel
         encoder_dir = os.path.join(variant_dir, 'text_encoder')
@@ -69,8 +68,23 @@ class TextEncoder:
         self.model.eval()
         self.tokenizer = AutoTokenizer.from_pretrained(
             os.path.join(variant_dir, 'tokenizer'))
-        self.processor = AutoProcessor.from_pretrained(
-            os.path.join(variant_dir, 'processor'))
+        self._variant_dir = variant_dir
+        self._processor = None
+
+    @property
+    def processor(self):
+        """The release's Qwen3-VL processor, loaded on first image.
+
+        Built lazily because it is only used to patchify images: the
+        processor drags in the whole image stack (PIL, torchvision), which a
+        t2va corpus -- text only -- would otherwise have to install to
+        encode a prompt.
+        """
+        if self._processor is None:
+            from transformers import AutoProcessor  # pylint: disable=import-outside-toplevel
+            self._processor = AutoProcessor.from_pretrained(
+                os.path.join(self._variant_dir, 'processor'))
+        return self._processor
 
     def _ids(self, text: str) -> list[int]:
         return list(self.tokenizer(text, add_special_tokens=False)[
