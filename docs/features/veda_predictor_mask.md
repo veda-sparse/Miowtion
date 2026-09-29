@@ -63,6 +63,11 @@ KL 在最优点为 0、recall 为 1、TeacherCollector 输出与稠密逐位一�
 其梯度抬高被保留块、压低被丢弃块，对角完全没有梯度。
 
 ## 踩坑记录
+- **选择路径每层同步主机**：`select_video_blocks` 用 `torch.nonzero` 找落在本列块里的行来强制
+  对角块，结果大小依赖数据，每次调用都要等 GPU；`bresenham_extra` 每次把缓存在主机上的表 H2D
+  （可分页内存，同样等 GPU）。t102 每步因此空闲 0.21 s。对策：对角块改成对所有行
+  gather / where / scatter（写入的值逐位相同，单测对拍原实现）；bresenham 表按设备缓存
+  （返回的张量是共享缓存，调用方不得修改）。
 - **Bresenham 的浮点误差**：`2.3−2` 得到 `0.29999999999999982`，`floor(400×frac)` 少算 1 个，
   平均值与预算的差达到 1/n。对策：frac 按 12 位小数取整。
 - **Triton 默认的 num_stages=3 让热力图 kernel 慢约 20%**：key tile 循环被软件流水后反而变慢

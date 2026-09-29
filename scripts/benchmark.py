@@ -110,6 +110,12 @@ def build_parser() -> argparse.ArgumentParser:
                         choices=pipeline.ATTENTION_MODES)
     parser.add_argument('--predictor', default=None,
                         help='predictor bundle (veda)')
+    parser.add_argument(
+        '--veda-collect-mib', type=int,
+        default=veda_attention.DEFAULT_COLLECT_BYTES // 2**20,
+        help='head-chunk bound of the sparse attention (VedaConfig.'
+        'collect_bytes); the default fits 24 GB, 2048 runs a whole head '
+        'group per launch at latent_t 102')
     parser.add_argument('--keep-ratio', type=float, default=None)
     parser.add_argument('--dense-steps', type=int, nargs='*', default=[])
     parser.add_argument('--seed', type=int, default=0)
@@ -365,7 +371,8 @@ def main() -> None:
             plans, predictor = loaded.plans, loaded.predictor
         stages['predictor'] = timer.seconds
         veda_config = veda_attention.VedaConfig(
-            target_budget=veda_mask.Budget(ratio=args.keep_ratio))
+            target_budget=veda_mask.Budget(ratio=args.keep_ratio),
+            collect_bytes=args.veda_collect_mib * 2**20)
     decoder = None
     if args.decode:
         with progress.Timer('load the VAE decoder') as timer:

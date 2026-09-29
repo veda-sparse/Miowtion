@@ -74,6 +74,12 @@ def build_parser() -> argparse.ArgumentParser:
                         help='predictor bundle (.safetensors) written by '
                         'scripts/export_predictor.py; brings its own plans, '
                         'so it replaces --checkpoint and --plan-dir')
+    parser.add_argument(
+        '--veda-collect-mib', type=int,
+        default=veda_attention.DEFAULT_COLLECT_BYTES // 2**20,
+        help='head-chunk bound of the sparse attention (VedaConfig.'
+        'collect_bytes); the default fits 24 GB, 2048 runs a whole head '
+        'group per launch at latent_t 102')
     parser.add_argument('--keep-ratio', type=float, default=None,
                         help='block budget; defaults to the bundle\'s own '
                         'ratio, else 0.1')
@@ -209,7 +215,8 @@ def _denoise_all(args, env, cache, jobs, devices, assigned) -> list[dict]:
             raise ValueError('veda needs --predictor, or --plan-dir with '
                              '--checkpoint')
         veda_config = veda_attention.VedaConfig(
-            target_budget=veda_mask.Budget(ratio=args.keep_ratio))
+            target_budget=veda_mask.Budget(ratio=args.keep_ratio),
+            collect_bytes=args.veda_collect_mib * 2**20)
         progress.log(f'veda: {source}, keep {args.keep_ratio}, dense '
                      f'steps {args.dense_steps}')
     replicas = [(tch.model, tch.tables, predictor)]

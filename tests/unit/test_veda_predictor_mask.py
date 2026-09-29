@@ -148,3 +148,47 @@ def test_dense_block_mask_for_a_row_subset():
     assert torch.equal(sub_mask, veda_mask.dense_block_mask(full, lay)[:, rows])
     with pytest.raises(ValueError):
         veda_mask.dense_block_mask(sub, lay)
+
+
+def _select_with_nonzero(scores, layout, blocks, rows):
+    """The selection as first written: diagonal via torch.nonzero indexing."""
+    heads, num_rows = scores.shape[0], rows.numel()
+    indices, keeps = [], []
+    for block in blocks:
+        n_cols = block.stop - block.start
+        s = scores[:, :, block.start:block.stop].float().clone()
+        s.masked_fill_(~layout.kv_ok[None, None, block.start:block.stop],
+                       float('-inf'))
+        own = torch.nonzero((rows >= block.start)
+                            & (rows < block.stop)).view(-1)
+        s[:, own, rows[own] - block.start] = float('inf')
+        budget = block.budget.per_row(block.real_tokens, n_cols)
+        k_lo, k_hi, frac = veda_mask.split_budget(budget, n_cols)
+        vals, idx = torch.topk(s, k_hi, dim=-1, sorted=True)
+        extra = veda_mask.bresenham_extra(layout.n_video_tiles, frac,
+                                          'cpu').index_select(0, rows)
+        allowed = k_lo + extra.to(torch.long)
+        keep = (torch.arange(k_hi)[None, None, :]
+                < allowed[None, :, None]) & (vals > float('-inf'))
+        indices.append(idx + block.start)
+        keeps.append(keep.expand(heads, num_rows, k_hi))
+    return torch.cat(indices, -1), torch.cat(keeps, -1)
+
+
+def test_diagonal_without_nonzero_is_bitwise_the_original():
+    lay = _layout(target_grid=(16, 8, 16), cond=(1, 16, 32))
+    n_video = lay.n_video_tiles
+    blocks = veda_mask.column_blocks(lay, veda_mask.Budget(ratio=0.25),
+                                     veda_mask.Budget(tiles=2))
+    torch.manual_seed(0)
+    # Coarse scores force ties, so topk order is part of the comparison.
+    scores = torch.randint(0, 4, (3, n_video, lay.n_tiles)).float()
+    for rows in (torch.arange(n_video),
+                 torch.tensor([0, lay.n_ref_tiles - 1, lay.n_ref_tiles,
+                               n_video - 1])):
+        sel = veda_mask.select_video_blocks(scores[:, rows], lay, blocks,
+                                            rows)
+        index, keep = _select_with_nonzero(scores[:, rows], lay, blocks,
+                                           rows)
+        assert torch.equal(sel.index, index)
+        assert torch.equal(sel.keep, keep)

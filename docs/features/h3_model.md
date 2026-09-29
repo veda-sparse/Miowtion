@@ -53,6 +53,19 @@ VAE 代码、`model_index.json` 的 sigma 位移）直接复用，不重写。
 - `set_mlp_chunk_rows`：按行分块计算 MLP，降低中间张量峰值（100k 行时为 5.7 GB）。不同行数下
   GEMM 结果可能不同，所以搜索、训练、评估必须使用同一个设置。
 
+### 融合的逐元素链（`miowtion/kernels/elementwise_triton.py`）
+
+RoPE、AdaLN modulate、门控残差、SwiGLU 的 silu×up 在 eager 下每个算子都是一次整张
+[S, hidden]（或 [S, H, D]）bf16 张量的读写，在 RTX PRO 6000 上占 Veda 一步的 ~17%
+（`docs/benchmark/performance.md` §11.2）。CUDA + Triton 上它们各合并成一个 kernel。
+
+- **不变量：与 eager 链逐位相等**（`torch.equal`，不是 allclose）。eager 里每个物化成 bf16 张量
+  的中间结果，kernel 里也在同一位置舍入到 bf16（fp32 计算、就近偶数），顺序相同；silu 用
+  libdevice 的 `exp` 与正确舍入除法 `div_rn`，与 PyTorch CUDA silu 编译出的一致。
+- **没有 autograd**：`model._fused()` 只在不需要梯度时走融合路径；阶段 2 的 LoRA 学生前向
+  （需要反传）仍走 eager。推理与阶段 1 的 no_grad 教师前向都走融合路径。
+- 分派只看设备与 dtype（CUDA、Triton 可用、全部 bf16），不是行为开关：两条路结果逐位相同。
+
 ### 权重（`miowtion/h3/weights.py`）
 - 发布 checkpoint 的融合 QKV 按头交错存放（h0 的 q,k,v，h1 的 q,k,v，…），加载时重排成
   [q_all; k_all; v_all]。**不重排也能跑，不报错，但结果是垃圾**；测试钉死了这个置换。
@@ -74,6 +87,13 @@ VAE 代码、`model_index.json` 的 sigma 位移）直接复用，不重写。
   置换、命名映射）之后必须跑一次。
 
 ## 踩坑记录
+- **Triton 把"舍入到 bf16"优化掉，还把乘加合成 fma**：`x.to(tl.bfloat16).to(tl.float32)` 这种
+  来回转换会被编译器消掉，随后 `x*a + b` 被收缩成一条 fp32 fma——恰好跳过了 eager 做的那次
+  中间舍入，modulate 有 28% 的元素差 1 ulp。对策：舍入写成整数位运算（加 0x7FFF + 奇偶位、
+  截断低 16 位，NaN 原样保留），编译器无法折叠；同时启动参数 `enable_fp_fusion=False`。
+- **Triton 默认 flush-to-zero**：libdevice 默认用 ftz 变体，silu 对 bf16 次正规数输入输出
+  -0.0，PyTorch 保留次正规数（全部 65536 个 bf16 值里 508 个不同）。对策：启动参数
+  `enable_reflect_ftz=False`；GPU 测试遍历全部 bf16 值钉死。
 - **长 clip 在 RoPE 处 OOM**：eager 的 RoPE 链（乘积、rotate_half 的 cat、最后的 cat）每一步都是整张
   [S, 56, 128] 的临时张量，78k token 时约 4 GB，训练在 4:3 14.4 s 上 OOM。按行分块后临时显存有界，
   结果逐位不变。之后 16:9 14.4 s（104k token）又在 `_modulate`（`index_select` 出的 [S, 5376]
@@ -124,6 +144,10 @@ VAE 代码、`model_index.json` 的 sigma 位移）直接复用，不重写。
   否则下一次就是把一条路修好、另一条路改坏。
 
 ## 验证记录
+- 2026-09-28，1×RTX PRO 6000 Blackwell（SM120）：融合逐元素链 `pytest tests/gpu`
+  23 passed（含 `test_elementwise_triton_gpu.py`：四个 kernel 对 eager 链 `torch.equal`、silu 遍历
+  全部 bf16 值、tiny DiT 整个前向融合 vs eager 逐位相等）。随机权重实测：稠密 step t37
+  10.89 → 10.25 s、t102 58.03 → 55.98 s。
 - 2026-09-26，3×RTX 4090、真实权重、8 步 Turbo LoRA：`[gate; up]`（第一版发布）下
   dense 生成正常，`[up; gate]` 下同 prompt 同 seed 的末态 latent 与初始噪声 cos 0.94、
   两个不同 prompt 的结果逐位相同（纯噪声）。

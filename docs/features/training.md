@@ -79,6 +79,12 @@
 - **MLP 行分块**：`mlp_chunk_rows` 限制 `[rows, 2×14336]` 中间张量的大小。GEMM 的行数会影响
   数值，所以搜索、训练、评估必须使用同一个值。
 - 阶段 2 的重算：逐 block 的非重入检查点。
+- **教师热力图的按头分块**：`veda_collect_mib`（`VedaConfig.collect_bytes`）限制一份按 tile 排列的
+  q / k 拷贝的大小，热力图同时持有两份。默认 256 MiB 是 24 GB 卡在 latent_t 102 上的上限；显存
+  宽裕的卡（96 GB）上设成 2048，一个头组一次算完，launch 数少很多。分块不改变教师输出和热力图，
+  只改变打分器梯度的累加顺序（容差，不是逐位）。
+- **融合逐元素链**：no_grad 的教师前向走 `miowtion/kernels/elementwise_triton.py`（与 eager 逐位
+  相等，见 [h3_model](h3_model.md)）；阶段 2 需要反传的学生前向仍走 eager。
 
 2×RTX 4090 实测（5 s 16:9，38010 token，每 rank 一个 clip）：
 

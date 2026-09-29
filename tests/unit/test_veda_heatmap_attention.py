@@ -1,5 +1,6 @@
 """Tests for miowtion.veda.heatmap and miowtion.veda.attention."""
 
+import dataclasses
 import math
 
 import pytest
@@ -171,7 +172,7 @@ def test_sparse_student_with_global_tiles():
     assert (sparse - dense).abs().max() > 1e-3
 
 
-def test_teacher_collector_head_chunks_match_whole_groups(monkeypatch):
+def test_teacher_collector_head_chunks_match_whole_groups():
     from miowtion.h3 import geometry
     from miowtion.h3 import layout as h3_layout
     from miowtion.veda import plan as veda_plan
@@ -186,7 +187,7 @@ def test_teacher_collector_head_chunks_match_whole_groups(monkeypatch):
         target_budget=veda_mask.Budget(ratio=0.3), teacher_q_tiles=0.5,
         recall_every=1)
 
-    def run():
+    def run(config):
         torch.manual_seed(0)
         pred = veda_predictor.TileScorePredictor(1, 4, 32)
         clip = veda_attention.ClipTiling(lay, config, torch.device('cpu'))
@@ -198,16 +199,15 @@ def test_teacher_collector_head_chunks_match_whole_groups(monkeypatch):
         return out, collector.stats.kl[0], [p.grad.clone()
                                             for p in pred.parameters()]
 
-    whole = run()
-    monkeypatch.setattr(veda_attention, '_COLLECT_BYTES', 1)  # 1 head/chunk
-    chunked = run()
+    whole = run(config)
+    chunked = run(dataclasses.replace(config, collect_bytes=1))  # 1 head
     assert torch.equal(chunked[0], whole[0])
     assert chunked[1] == pytest.approx(whole[1], rel=1e-6)
     for a, b in zip(chunked[2], whole[2]):
         torch.testing.assert_close(a, b, rtol=1e-5, atol=1e-12)
 
 
-def test_sparse_student_head_chunks_are_exact(monkeypatch):
+def test_sparse_student_head_chunks_are_exact():
     from miowtion.h3 import geometry
     from miowtion.h3 import layout as h3_layout
     from miowtion.veda import plan as veda_plan
@@ -224,10 +224,14 @@ def test_sparse_student_head_chunks_are_exact(monkeypatch):
         target_budget=veda_mask.Budget(ratio=0.2)), torch.device('cpu'))
     student = veda_attention.SparseStudent(clip, plan, pred,
                                            allow_reference_kernel=True)
+    one_head = veda_attention.ClipTiling(lay, veda_attention.VedaConfig(
+        target_budget=veda_mask.Budget(ratio=0.2), collect_bytes=1),
+        torch.device('cpu'))
+    chunked_student = veda_attention.SparseStudent(
+        one_head, plan, pred, allow_reference_kernel=True)
     with torch.no_grad():
         whole = student(q, k, v, 0)
-        monkeypatch.setattr(veda_attention, '_COLLECT_BYTES', 1)
-        chunked = student(q, k, v, 0)
+        chunked = chunked_student(q, k, v, 0)
     assert torch.equal(chunked, whole)
 
 

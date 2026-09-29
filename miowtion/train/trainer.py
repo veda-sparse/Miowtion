@@ -74,6 +74,9 @@ class TrainConfig:
     tile_conditions: bool = False
     teacher_q_tiles: float = 1.0
     recall_every: int = 1  # mask diagnostics on every n-th layer
+    # VedaConfig.collect_bytes in MiB: the head-chunk bound of the teacher
+    # heat. The default fits a 24 GB card; raise it where memory allows.
+    veda_collect_mib: int = veda_attention.DEFAULT_COLLECT_BYTES // 2**20
     # Weight of the oracle top-k BCE added to the seer KL (0 = KL only).
     # The KL fits the whole teacher distribution; only the top-k ordering
     # reaches the kernel. See heatmap.oracle_bce().
@@ -214,7 +217,8 @@ class Trainer:
                         if config.ref_keep_ratio else None),
             tile_conditions=config.tile_conditions,
             teacher_q_tiles=config.teacher_q_tiles,
-            recall_every=config.recall_every)
+            recall_every=config.recall_every,
+            collect_bytes=config.veda_collect_mib * 2**20)
 
         self.trainable = [(f'predictor.{n}', p)
                           for n, p in self.predictor.named_parameters()]

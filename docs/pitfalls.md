@@ -25,6 +25,7 @@
 | 长 clip（103k token）的 tile 搜索 OOM | oracle kernel 路径一次 gather 所有头的 q/k/v | 按头分块，单块 ≤ 1 GiB | [tile_search](features/tile_search.md) |
 | oracle 的 kernel 路径与参考路径的 rel-MSE 相差最多 88% | 子集行的块列表用行数 R 当全局列起点 | 起点取 `layout.n_video_tiles`；单测对拍子集与全量 | [tile_search](features/tile_search.md) |
 | 混合形状的用例没真的测到"按头变长" | 两种形状在 (12,8,16) 上都是 12 个 tile、补齐为 0 | 用 latent_t=11 的网格（12 vs 11 个 tile） | [veda_tiling](features/veda_tiling.md) |
+| Veda 每步 GPU 空闲 0.4 s（t102） | `select_video_blocks` 的 `torch.nonzero` 每次调用同步主机；`bresenham_extra` 每次从可分页内存 H2D | 对角块改成 gather / where / scatter；bresenham 表按设备缓存 | [predictor_mask](features/veda_predictor_mask.md) |
 
 ## Kernel
 
@@ -37,6 +38,10 @@
 | FA4 在 SM100 上拒绝 128 行的 Q 块 | 接口在 seqlen>128 时强制 q_stage=2（256 行粒度） | 覆盖为 q_stage=1（待 B200 验证） | [veda_kernel](features/veda_kernel.md) |
 | FA4 报出看起来像掩码形状不对的错误 | `BlockSparseTensorsTorch` 的第 5 个字段是 `cu_total_m_blocks` | `block_size` 用关键字参数传 | [veda_kernel](features/veda_kernel.md) |
 | flex 每次换 pattern 都很慢 | `from_kv_blocks` 默认为反向计算转置索引（约 1.2 ms） | 只做前向时传 `compute_q_blocks=False`（约 0.01 ms） | [veda_kernel](features/veda_kernel.md) |
+| 融合 kernel 与 eager 差 1 ulp（modulate 28% 的元素） | Triton 把 `.to(bf16).to(fp32)` 来回转换消掉，再把乘加收缩成 fp32 fma，跳过了 eager 的中间舍入 | bf16 舍入写成整数位运算；启动参数 `enable_fp_fusion=False` | [h3_model](features/h3_model.md) |
+| 融合的 silu 对次正规数输出 -0.0 | Triton 默认让 libdevice 走 flush-to-zero | 启动参数 `enable_reflect_ftz=False`；GPU 测试遍历全部 bf16 值 | [h3_model](features/h3_model.md) |
+| 猴补 FA4 的 num_stages / num_threads 后测速完全不变、diff 恰好为 0 | FA4 的编译缓存键不含这些参数，第一次编译的 kernel 被复用 | 每个变体前换一个新的 `get_jit_cache()` | [performance](benchmark/performance.md) |
+| SM120 上 FA4 `Q_in_regs=True` + 2 stage 结果错误（max diff 5e-2） | 未查明；SM80 主循环的该组合在 SM120 上没有验证过 | 不用；只作为调参时的已知坏组合 | [performance](benchmark/performance.md) |
 
 ## 训练与分布式
 

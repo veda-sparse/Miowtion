@@ -25,6 +25,12 @@ from miowtion.veda import plan as veda_plan
 from miowtion.veda import predictor as veda_predictor
 from miowtion.veda import tiling
 
+# Default VedaConfig.collect_bytes. Note the TeacherCollector holds *two*
+# copies at once (q and k, until the heat is built), so its peak is twice
+# this. 256 MiB, not 512: on a 24 GB card at 104k tokens the 1 GiB that
+# cost left 20 MB free.
+DEFAULT_COLLECT_BYTES = 256 * 2**20
+
 
 @dataclasses.dataclass(frozen=True)
 class VedaConfig:
@@ -41,6 +47,12 @@ class VedaConfig:
             between geometries.
         recall_every: Compute the mask diagnostics on every n-th layer.
         dense_layers: Layers that stay dense in the sparse student.
+        collect_bytes: Bound on one tile-ordered q / k / v / out copy; a
+            head group is processed in chunks of heads under it. Heads are
+            independent, so it changes only the launch count, never the
+            result. The default fits a 24 GB card at latent_t 102; on a
+            card with room, a larger bound runs a whole group per launch,
+            which is much faster (docs/benchmark/performance.md §11.3).
     """
 
     target_budget: veda_mask.Budget = veda_mask.Budget(ratio=0.1)
@@ -49,6 +61,7 @@ class VedaConfig:
     teacher_q_tiles: float = 1.0
     recall_every: int = 1
     dense_layers: frozenset[int] = frozenset()
+    collect_bytes: int = DEFAULT_COLLECT_BYTES
 
 
 class ClipTiling:
@@ -99,20 +112,13 @@ class ClipTiling:
         return max(1, min(n_video, count))
 
 
-# Bound on one tile-ordered q / k / v / out copy in TeacherCollector and
-# SparseStudent (heads are processed in chunks under it), and the bytes of
-# one bf16 head_dim-128 row. Note the collector holds *two* of these at
-# once (the q and k copies, until the heat is built), so the peak is twice
-# this. 256 MiB, not 512: at 104k tokens the 1 GiB that cost left the card
-# with 20 MB free. Heads are independent, so the chunk size does not touch
-# the result -- only how many kernel launches build it.
-_COLLECT_BYTES = 256 * 2**20
+# Bytes of one bf16 head_dim-128 row of a tile-ordered copy.
 _HEAD_DIM_BYTES = 128 * 2
 
 
-def _chunk_heads(tile_layout: tiling.TileLayout) -> int:
-    """Heads per chunk so one tile-ordered copy stays under _COLLECT_BYTES."""
-    return max(1, _COLLECT_BYTES // (tile_layout.num_slots * _HEAD_DIM_BYTES))
+def _chunk_heads(tile_layout: tiling.TileLayout, collect_bytes: int) -> int:
+    """Heads per chunk so one tile-ordered copy stays under collect_bytes."""
+    return max(1, collect_bytes // (tile_layout.num_slots * _HEAD_DIM_BYTES))
 
 
 def _fused(x: torch.Tensor) -> bool:
@@ -245,7 +251,8 @@ class TeacherCollector:
             # Heads are independent, so a group is processed in chunks of
             # heads: the tile-ordered q / k copies of a whole group (1.5 GB
             # each at 103k tokens) would not fit next to the trunk.
-            for heads in group.heads.split(_chunk_heads(tile_layout)):
+            for heads in group.heads.split(
+                    _chunk_heads(tile_layout, self.clip.config.collect_bytes)):
                 q_tiles, feats_q = _gather_and_pool(q, tile_layout, heads)
                 k_tiles, feats_k = _gather_and_pool(k, tile_layout, heads)
                 heat = heatmap.teacher_heat(
@@ -328,7 +335,8 @@ class SparseStudent:
             tile_layout = self.clip.get(group.shape)
             # Chunks of heads bound the tile-ordered q / k / v / out copies
             # (heads are independent throughout, so this is exact).
-            for heads in group.heads.split(_chunk_heads(tile_layout)):
+            for heads in group.heads.split(
+                    _chunk_heads(tile_layout, self.clip.config.collect_bytes)):
                 self._attend(q, k, v, layer_index, tile_layout, heads, out)
         out = out[:seq_len]
         if used < seq_len:

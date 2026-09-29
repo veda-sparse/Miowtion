@@ -292,7 +292,8 @@ class QuantHeatProbe:
             tile_layout = self.clip.get(group.shape)
             blocks = self.clip.blocks(tile_layout)
             rows = self._rows(tile_layout)
-            chunk = veda_attention._chunk_heads(tile_layout)  # pylint: disable=protected-access
+            chunk = veda_attention._chunk_heads(  # pylint: disable=protected-access
+                tile_layout, self.clip.config.collect_bytes)
             for heads in group.heads.split(chunk):
                 q_tiles = veda_attention._gather(q, tile_layout, heads)  # pylint: disable=protected-access
                 k_tiles = veda_attention._gather(k, tile_layout, heads)  # pylint: disable=protected-access
@@ -469,7 +470,8 @@ class PredictorProbe:
             tile_layout = self.clip.get(group.shape)
             blocks = self.clip.blocks(tile_layout)
             rows = self._rows(tile_layout)
-            chunk = veda_attention._chunk_heads(tile_layout)  # pylint: disable=protected-access
+            chunk = veda_attention._chunk_heads(  # pylint: disable=protected-access
+                tile_layout, self.clip.config.collect_bytes)
             for heads in group.heads.split(chunk):
                 q_tiles, feats_q = veda_attention._gather_and_pool(  # pylint: disable=protected-access
                     q, tile_layout, heads)

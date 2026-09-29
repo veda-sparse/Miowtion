@@ -77,15 +77,20 @@ def split_budget(budget: float, n_cols: int) -> tuple[int, int, float]:
 
 
 @functools.lru_cache(maxsize=256)
-def _bresenham_cpu(n_rows: int, frac: float) -> torch.Tensor:
+def _bresenham(n_rows: int, frac: float, device: str) -> torch.Tensor:
+    # Built on the host in fp64 and cached per device: a fresh host-to-device
+    # copy per call would be a pageable copy, which waits for the GPU.
     ramp = torch.floor(torch.arange(n_rows + 1, dtype=torch.float64) * frac)
-    return ramp[1:] > ramp[:-1]
+    return (ramp[1:] > ramp[:-1]).to(device)
 
 
 def bresenham_extra(n_rows: int, frac: float,
                     device: torch.device | str) -> torch.Tensor:
-    """[n_rows] bool: row r keeps k_hi iff floor((r+1)f) > floor(r f)."""
-    return _bresenham_cpu(n_rows, float(frac)).to(device)
+    """[n_rows] bool: row r keeps k_hi iff floor((r+1)f) > floor(r f).
+
+    The returned tensor is cached and shared; callers must not modify it.
+    """
+    return _bresenham(n_rows, float(frac), str(torch.device(device)))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -165,9 +170,15 @@ def select_video_blocks(scores: torch.Tensor, layout: tiling.TileLayout,
         s = scores[:, :, block.start:block.stop].float().clone()
         s.masked_fill_(~layout.kv_ok[None, None, block.start:block.stop],
                        _NEG_INF)
-        own = torch.nonzero((rows >= block.start)
-                            & (rows < block.stop)).view(-1)
-        s[:, own, rows[own] - block.start] = _POS_INF
+        # A query tile always keeps its own key tile. Written as a gather /
+        # where / scatter over every row instead of indexing the rows that
+        # fall in the block: that indexing needs torch.nonzero, whose
+        # data-dependent size synchronizes the host once per call.
+        own = (rows >= block.start) & (rows < block.stop)
+        col = (rows - block.start).clamp(0, n_cols - 1)
+        col = col[None, :, None].expand(heads, num_rows, 1)
+        s.scatter_(-1, col, torch.where(own[None, :, None], _POS_INF,
+                                        s.gather(-1, col)))
         budget = block.budget.per_row(block.real_tokens, n_cols)
         k_lo, k_hi, frac = split_budget(budget, n_cols)
         vals, idx = torch.topk(s, k_hi, dim=-1, sorted=True)

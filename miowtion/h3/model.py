@@ -30,6 +30,7 @@ from miowtion.h3 import attention as h3_attention
 from miowtion.h3 import config as h3_config
 from miowtion.h3 import layout as h3_layout
 from miowtion.h3 import schedule as h3_schedule
+from miowtion.kernels import elementwise_triton
 
 _BF16 = torch.bfloat16
 _FP32 = torch.float32
@@ -56,6 +57,18 @@ class DenseAttention:
                                             backend=self.backend)[0]
 
 
+def _fused(*tensors: torch.Tensor) -> bool:
+    """Whether an elementwise chain runs as one Triton kernel.
+
+    The fused kernels are bitwise equal to the eager chains below (see
+    miowtion.kernels.elementwise_triton) but have no autograd, so anything
+    that needs a gradient (stage-2 LoRA) stays on the eager path.
+    """
+    if torch.is_grad_enabled() and any(t.requires_grad for t in tensors):
+        return False
+    return elementwise_triton.usable(*tensors)
+
+
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
     x1, x2 = x.chunk(2, dim=-1)
     return torch.cat((-x2, x1), dim=-1)
@@ -78,6 +91,8 @@ def apply_rope(x: torch.Tensor, cos: torch.Tensor,
         sin: [S, 1, rope_dim] bf16.
     """
     rope_dim = cos.shape[-1]
+    if _fused(x, cos, sin):
+        return elementwise_triton.rope(x, cos, sin)
     if x.shape[0] <= _ROPE_CHUNK_ROWS:
         x_rot, x_pass = x[..., :rope_dim], x[..., rope_dim:]
         return torch.cat((x_rot * cos + _rotate_half(x_rot) * sin, x_pass),
@@ -205,6 +220,8 @@ class Mlp(nn.Module):
     def _forward(self, x: torch.Tensor) -> torch.Tensor:
         first, second = self.fc1(x).chunk(2, dim=-1)
         gate, up = (first, second) if self.gate_first else (second, first)
+        if _fused(gate, up):
+            return self.fc2(elementwise_triton.swiglu(gate, up))
         return self.fc2(F.silu(gate) * up)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -278,6 +295,8 @@ _ADALN_CHUNK_ROWS = 16384
 
 def _modulate(x: torch.Tensor, one_plus_scale: torch.Tensor,
               shift: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
+    if _fused(x, one_plus_scale, shift):
+        return elementwise_triton.modulate(x, one_plus_scale, shift, index)
     if x.shape[0] <= _ADALN_CHUNK_ROWS:
         return x * one_plus_scale.index_select(0, index) + shift.index_select(
             0, index)
@@ -293,6 +312,8 @@ def _modulate(x: torch.Tensor, one_plus_scale: torch.Tensor,
 def _gated_residual(x: torch.Tensor, gate: torch.Tensor,
                     index: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
     """x + gate[index] * h, chunked over rows like _modulate."""
+    if _fused(x, gate, h):
+        return elementwise_triton.gated_residual(x, gate, index, h)
     if x.shape[0] <= _ADALN_CHUNK_ROWS:
         return x + gate.index_select(0, index) * h
     out = torch.empty_like(x)
