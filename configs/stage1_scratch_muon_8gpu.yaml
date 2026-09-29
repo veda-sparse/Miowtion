@@ -7,10 +7,12 @@
 # (veda.predictor.INIT_STD = 1e-4) and has to travel 140x that scale --
 # the released weights measure RMS 1.4e-2.
 #
-# Batch 8 = 8 ranks x accum 1 clip each... except accum is 8 here, because
-# one micro-step is one denoising step: accum 8 with num_steps 8 means an
-# update covers a whole trajectory, all eight noise levels, one clip per
-# rank. Every rank draws the SAME geometry (GeometrySampler is
+# One update is one denoising step of eight clips, one per rank: accum 1
+# against num_steps 8 means a trajectory is consumed over eight updates
+# rather than inside one. That is eight times as many updates per unit of
+# wall clock, which is what a from-scratch run is short of -- phase A
+# needed 600 of them -- at the cost of each update seeing a single noise
+# level instead of all eight. Every rank draws the SAME geometry (GeometrySampler is
 # rank-independent) but its OWN sample, so the ranks stay in lockstep on
 # sequence length -- FSDP collectives must match -- while the batch still
 # holds eight different clips.
@@ -41,15 +43,16 @@ num_steps: 8
 teacher_adapter: weights/turbo_lora/minimax_h3_turbo_v4_step600_ema.safetensors
 keep_ratio: 0.1
 teacher_q_tiles: 1.0
-accum: 8               # one update = one full 8-step trajectory per rank
-steps: 30              # the control arm's length; extend once it has won
+accum: 1               # one update = one denoising step, 8 clips (one per rank)
+steps: 600
 optimizer: muon
-lr: 5.0e-3
+lr: 1.0e-2
 muon_momentum: 0.95
 muon_rms: 0.2
-warmup: 10
-lr_decay: none         # a controlled comparison, not a finished schedule
-save_every: 10
+warmup: 20
+lr_decay: cosine
+lr_min_ratio: 0.1
+save_every: 50
 keep_optimizer: 1
 out_dir: runs
 # 8 ranks shard the trunk, so nothing has to be offloaded and the teacher
