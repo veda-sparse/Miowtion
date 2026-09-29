@@ -65,6 +65,7 @@
 | 保存 checkpoint 时挂起 | `full_tensor()` 是集合通信，rank 0 以外的 rank 提前返回了 | 所有 rank 先取出完整张量，再由 rank 0 写盘 | [training](features/training.md) |
 | 训练慢，但诊断量的 FLOPs 明明可以忽略 | 逐层 `kl.item()` 和对设备张量的 Python 分支把 CPU 与 GPU 串起来 | 诊断量留在设备上，每个 micro-step 只做一次 `torch.stack(...).cpu()` | [training](features/training.md) |
 | 4090 上第 2 次 update 时 OOM | 打分器的 Adam 状态、梯度和 EMA（约 5.5 GB）常驻显存 | `offload_optimizer`：主权重、动量、EMA 放 pinned 主机内存 | [training](features/training.md) |
+| 8 卡训练启动要 23 分钟，其中 18 分钟在 AdaLN 建表 | 表是复制的，每块 `adaln_proj` 1.04 GB × 50 块 = 52 GB，8 个 rank 各读一遍 = 416 GB 走网络盘 | 把 transformer 拷进 `/dev/shm` 再用软链接指过去；启动降到 10 秒 | [training](features/training.md) |
 
 ## 环境
 

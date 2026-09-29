@@ -85,6 +85,19 @@
   只改变打分器梯度的累加顺序（容差，不是逐位）。
 - **融合逐元素链**：no_grad 的教师前向走 `miowtion/kernels/elementwise_triton.py`（与 eager 逐位
   相等，见 [h3_model](h3_model.md)）；阶段 2 需要反传的学生前向仍走 eager。
+- **多卡启动：把 checkpoint 放进 `/dev/shm`**。启动的瓶颈不是权重加载而是 **AdaLN 建表**：
+  每块 `adaln_proj` 是 [96768, 5376] bf16 = 1.04 GB，50 块共 52 GB，而这张表是**复制的**，
+  8 个 rank 各读一遍 = 416 GB 走网络盘。实测 8×RTX PRO 6000 上（62 GB 的 transformer）：
+
+  | 阶段 | 共享盘（AutoFS） | `/dev/shm` |
+  |---|---:|---:|
+  | 权重加载（各 rank 只读自己的分片） | 7 分 04 秒 | **4 秒** |
+  | AdaLN 建表（每个 rank 都读全量） | 约 18 分钟 | **8 秒** |
+
+  做法：把 `<variant>/transformer` 和 `model_index.json` 拷进 `/dev/shm`（62 GB，8 路并行
+  90 秒），机器本地用软链接指过去，配置里的仓库相对路径不变。一次训练省约 23 分钟，调参
+  时反复重启省得更多。代价是 62 GB 常驻内存（这台机器 1 TB，训练本身只用几十 GB）。
+  更彻底的修法是 rank 0 建表后广播，但有 shm 之后 I/O 已经不是瓶颈，不值得为此改代码。
 - **随机权重测速**：`random_weights_seed` + `sample_cache: null` 用随机教师（无少步 LoRA）和
   `random_text_len` 行随机 prompt 量一张卡的训练速度，不需要权重
   （`configs/stage1_bench_random_16x9_1gpu.yaml`）；打分器学不到任何东西。
