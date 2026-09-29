@@ -1,0 +1,61 @@
+# Stage 1 from scratch on 8x RTX PRO 6000 Blackwell, AdamW control.
+#
+# The control arm of the optimizer comparison: identical to
+# stage1_scratch_muon_8gpu.yaml except for the optimizer and its learning
+# rate, down to the seed, so the geometry stream and the per-rank sample
+# order are the same sequence in both runs and the only thing that differs
+# is how the gradient becomes a step.
+#
+# From scratch on purpose: the released predictor was trained at latent_t
+# 37 only, and this run asks what the same architecture does when it sees
+# every geometry from the start. No init_from, so the predictor begins as
+# the mean-pooled QK scorer its initialization makes it
+# (veda.predictor.INIT_STD = 1e-4) and has to travel 140x that scale --
+# the released weights measure RMS 1.4e-2.
+#
+# Batch 8 = 8 ranks x accum 1 clip each... except accum is 8 here, because
+# one micro-step is one denoising step: accum 8 with num_steps 8 means an
+# update covers a whole trajectory, all eight noise levels, one clip per
+# rank. Every rank draws the SAME geometry (GeometrySampler is
+# rank-independent) but its OWN sample, so the ranks stay in lockstep on
+# sequence length -- FSDP collectives must match -- while the batch still
+# holds eight different clips.
+#
+# geometry_sampling uniform over all twelve geometries: shape and duration
+# are drawn independently per trajectory rather than cycled, so no length
+# is systematically paired with a position in the schedule.
+#
+# AdamW at 1e-3 is what phase A used at batch 8; its measured update was
+# ~1.7% of the weight norm per step, against Muon's fixed 1e-3 RMS.
+run_name: stage1_scratch_adamw_8gpu
+checkpoint_root: weights/MiniMax-H3
+sample_cache: artifacts/samples/moviegen_video_bench
+geometries: ['1:1@37', '4:3@37', '16:9@37', '9:16@37',
+             '1:1@72', '4:3@72', '16:9@72', '9:16@72',
+             '1:1@102', '4:3@102', '16:9@102', '9:16@102']
+geometry_sampling: uniform
+variant: FL2VA
+tasks: [t2va]
+plan_dir: artifacts/init/veda_8nfe_step600_plans
+schedule: turbo
+num_steps: 8
+teacher_adapter: weights/turbo_lora/minimax_h3_turbo_v4_step600_ema.safetensors
+keep_ratio: 0.1
+teacher_q_tiles: 1.0
+accum: 8               # one update = one full 8-step trajectory per rank
+steps: 30              # the control arm's length; extend once it has won
+optimizer: adamw
+lr: 1.0e-3             # the rate phase A ran AdamW at, at this same batch
+warmup: 10
+lr_decay: none         # a controlled comparison, not a finished schedule
+save_every: 10
+keep_optimizer: 1
+out_dir: runs
+# 8 ranks shard the trunk, so nothing has to be offloaded and the teacher
+# heat can collect a whole head group per launch.
+offload_blocks: 0
+prefetch: 1
+mlp_chunk_rows: 8192
+veda_collect_mib: 2048
+offload_optimizer: false
+monitor_updates: true
