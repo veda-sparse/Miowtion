@@ -1,0 +1,60 @@
+# Stage 1 continued from the published 8-NFE predictor (step 600) on ONE
+# RTX PRO 6000 Blackwell: the longest geometry, all four aspect ratios,
+# batch 32.
+#
+# Warm start: the release
+# (huggingface.co/Veda-Sparse/Minimax-H3-T2VA-Veda-8NFE-600Step-Preview)
+# unpacked by scripts/import_predictor.py. That is a stage seed, not a
+# resume -- a bundle carries no optimizer moments, so Adam restarts cold
+# (hence the warmup below) and the weights come back fp8-rounded.
+#
+# Batch 32 = 1 rank x accum 32. The release was trained at batch 8
+# (2 ranks x accum 4) and its logs showed the two micro-batch gradients
+# disagreeing on ~1 step in 4 at batch 4; 32 is the next step up on a box
+# with one card, where batch can only come from accumulation.
+#
+# Geometry: the four aspect ratios at latent_t 102 -- the longest clips
+# (14.4 s, 104576 tokens at 16:9) and the geometry the release was NOT
+# trained on (it saw 5.17 s only) but is expected to serve. The prompts are
+# aspect-agnostic (t2va records declare no aspect), so all four aspects draw
+# from the same corpus; latent_t must match, so the eligible half is the one
+# written for 14.4 s.
+#
+# Cost: a micro-step at latent_t 102 is ~84 s on this card, so batch 32 is
+# ~45 min per update. That is the price of the longest geometry at this
+# batch on one card, and it sets the monitoring cadence.
+run_name: stage1_continue_t102_step600_1gpu
+checkpoint_root: weights/MiniMax-H3
+sample_cache: artifacts/samples/moviegen_video_bench
+geometries: ['1:1@102', '4:3@102', '16:9@102', '9:16@102']
+geometry_sampling: cycle
+variant: FL2VA
+tasks: [t2va]
+plan_dir: artifacts/init/veda_8nfe_step600_plans
+schedule: turbo
+num_steps: 8
+teacher_adapter: weights/turbo_lora/minimax_h3_turbo_v4_step600_ema.safetensors
+init_from: artifacts/init/veda_8nfe_step600
+keep_ratio: 0.1
+teacher_q_tiles: 1.0   # supervise every query tile
+accum: 32              # 1 rank x 32 = batch 32
+steps: 100
+lr: 1.0e-3             # the rate phase A ran at, at 1/4 of this batch
+# Longer than phase A's 20 relative to the run, because the moments start
+# empty here: the first updates of a cold Adam are the ones that can undo a
+# warm start.
+warmup: 10
+lr_decay: cosine
+lr_min_ratio: 0.2
+save_every: 5
+keep_optimizer: 1
+out_dir: runs
+# A 96 GB card: nothing is offloaded and the whole head group of the
+# teacher heat is collected in one launch (see docs/benchmark/
+# performance.md 11.3).
+offload_blocks: 0
+prefetch: 1
+mlp_chunk_rows: 8192
+veda_collect_mib: 2048
+offload_optimizer: false
+monitor_updates: true
