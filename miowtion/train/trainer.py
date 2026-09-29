@@ -33,6 +33,7 @@ from miowtion.kernels import fa4
 from miowtion.train import checkpoint
 from miowtion.train import data
 from miowtion.train import lora
+from miowtion.train import muon
 from miowtion.train import monitor as monitor_lib
 from miowtion.train import optim
 from miowtion.train import parallel
@@ -88,6 +89,14 @@ class TrainConfig:
     warmup: int = 25
     lr_decay: str = 'none'  # or 'cosine', see learning_rate()
     lr_min_ratio: float = 0.1  # floor of the cosine, as a fraction of lr
+    # 'adamw' or 'muon'. Muon orthogonalizes each head's update matrix, so
+    # the step size is set by lr * muon_rms rather than by the gradient's
+    # magnitude (miowtion.train.muon). The predictor is a stack of per-head
+    # matrices and nothing else, which is what Muon is for; stage 2's heads
+    # and LoRA stay on AdamW either way.
+    optimizer: str = 'adamw'
+    muon_momentum: float = 0.95
+    muon_rms: float = 0.2      # RMS every orthogonalized update is scaled to
     betas: tuple[float, float] = (0.9, 0.95)
     weight_decay: float = 0.0
     grad_clip: float = 1.0
@@ -128,6 +137,9 @@ class TrainConfig:
     def validate(self) -> None:
         if self.stage not in (1, 2):
             raise ValueError(f'stage must be 1 or 2, got {self.stage}')
+        if self.optimizer not in ('adamw', 'muon'):
+            raise ValueError("optimizer must be 'adamw' or 'muon', got "
+                             f'{self.optimizer!r}')
         if (self.sample_cache is None) != (self.random_weights_seed
                                            is not None):
             raise ValueError('sample_cache must be null exactly when '
@@ -258,11 +270,26 @@ class Trainer:
         self.opt_params = (self.masters.named() if self.masters
                            else self.trainable)
         self.clip_groups = _clip_groups(self.trainable)
-        self.optimizer = torch.optim.AdamW(
-            [{'params': ps, 'name': g}
-             for g, ps in _param_groups(self.opt_params).items()],
-            lr=config.lr, betas=config.betas,
-            weight_decay=config.weight_decay)
+        groups = _param_groups(self.opt_params)
+        if config.optimizer == 'muon':
+            # Every stage-1 parameter is a [heads, 3D, D] stack of per-head
+            # matrices, which is exactly what Muon orthogonalizes. Anything
+            # else a stage adds (LoRA, the output heads) keeps AdamW: they
+            # are not per-head matrices and Muon refuses 1-D parameters.
+            non_matrix = {g: ps for g, ps in groups.items() if g != 'predictor'}
+            if non_matrix:
+                raise ValueError(
+                    f'optimizer muon needs a predictor-only run; this one '
+                    f'also trains {sorted(non_matrix)}')
+            self.optimizer = muon.Muon(
+                groups['predictor'], lr=config.lr,
+                momentum=config.muon_momentum, rms_target=config.muon_rms,
+                weight_decay=config.weight_decay)
+        else:
+            self.optimizer = torch.optim.AdamW(
+                [{'params': ps, 'name': g} for g, ps in groups.items()],
+                lr=config.lr, betas=config.betas,
+                weight_decay=config.weight_decay)
         self.ema = checkpoint.Ema(self.opt_params, config.ema)
         self.ckpt = checkpoint.CheckpointManager(
             os.path.join(self.run_dir, 'ckpt'), config.persistent_dir,
@@ -474,6 +501,12 @@ class Trainer:
                   if torch.cuda.is_available() else 0.0}
         if stats['mse']:
             record['mse'] = self._reduce_mean(stats['mse'])
+        if isinstance(self.optimizer, muon.Muon):
+            # Measured, not derived: the scale formula assumes a full-rank
+            # update, and a rank-deficient gradient lands below the target
+            # (miowtion.train.muon). This is the number lr is calibrated
+            # against, so it has to come from the step that just ran.
+            record['update_rms'] = round(self.optimizer.last_update_rms(), 5)
         for name in ('topk_bce', 'heat_kept', 'heat_ceiling', 'logit_std'):
             if stats[name]:
                 record[name] = round(self._reduce_mean(stats[name]), 5)
