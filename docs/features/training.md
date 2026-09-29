@@ -85,6 +85,9 @@
   只改变打分器梯度的累加顺序（容差，不是逐位）。
 - **融合逐元素链**：no_grad 的教师前向走 `miowtion/kernels/elementwise_triton.py`（与 eager 逐位
   相等，见 [h3_model](h3_model.md)）；阶段 2 需要反传的学生前向仍走 eager。
+- **随机权重测速**：`random_weights_seed` + `sample_cache: null` 用随机教师（无少步 LoRA）和
+  `random_text_len` 行随机 prompt 量一张卡的训练速度，不需要权重
+  （`configs/stage1_bench_random_16x9_1gpu.yaml`）；打分器学不到任何东西。
 
 2×RTX 4090 实测（5 s 16:9，38010 token，每 rank 一个 clip）：
 

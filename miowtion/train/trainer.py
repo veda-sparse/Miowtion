@@ -54,7 +54,8 @@ class TrainConfig:
 
     run_name: str
     checkpoint_root: str
-    sample_cache: str
+    # None only with random_weights_seed (random prompt rows instead).
+    sample_cache: str | None
     geometries: list[str]
     stage: int = 1
     variant: str = 'FL2VA'
@@ -107,6 +108,11 @@ class TrainConfig:
     dense_backend: str = 'auto'
     offload_optimizer: bool = False
     monitor_updates: bool = True
+    # Benchmark-only: a random teacher (miowtion.h3.synthetic) and random
+    # prompt rows of random_text_len, so a card's training speed can be
+    # measured without the weights. The predictor learns nothing useful.
+    random_weights_seed: int | None = None
+    random_text_len: int = 589
 
     @classmethod
     def from_yaml(cls, path: str) -> TrainConfig:
@@ -122,6 +128,10 @@ class TrainConfig:
     def validate(self) -> None:
         if self.stage not in (1, 2):
             raise ValueError(f'stage must be 1 or 2, got {self.stage}')
+        if (self.sample_cache is None) != (self.random_weights_seed
+                                           is not None):
+            raise ValueError('sample_cache must be null exactly when '
+                             'random_weights_seed is set')
         for task in self.tasks:
             if data.VARIANT_OF_TASK[task] != self.variant:
                 raise ValueError(f'task {task} needs the '
@@ -195,7 +205,8 @@ class Trainer:
             offload_blocks=config.offload_blocks, prefetch=config.prefetch,
             mlp_chunk_rows=config.mlp_chunk_rows,
             before_shard=(lambda m: lora.add_lora(m, config.lora_rank))
-            if config.stage == 2 else None)
+            if config.stage == 2 else None,
+            random_weights_seed=config.random_weights_seed)
         self.model = teacher_.model
         self.model.dense_backend = config.dense_backend
         if config.stage == 2:
@@ -259,7 +270,12 @@ class Trainer:
 
         self.geometries = data.GeometrySampler(
             config.geometries, config.seed, config.geometry_sampling)
-        self.cache = data.SampleCache(config.sample_cache)
+        if config.random_weights_seed is None:
+            self.cache = data.SampleCache(config.sample_cache)
+        else:
+            self.cache = data.SyntheticSampleCache(
+                config.random_text_len, cfg.text_dim,
+                config.random_weights_seed)
         self.samples = data.SampleSampler(
             self.cache.select('train', config.tasks), config.seed,
             self.env.rank)

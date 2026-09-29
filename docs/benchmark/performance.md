@@ -189,6 +189,10 @@ prefetch 1、`mlp_chunk_rows 4096`、优化器状态 offload 到主机。
   而不是注意力。
 - 多卡（2×4090）的记录：现在只有单卡。注意仓库没有 TP/SP，多卡只能是 FSDP 分片训练或
   一卡一样本的推理。
+- fp8 块稀疏 kernel（§11.4 第 6 条）：SM120 上 fp8 稠密注意力实测 1.8×，但 FA4 的 SM120
+  路径只接 fp16 / bf16。这是目前已知**唯一还剩数量级收益**的方向。
+- SM120 的 `ncu` 性能计数器在这台机器上没有权限（`ERR_NVGPUCTRPERM`），所以 §11.4 的
+  kernel 判断都是以"实测 GEMM 上限"为尺子，没有 pipe 级证据。
 
 ## 10. 复现
 
@@ -289,31 +293,68 @@ Veda t102 一步（21.6 s kernel 时间，busy 并集 21.6 s，墙上 22.0 s）�
 稠密一步 GPU 几乎不空闲（t37：idle 0.004 s / 10.8 s），CPU 一直跑在 GPU 前面，launch
 开销不是问题。稠密 FA4 kernel 357~368 TFLOP/s（峰值 71~73%，GEMM 上限 83~85%）。
 
-### 11.3 可优化的点（按收益排序，均未实现）
+### 11.3 优化后的实测（commit d0fda2d）
 
-1. **FA4 块稀疏按头分块太碎**（已实测）：`veda/attention.py` 的 `_COLLECT_BYTES = 256 MiB`
-   是为 24 GB 卡定的，t102 被切成 7 个 head chunk、每步 1050 次 FA4 调用。改成 2 GiB
-   （56 个头一次）后 t102 Veda step **21.73 → 19.88 s（−8.5%）**，块稀疏 kernel
-   7.37 → 5.58 s（−24%，MFU 55% → 73%，与稠密 kernel 持平），GPU 空闲 0.41 → 0.07 s；
-   t37 6.27 → 6.03 s。分块不改变结果（各头独立），所以应按显存余量自适应而不是写死。
-   分块为什么这么贵还没有证据，猜测是全局行（text / audio 的 q tile 看全部 key tile，
-   工作量是视频行的约 8 倍）在每次 launch 的末尾形成长尾——需要 ncu 或按 CTA 计时确认；
-   若属实，24 GB 卡上也可以通过把全局行单独成一次调用或先调度重 CTA 来拿回这部分。
-2. **访存型逐元素算子融合**（t102 占 Veda step 的 ≈17%，t37 约 1.3 s / 6.3 s ≈ 21%）：RoPE
-   （`_rotate_half` 的 cat + neg + mul + add）→ 一个 kernel；RMSNorm + AdaLN modulate
-   （index_select + mul + add）→ 一个 kernel；门控残差 → 一个 kernel；qk-norm 与 RoPE
-   合并；SwiGLU 的 silu×mul 融进 fc1 的 epilogue。按 1.8 TB/s 估算，理想读写量约为现在的
-   1/4~1/5，t102 上可省 ~2.5 s/step（估算，未实测）。这部分在 4090 上被 H2D 掩盖，在
-   PRO 6000 上算力涨了 3 倍、带宽只涨 1.8 倍，于是暴露出来。
-3. **稠密注意力 kernel 只有 GEMM 上限的 83~85%**（稠密 t102 一步 76% 的时间）：`mma.sync`
-   同步发射，softmax 的 exp / 缩放不能与 MMA 重叠；在 3 倍于 4090 的张量算力下，这部分
-   不再被掩盖（4090 上同一 kernel 达到峰值的 ~94%）。方向：warp 专精 / ping-pong softmax、
-   exp2 的 FMA 多项式模拟（FA4 在 SM100 上的做法）。需要 ncu 权限才能确认瓶颈。
-4. **去掉 Veda 路径上的主机同步**（≈2% 的 step）：`select_video_blocks` 的 `nonzero` 可以
-   换成与布局绑定的预计算索引，`bresenham_extra` 可缓存；FA4 块稀疏调用的主机侧开销在
-   调用数减少后（第 1 条）自然下降。
-5. **GEMM** 已在上限的 91~96%，bf16 下空间很小；再往上只能换精度（FP8 `mma.sync` 在
-   SM120 上是 bf16 的 2 倍），会改变数值，需要单独做对齐与人工确认。
+三处改动都不改变结果（见 §11.4 的第 1、2、4 条）：头分块改成
+`VedaConfig.collect_bytes`（这里用 2048 MiB）、去掉选择路径的两处主机同步、逐元素链融合成
+Triton kernel（与 eager 逐位相等）。同一张卡、同一请求：
+
+| latent_t | 注意力 | 改动前 | 分块+去同步 | ＋融合逐元素 | 总计 | MFU |
+|---|---|---:|---:|---:|---:|---:|
+| 37 | 稠密 | 10.89 s | — | **10.25 s** | −5.9% | 65.3% → 69.3% |
+| 37 | Veda 10% | 6.35 s | 6.04 s | **5.49 s** | −13.5% | 52.8% → 61.0% |
+| 102 | 稠密 | 58.03 s | — | **55.98 s** | −3.5% | 67.4% → 69.8% |
+| 102 | Veda 10% | 21.85 s | 20.18 s | **18.33 s** | −16.1% | 50.9% → 60.6% |
+
+阶段 1 训练（`configs/stage1_bench_random_16x9_1gpu.yaml`，accum 1 所以一次 update 就是一个
+micro-step，稳态值）：
+
+| 几何 | 改动前 | 改动后 | 峰值显存 | 4090 同项 |
+|---|---:|---:|---:|---:|
+| 16:9@37 | 15.29 s | **14.52 s**（−5.0%） | 48.0 GiB | 33.53 s |
+| 16:9@102 | 86.38 s | **84.25 s**（−2.5%） | — | 182.71 s |
+
+训练的收益远小于推理：一次 update 里那次稠密 teacher 前向占绝大部分，而教师热力图
+（Triton）和打分器都不经过这三处改动。
+
+### 11.4 还能往哪里走（SM120 的实测天花板）
+
+先把尺子定死：这张卡的**实测 bf16 GEMM 上限是 432.5 TFLOP/s**（cuBLAS 8192³，标称峰值
+503.8 的 86%），FA4 与 cuBLAS 在 SM120 上都走 SM80 时代的 `mma.sync`。
+
+| kernel | 实测 | 占峰值 | 占 GEMM 上限 |
+|---|---:|---:|---:|
+| FA4 稠密（t37 / t72） | 363~368 TFLOP/s | 72~73% | 84~85% |
+| FA4 块稀疏（t37 / t102，keep 0.1，56 头一次） | 338 / 356 TFLOP/s | 67~71% | 78~82% |
+| 线性层 GEMM（qkv / fc1 / fc2 的真实形状） | 392~416 TFLOP/s | 78~83% | 91~96% |
+
+1. ~~头分块~~、2. ~~逐元素融合~~、4. ~~主机同步~~：已实现，见 §11.3。
+3. **块稀疏 kernel 的 tile 调参已经没有余量**：把 128×32（在 4090/SM89 上调出来的）换成
+   更大的 tile 全都更慢——t102 上 128×64 慢 18%、128×128 慢 44%（hdim 128 下 128×128 要
+   96 KB smem，只剩 1 CTA/SM，而稀疏工作量本身不均匀）。256 线程在 t37 上快 1%，噪声级别。
+   所以 bf16 下块稀疏 kernel 距上限只剩 ~20%，即整个 Veda step 的 ~5%。
+5. **不能把 SM100 的 kernel 搬过来**：SM100 前向建立在 tcgen05（UMMA）+ TMEM 累加器 +
+   2-CTA MMA 之上，**SM120 没有这三样**（它是 Blackwell 家族里仍用 warp 级 `mma.sync` 的那一支，
+   既没有 Hopper 的 wgmma 也没有 SM100 的 tcgen05）。强行 `_arch=90` 直接被
+   `Only SM 9.x is supported` 拒掉。能跨过来的只有**软件结构**：TMA 载入、warp 专精
+   （load / MMA / softmax 分工）、mbarrier 多级流水（SageAttention3 的 sm120a kernel 正是
+   用 `SM90_TMA_LOAD` + `PipelineTmaAsync` + SM120 的 blockscaled MMA atom 搭起来的）。
+   按第 3 条的上限，这套重写在 bf16 下最多值 ~5% 的 step，**性价比低**。
+6. **真正的杠杆是精度**：SM120 的 `mma.sync` 在 fp8 下是 bf16 的两倍。实测（稠密、非 causal、
+   D=128、56 头，误差对 FA4 bf16）：
+
+   | kernel | seq 38299 | seq 73975 | 相对 FA4 | rel L2 | 最差行 cos |
+   |---|---:|---:|---:|---:|---:|
+   | FA4 bf16 | 368 TFLOP/s | 368 TFLOP/s | 1.00× | — | — |
+   | SageAttention2（INT8 QK + FP8 PV） | 654 | 668 | **1.78~1.82×** | 3.9e-2 | 0.998 |
+   | SageAttention3（NVFP4） | 645 | 崩 | 1.75× | 1.9e-1 | 0.915 |
+
+   NVFP4 在这张卡上**不比 fp8 快**（645 vs 654），误差却大一个数量级，而且 seq 73975 时 TMA
+   描述符初始化失败、`illegal instruction` 崩掉——不是我们要的方向。fp8 才是。
+   但 SageAttention 是**稠密**的：要拿到这 1.8×，得把 fp8 接进 FA4 的 SM120 **块稀疏** kernel，
+   而 `flash_fwd_sm120.can_implement` 现在只接受 fp16 / bf16（`q_descale` / `k_descale` /
+   `v_descale` 这些接口参数已经在了，只有 SM90/SM100 用得上）。这是下一个补丁（0008）的范围，
+   属于"数值会变"的改动：按 AGENTS.md 1.5 需要误差记录 + 可视化对比 + 人工确认。
 
 ## 12. Kernel 端到端复测
 

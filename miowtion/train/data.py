@@ -197,7 +197,11 @@ class SyntheticSampleCache:
         self._hidden = torch.randn(text_len, text_dim,
                                    generator=generator).to(torch.bfloat16)
         self.samples = [Sample(id=f'synthetic_text{text_len}', task='t2va',
-                               split='test', text=(0, text_len))]
+                               split='train', text=(0, text_len))]
+
+    def select(self, split: str, tasks: Sequence[str]) -> list[Sample]:
+        return [s for s in self.samples
+                if s.split == split and s.task in tasks]
 
     def text(self, sample: Sample) -> tuple[torch.Tensor, torch.Tensor]:
         """(hidden [L, D] bf16, tags [L] int64); every row is text."""

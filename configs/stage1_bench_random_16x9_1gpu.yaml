@@ -1,0 +1,33 @@
+# Stage-1 training speed of ONE card on random weights (no checkpoint;
+# docs/benchmark/performance.md §11). Same per-update work as
+# stage1_bench_16x9_t37_1gpu (turbo 8-step trajectories, keep 0.1,
+# teacher_q_tiles 1.0, accum 1 so an update is one micro-step), except:
+# the teacher is random (miowtion.h3.synthetic) and has no few-step LoRA,
+# the prompt is 589 random rows, the plan is the bootstrap uniform one,
+# and the DiT stays resident (a 96 GB card; set offload_blocks: 50 and
+# mlp_chunk_rows: 4096 for a 24 GB one). The predictor learns nothing.
+run_name: stage1_bench_random_16x9_1gpu
+checkpoint_root: third_party/MiniMax-H3
+sample_cache: null
+random_weights_seed: 0
+random_text_len: 589
+geometries: ['16:9@37']
+geometry_sampling: cycle
+variant: FL2VA
+tasks: [t2va]
+schedule: turbo
+num_steps: 8
+keep_ratio: 0.1
+teacher_q_tiles: 1.0
+accum: 1
+steps: 8
+lr: 1.0e-3
+warmup: 20
+save_every: 1000    # only the mandatory final checkpoint
+keep_optimizer: 1   # the minimum the checkpointer allows
+out_dir: runs
+offload_blocks: 0
+prefetch: 1
+mlp_chunk_rows: 8192
+offload_optimizer: false
+monitor_updates: false
