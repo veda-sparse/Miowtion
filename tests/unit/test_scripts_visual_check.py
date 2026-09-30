@@ -104,17 +104,29 @@ def test_stack_direction_switches_the_filter():
         module.stack_command(videos, titles, 'out.mp4', stack='diagonal')
 
 
-def test_2x2_needs_four_panes_and_uses_xstack():
+def _grid_chain(module, labels, stack):
+    videos = {c: c + '.mp4' for c in labels}
+    args = module.stack_command(videos, {c: c + '.png' for c in labels},
+                                'out.mp4', stack=stack)
+    return args[args.index('-filter_complex') + 1]
+
+
+def test_grid_is_row_major_and_may_end_part_empty():
     module = _module()
-    four = {c: c + '.mp4' for c in 'ABCD'}
-    titles = {c: c + '.png' for c in four}
-    args = module.stack_command(four, titles, 'out.mp4', stack='2x2')
-    chain = args[args.index('-filter_complex') + 1]
-    assert 'xstack=inputs=4:layout=0_0|w0_0|0_h0|w0_h0[v]' in chain
-    three = {c: c + '.mp4' for c in 'ABC'}
-    with pytest.raises(ValueError, match='2x2 needs exactly four'):
-        module.stack_command(three, {c: c + '.png' for c in three},
-                             'out.mp4', stack='2x2')
+    assert ('xstack=inputs=4:layout=0_0|w0_0|0_h0|w0_h0[v]'
+            in _grid_chain(module, 'ABCD', '2x2'))
+    # Five panes in 3x2: the last row holds one, the sixth cell stays black.
+    assert ('xstack=inputs=5:layout=0_0|w0_0|0_h0|w0_h0|0_h0+h0[v]'
+            in _grid_chain(module, 'ABCDE', '3x2'))
+    # A part-empty last row is fine; an entirely empty one means the caller
+    # asked for the wrong grid.
+    _grid_chain(module, 'ABC', '2x2')
+    with pytest.raises(ValueError, match='no empty row'):
+        _grid_chain(module, 'ABCD', '3x2')
+    with pytest.raises(ValueError, match='no empty row'):
+        _grid_chain(module, 'ABCDE', '2x2')
+    with pytest.raises(ValueError, match='stack must be'):
+        _grid_chain(module, 'AB', '2by2')
 
 
 def test_probe_stack_opposes_the_clip_orientation(monkeypatch):
@@ -130,9 +142,11 @@ def test_probe_stack_opposes_the_clip_orientation(monkeypatch):
     # A portrait clip goes in a row whatever the pane count.
     assert module.probe_stack('tall.mp4') == 'h'
     assert module.probe_stack('tall.mp4', panes=4) == 'h'
-    # Landscape and square: a grid with four panes, a column otherwise.
+    # Landscape and square: two columns from four panes up, a column below.
     assert module.probe_stack('wide.mp4', panes=4) == '2x2'
     assert module.probe_stack('square.mp4', panes=4) == '2x2'
+    assert module.probe_stack('wide.mp4', panes=5) == '3x2'
+    assert module.probe_stack('wide.mp4', panes=6) == '3x2'
     assert module.probe_stack('wide.mp4', panes=3) == 'v'
 
 

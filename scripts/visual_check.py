@@ -52,13 +52,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument('--out-dir', default=None,
                         help='default artifacts/visual_checks/<feature>/'
                         '<today>')
-    parser.add_argument('--stack', choices=('auto', 'h', 'v', '2x2'),
-                        default='auto',
-                        help="pane layout: '2x2' a grid of exactly four, "
-                        "'h' left to right, 'v' top to bottom. 'auto' "
-                        '(default) reads the reference pane with ffprobe: a '
-                        'portrait clip goes in a row, anything else in a '
-                        '2x2 grid when there are four panes, else a column')
+    parser.add_argument('--stack', default='auto',
+                        help="pane layout: 'RxC' a row-major grid (2x2, "
+                        "3x2, ...), 'h' left to right, 'v' top to bottom. "
+                        "'auto' (default) reads the reference pane with "
+                        'ffprobe: a portrait clip goes in a row, anything '
+                        'else in a two-column grid from four panes up, else '
+                        'a column')
     parser.add_argument('--ffprobe', default='ffprobe',
                         help='ffprobe binary for --stack auto')
     parser.add_argument('--joined-dir', default=None,
@@ -130,20 +130,35 @@ def stack_command(videos: dict[str, str], titles: dict[str, str],
         titles: {label: PNG path} from write_title, one per pane.
         out_path: Destination.
         ffmpeg: Binary to call.
-        stack: '2x2' arranges exactly four panes in a grid, 'h' places them
-            left to right, 'v' top to bottom. The useful choice depends on
-            the clip's own orientation: four 16:9 panes in a row are 5376 px
-            wide and unwatchable, in a column 3264 px tall, but a 2x2 grid
-            is 2688x1632 -- close to a screen's own shape. Four 9:16 panes
-            already fit side by side.
+        stack: 'h' places the panes left to right, 'v' top to bottom, and
+            'RxC' (e.g. '2x2', '3x2') fills an R-row by C-column grid
+            row-major. The useful choice depends on the clip's own
+            orientation: four 16:9 panes in a row are 5376 px wide and
+            unwatchable, in a column 3264 px tall, but a 2x2 grid is
+            2688x1632 -- close to a screen's own shape. Four 9:16 panes
+            already fit side by side. A grid's last row may be partly
+            empty (five panes in 3x2); the gap stays black.
 
     Raises:
-        ValueError: On an unknown `stack`, or '2x2' without four panes.
+        ValueError: On an unknown `stack`, on a grid too small for the
+            panes, or on a grid whose last row would be entirely empty
+            (which would mean the caller asked for the wrong shape).
     """
-    if stack not in ('h', 'v', '2x2'):
-        raise ValueError(f"stack must be 'h', 'v' or '2x2', got {stack!r}")
-    if stack == '2x2' and len(videos) != 4:
-        raise ValueError(f'2x2 needs exactly four panes, got {len(videos)}')
+    grid = None
+    if stack not in ('h', 'v'):
+        match = re.fullmatch(r'(\d+)x(\d+)', stack)
+        if not match:
+            raise ValueError(
+                f"stack must be 'h', 'v' or 'RxC', got {stack!r}")
+        grid = (int(match.group(1)), int(match.group(2)))
+        rows, cols = grid
+        if rows < 1 or cols < 1:
+            raise ValueError(f'grid must be positive, got {stack!r}')
+        if not (rows - 1) * cols < len(videos) <= rows * cols:
+            raise ValueError(
+                f'{stack} holds {rows * cols} panes with no empty row for '
+                f'{(rows - 1) * cols + 1}..{rows * cols}, got '
+                f'{len(videos)}')
     args = [ffmpeg, '-y']
     for path in videos.values():
         args += ['-i', path]
@@ -158,11 +173,18 @@ def stack_command(videos: dict[str, str], titles: dict[str, str],
         parts.append(f'[b{index}][{count + index}:v]'
                      f'overlay=(W-w)/2:0[p{index}]')
     inputs = ''.join(f'[p{i}]' for i in range(count))
-    if stack == '2x2':
-        # Row-major: pane 0 and 1 on top, 2 and 3 below. Every pane is the
-        # same clip and therefore the same size, so the offsets are exact.
-        parts.append(f'{inputs}xstack=inputs=4:'
-                     'layout=0_0|w0_0|0_h0|w0_h0[v]')
+    if grid is not None:
+        # Row-major. Every pane is the same clip and therefore the same
+        # size, so an offset can be written as a multiple of pane 0's own
+        # width and height rather than a sum over the preceding panes.
+        cells = []
+        for index in range(count):
+            row, col = divmod(index, grid[1])
+            x = '+'.join(['w0'] * col) or '0'
+            y = '+'.join(['h0'] * row) or '0'
+            cells.append(f'{x}_{y}')
+        parts.append(f'{inputs}xstack=inputs={count}:'
+                     f'layout={"|".join(cells)}[v]')
     else:
         parts.append(f'{inputs}{stack}stack=inputs={count}[v]')
     args += ['-filter_complex', ';'.join(parts), '-map', '[v]']
@@ -215,12 +237,13 @@ def parse_metrics(stderr: str) -> dict[str, float]:
 
 def probe_stack(path: str, ffprobe: str = 'ffprobe',
                 panes: int = 0) -> str:
-    """The layout that keeps a comparison watchable: '2x2', 'v' or 'h'.
+    """The layout that keeps a comparison watchable: a grid, 'v' or 'h'.
 
     A portrait clip gets 'h' (the panes are narrow, so a row is fine).
-    Anything else gets '2x2' when there are exactly four panes and 'v'
-    otherwise, since a row of wide panes is unusably wide (see
-    stack_command).
+    Anything else goes in a two-column grid once there are four or more
+    panes -- '2x2' for four, '3x2' for five or six -- since a row of wide
+    panes is unusably wide and a column of more than three is unusably
+    tall (see stack_command). Fewer than four wide panes stay a column.
 
     Raises:
         RuntimeError: If ffprobe is missing or reports no video stream. It
@@ -243,7 +266,9 @@ def probe_stack(path: str, ffprobe: str = 'ffprobe',
     width, height = int(fields[0]), int(fields[1])
     if width < height:
         return 'h'
-    return '2x2' if panes == 4 else 'v'
+    if panes >= 4:
+        return f'{-(-panes // 2)}x2'
+    return 'v'
 
 
 def _run(args: list[str]) -> str:
