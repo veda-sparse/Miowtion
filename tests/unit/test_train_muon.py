@@ -137,3 +137,25 @@ def test_update_scale_formula():
         pytest.approx(0.2 * math.sqrt(384)))
     assert muon.update_scale(torch.Size([128, 384]), 0.2) == (
         pytest.approx(0.2 * math.sqrt(384)))
+
+
+def test_alignment_reads_1_without_momentum_and_falls_with_it():
+    """The diagnostic for a step spread across stale directions."""
+    torch.manual_seed(0)
+    p = torch.nn.Parameter(torch.zeros(2, 32, 16))
+    plain = muon.Muon([p], lr=1e-3, momentum=0.0, nesterov=False)
+    p.grad = torch.randn(2, 32, 16)
+    plain.step()
+    # No momentum: the step is the orthogonalized current gradient, which
+    # keeps its dominant direction, so the cosine is solidly positive.
+    assert plain.last_alignment() > 0.3
+    # With momentum, a gradient orthogonal to the buffer's contents gets
+    # only part of the step.
+    q = torch.nn.Parameter(torch.zeros(2, 32, 16))
+    heavy = muon.Muon([q], lr=1e-3, momentum=0.95, nesterov=False)
+    first = torch.randn(2, 32, 16)
+    q.grad = first
+    heavy.step()
+    q.grad = torch.randn(2, 32, 16)      # a fresh, unrelated batch
+    heavy.step()
+    assert heavy.last_alignment() < plain.last_alignment()

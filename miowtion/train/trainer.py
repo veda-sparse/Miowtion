@@ -536,6 +536,7 @@ class Trainer:
             # (miowtion.train.muon). This is the number lr is calibrated
             # against, so it has to come from the step that just ran.
             record['update_rms'] = round(self.optimizer.last_update_rms(), 5)
+            record['update_align'] = round(self.optimizer.last_alignment(), 4)
         for name in ('topk_bce', 'heat_kept', 'heat_ceiling', 'logit_std'):
             if stats[name]:
                 record[name] = round(self._reduce_mean(stats[name]), 5)

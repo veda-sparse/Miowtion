@@ -141,6 +141,7 @@ class Muon(torch.optim.Optimizer):
                         f'{tuple(p.shape)}; 1-D parameters (biases, norms) '
                         'belong in AdamW')
         self._last_rms: dict[int, float] = {}
+        self._last_alignment: dict[int, float] = {}
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -154,6 +155,7 @@ class Muon(torch.optim.Optimizer):
             with torch.enable_grad():
                 loss = closure()
         self._last_rms.clear()
+        self._last_alignment.clear()
         for group in self.param_groups:
             lr = group['lr']
             scale_rms = group['rms_target']
@@ -171,10 +173,34 @@ class Muon(torch.optim.Optimizer):
                 update = update.mul_(update_scale(p.shape, scale_rms))
                 self._last_rms[id(p)] = float(
                     update.pow(2).mean().sqrt().item())
+                # How much of the step serves the batch that just arrived.
+                # The buffer averages ~1/(1-momentum) updates, and gradients
+                # from different request geometries are close to orthogonal
+                # (measured), so a fixed-RMS update gets divided among every
+                # direction the buffer still holds. This says whether that
+                # is costing anything: near 1 the step follows the current
+                # gradient, near 0 it is spending itself on stale ones.
+                self._last_alignment[id(p)] = float(torch.nn.functional
+                    .cosine_similarity(update.flatten(), p.grad.flatten(),
+                                       dim=0).item())
                 if group['weight_decay']:
                     p.mul_(1 - lr * group['weight_decay'])
                 p.add_(update, alpha=-lr)
         return loss
+
+    def last_alignment(self) -> float:
+        """Mean cosine between the last step and the gradient it came from.
+
+        Not a health metric on its own: momentum is meant to carry
+        information the current gradient lacks. It is here because Muon
+        re-normalizes the buffer, so the cost of mixing orthogonal
+        directions is not visible in the loss -- a step spread over several
+        geometries advances each of them by a fraction of its RMS budget.
+        Returns 0.0 before the first step.
+        """
+        if not self._last_alignment:
+            return 0.0
+        return sum(self._last_alignment.values()) / len(self._last_alignment)
 
     def last_update_rms(self) -> float:
         """RMS of the scaled updates of the last step, averaged over params.
