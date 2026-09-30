@@ -52,12 +52,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument('--out-dir', default=None,
                         help='default artifacts/visual_checks/<feature>/'
                         '<today>')
-    parser.add_argument('--stack', choices=('auto', 'h', 'v'),
+    parser.add_argument('--stack', choices=('auto', 'h', 'v', '2x2'),
                         default='auto',
-                        help="pane layout: 'h' left to right, 'v' top to "
-                        "bottom, 'auto' (default) picks the opposite of the "
-                        "clip's orientation with ffprobe -- landscape clips "
-                        'stack vertically, portrait ones horizontally')
+                        help="pane layout: '2x2' a grid of exactly four, "
+                        "'h' left to right, 'v' top to bottom. 'auto' "
+                        '(default) reads the reference pane with ffprobe: a '
+                        'portrait clip goes in a row, anything else in a '
+                        '2x2 grid when there are four panes, else a column')
+    parser.add_argument('--ffprobe', default='ffprobe',
+                        help='ffprobe binary for --stack auto')
+    parser.add_argument('--joined-dir', default=None,
+                        help='also copy the stacked video here as '
+                        '<clip>.mp4, where <clip> is the output directory '
+                        'name -- a flat folder of just the comparisons, '
+                        'without the per-pane inputs beside them')
     parser.add_argument('--heatmap', action='store_true',
                         help='also write per-frame difference videos '
                         '(off by default: only useful when chasing a '
@@ -122,17 +130,20 @@ def stack_command(videos: dict[str, str], titles: dict[str, str],
         titles: {label: PNG path} from write_title, one per pane.
         out_path: Destination.
         ffmpeg: Binary to call.
-        stack: 'h' places the panes left to right, 'v' top to bottom. The
-            useful choice is the opposite of the clip's own orientation:
-            three 16:9 panes side by side are 4032 px wide and unwatchable,
-            stacked they are 1344 wide; three 9:16 panes stack to 4000 px
-            tall and belong side by side instead.
+        stack: '2x2' arranges exactly four panes in a grid, 'h' places them
+            left to right, 'v' top to bottom. The useful choice depends on
+            the clip's own orientation: four 16:9 panes in a row are 5376 px
+            wide and unwatchable, in a column 3264 px tall, but a 2x2 grid
+            is 2688x1632 -- close to a screen's own shape. Four 9:16 panes
+            already fit side by side.
 
     Raises:
-        ValueError: On an unknown `stack`.
+        ValueError: On an unknown `stack`, or '2x2' without four panes.
     """
-    if stack not in ('h', 'v'):
-        raise ValueError(f"stack must be 'h' or 'v', got {stack!r}")
+    if stack not in ('h', 'v', '2x2'):
+        raise ValueError(f"stack must be 'h', 'v' or '2x2', got {stack!r}")
+    if stack == '2x2' and len(videos) != 4:
+        raise ValueError(f'2x2 needs exactly four panes, got {len(videos)}')
     args = [ffmpeg, '-y']
     for path in videos.values():
         args += ['-i', path]
@@ -147,7 +158,13 @@ def stack_command(videos: dict[str, str], titles: dict[str, str],
         parts.append(f'[b{index}][{count + index}:v]'
                      f'overlay=(W-w)/2:0[p{index}]')
     inputs = ''.join(f'[p{i}]' for i in range(count))
-    parts.append(f'{inputs}{stack}stack=inputs={count}[v]')
+    if stack == '2x2':
+        # Row-major: pane 0 and 1 on top, 2 and 3 below. Every pane is the
+        # same clip and therefore the same size, so the offsets are exact.
+        parts.append(f'{inputs}xstack=inputs=4:'
+                     'layout=0_0|w0_0|0_h0|w0_h0[v]')
+    else:
+        parts.append(f'{inputs}{stack}stack=inputs={count}[v]')
     args += ['-filter_complex', ';'.join(parts), '-map', '[v]']
     # The audio of the reference pane: the panes are the same clip, so N
     # copies of one track would only phase against each other.
@@ -196,11 +213,14 @@ def parse_metrics(stderr: str) -> dict[str, float]:
     return out
 
 
-def probe_stack(path: str, ffprobe: str = 'ffprobe') -> str:
-    """'v' for a landscape (or square) clip, 'h' for a portrait one.
+def probe_stack(path: str, ffprobe: str = 'ffprobe',
+                panes: int = 0) -> str:
+    """The layout that keeps a comparison watchable: '2x2', 'v' or 'h'.
 
-    Stacks against the clip's orientation, which is what keeps the result
-    watchable on a screen (see stack_command).
+    A portrait clip gets 'h' (the panes are narrow, so a row is fine).
+    Anything else gets '2x2' when there are exactly four panes and 'v'
+    otherwise, since a row of wide panes is unusably wide (see
+    stack_command).
 
     Raises:
         RuntimeError: If ffprobe is missing or reports no video stream. It
@@ -221,7 +241,9 @@ def probe_stack(path: str, ffprobe: str = 'ffprobe') -> str:
         raise RuntimeError(f'{ffprobe} found no video stream in {path}: '
                            f'{done.stderr[-500:]}')
     width, height = int(fields[0]), int(fields[1])
-    return 'v' if width >= height else 'h'
+    if width < height:
+        return 'h'
+    return '2x2' if panes == 4 else 'v'
 
 
 def _run(args: list[str]) -> str:
@@ -264,12 +286,19 @@ def main():
     titles = {label: write_title(
         label, os.path.join(out_dir, f'.title_{index}.png'))
         for index, label in enumerate(videos)}
-    direction = (probe_stack(videos[reference]) if args.stack == 'auto'
-                 else args.stack)
+    direction = (probe_stack(videos[reference], args.ffprobe, len(videos))
+                 if args.stack == 'auto' else args.stack)
     with progress.Timer(f'stack {len(videos)} panes ({direction})'):
         _run(stack_command(videos, titles, stack, args.ffmpeg, direction))
     for path in titles.values():
         os.remove(path)
+
+    if args.joined_dir:
+        os.makedirs(args.joined_dir, exist_ok=True)
+        joined = os.path.join(args.joined_dir,
+                              f'{os.path.basename(out_dir.rstrip("/"))}.mp4')
+        shutil.copyfile(stack, joined)
+        progress.log(f'joined copy: {joined}')
 
     report = {'reference': reference, 'panes': videos, 'metrics': {}}
     for label, path in videos.items():

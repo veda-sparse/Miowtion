@@ -104,6 +104,19 @@ def test_stack_direction_switches_the_filter():
         module.stack_command(videos, titles, 'out.mp4', stack='diagonal')
 
 
+def test_2x2_needs_four_panes_and_uses_xstack():
+    module = _module()
+    four = {c: c + '.mp4' for c in 'ABCD'}
+    titles = {c: c + '.png' for c in four}
+    args = module.stack_command(four, titles, 'out.mp4', stack='2x2')
+    chain = args[args.index('-filter_complex') + 1]
+    assert 'xstack=inputs=4:layout=0_0|w0_0|0_h0|w0_h0[v]' in chain
+    three = {c: c + '.mp4' for c in 'ABC'}
+    with pytest.raises(ValueError, match='2x2 needs exactly four'):
+        module.stack_command(three, {c: c + '.png' for c in three},
+                             'out.mp4', stack='2x2')
+
+
 def test_probe_stack_opposes_the_clip_orientation(monkeypatch):
     module = _module()
     import subprocess as sp
@@ -114,10 +127,13 @@ def test_probe_stack_opposes_the_clip_orientation(monkeypatch):
         return sp.CompletedProcess(args, 0, stdout=wh + '\n', stderr='')
 
     monkeypatch.setattr(module.subprocess, 'run', fake)
-    # Landscape and square stack vertically, portrait horizontally.
-    assert module.probe_stack('wide.mp4') == 'v'
-    assert module.probe_stack('square.mp4') == 'v'
+    # A portrait clip goes in a row whatever the pane count.
     assert module.probe_stack('tall.mp4') == 'h'
+    assert module.probe_stack('tall.mp4', panes=4) == 'h'
+    # Landscape and square: a grid with four panes, a column otherwise.
+    assert module.probe_stack('wide.mp4', panes=4) == '2x2'
+    assert module.probe_stack('square.mp4', panes=4) == '2x2'
+    assert module.probe_stack('wide.mp4', panes=3) == 'v'
 
 
 def test_probe_stack_refuses_to_guess_without_ffprobe(monkeypatch):
