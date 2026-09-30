@@ -16,6 +16,8 @@ Example:
 import argparse
 import os
 
+import torch
+
 from miowtion.train import checkpoint
 from miowtion.utils import progress
 from miowtion.veda import bundle as veda_bundle
@@ -45,11 +47,39 @@ def main():
                         help='export the EMA shadow instead of the live '
                         'weights (the live weights are the default: the '
                         'predictor is trained, not sampled from)')
+    parser.add_argument('--leap', type=float, default=None, metavar='DELTA',
+                        help='export DELTA * live + (1 - DELTA) * ema '
+                        'instead of either alone, mixed in fp32 before the '
+                        'storage dtype is applied. DELTA is the weight on '
+                        'the live weights, so 0.8 is mostly live with a '
+                        'fifth of the EMA shadow; 1.0 is --ema off and 0.0 '
+                        'is --ema. Useful when the run is shorter than the '
+                        "EMA's own halflife, where the shadow still "
+                        'averages weights the run has moved away from')
     args = parser.parse_args()
+    if args.leap is not None:
+        if args.ema:
+            raise ValueError('--leap and --ema are exclusive: --leap 0.0 is '
+                             '--ema and --leap 1.0 is the live weights')
+        if not 0.0 <= args.leap <= 1.0:
+            raise ValueError(f'--leap must be in [0, 1], got {args.leap}')
 
     with progress.Timer(f'load {args.checkpoint}'):
         payload = checkpoint.load(args.checkpoint)
-    source = payload['ema'] if args.ema else payload['weights']
+    if args.leap is not None:
+        live, shadow = payload['weights'], payload['ema']
+        missing = sorted(set(live) - set(shadow))
+        if missing:
+            raise KeyError(f'{args.checkpoint}: no EMA shadow for '
+                           f'{missing[:5]} ({len(missing)})')
+        # fp32 throughout: the checkpoint stores fp32 and the storage dtype
+        # is applied once, at save time, to the mixed result -- mixing two
+        # already-rounded tensors would round twice.
+        source = {k: torch.lerp(shadow[k].float(), live[k].float(),
+                                args.leap)
+                  for k in live}
+    else:
+        source = payload['ema'] if args.ema else payload['weights']
     weights = {k: v for k, v in source.items() if k.startswith(_PREFIX)}
     if not weights:
         raise KeyError(f'{args.checkpoint} holds no {_PREFIX}* tensors')
@@ -60,7 +90,9 @@ def main():
     veda_bundle.save(args.out, weights, plans, num_layers=num_layers,
                      num_heads=shape[0], head_dim=shape[2],
                      keep_ratio=args.keep_ratio, source=args.checkpoint,
-                     source_weights='ema' if args.ema else 'live',
+                     source_weights=(f'leap{args.leap:g}'
+                                     if args.leap is not None else
+                                     'ema' if args.ema else 'live'),
                      step=int(payload['step']),
                      dtype=veda_bundle.DTYPES[args.dtype])
     size = os.path.getsize(args.out) / 1024 ** 3
