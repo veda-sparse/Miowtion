@@ -1,0 +1,80 @@
+# Stage 1 from scratch on 8x RTX PRO 6000 Blackwell, per-head Muon.
+#
+# From scratch on purpose: the released predictor was trained at latent_t
+# 37 only, and this run asks what the same architecture does when it sees
+# every geometry from the start. No init_from, so the predictor begins as
+# the mean-pooled QK scorer its initialization makes it
+# (veda.predictor.INIT_STD = 1e-4) and has to travel 140x that scale --
+# the released weights measure RMS 1.4e-2.
+#
+# accum 8, so one update is a whole trajectory: all eight noise levels of
+# eight clips (one per rank), 64 micro-samples of gradient. The 600-step
+# run before this one used accum 1 and showed why that matters -- within a
+# trajectory consecutive updates share the same eight clips at adjacent
+# sigmas, so their gradients agreed at cos 0.71 rising to 0.98, i.e. the
+# extra updates were largely redundant. Averaging the eight noise levels
+# into one step trades update count for a gradient that is not dominated
+# by one sigma, and removes the systematic direction that grew logit_std
+# from 2.9 to 14.
+#
+# Continues from the accum-1 run rather than starting over: its weights
+# are the best predictor this corpus has produced. Every rank draws the SAME geometry (GeometrySampler is
+# rank-independent) but its OWN sample, so the ranks stay in lockstep on
+# sequence length -- FSDP collectives must match -- while the batch still
+# holds eight different clips.
+#
+# geometry_sampling uniform over all twelve geometries: shape and duration
+# are drawn independently per trajectory rather than cycled, so no length
+# is systematically paired with a position in the schedule.
+#
+# lr drops to 3e-3 (from 1e-2) and weight_decay comes on: the accum-1 run
+# ended with logit_std near 14 against the 2.4-2.9 of a trained predictor,
+# and grad_cos rising to 0.98 across all 50 layers -- a persistent
+# direction that Muon's scale-free step cannot damp on its own. Decoupled
+# decay is the force that opposes it.
+run_name: stage1_muon_accum8_8gpu
+checkpoint_root: weights/MiniMax-H3
+sample_cache: artifacts/samples/moviegen_video_bench
+# Eight geometries, not twelve: the corpus
+# (data/prompts/moviegen_video_bench_h3.jsonl) was expanded at 5.17 s and
+# 14.4 s only, so a latent_t 72 geometry has no sample whose prompt was
+# written for it and SampleSampler refuses to substitute one.
+geometries: ['1:1@37', '4:3@37', '16:9@37', '9:16@37',
+             '1:1@102', '4:3@102', '16:9@102', '9:16@102']
+geometry_sampling: uniform
+variant: FL2VA
+tasks: [t2va]
+plan_dir: artifacts/init/veda_8nfe_step600_plans
+init_from: runs/stage1_scratch_muon_8gpu/ckpt/step_0000600
+schedule: turbo
+num_steps: 8
+teacher_adapter: weights/turbo_lora/minimax_h3_turbo_v4_step600_ema.safetensors
+keep_ratio: 0.1
+teacher_q_tiles: 1.0
+accum: 8               # one update = one full trajectory x 8 clips
+steps: 600
+optimizer: muon
+lr: 3.0e-3
+muon_momentum: 0.95
+muon_rms: 0.2
+# Decoupled, and deliberately large for a Muon run: the step is scale-free,
+# so nothing else opposes the weights growing. lr * weight_decay = 3e-3 is
+# a 0.3% shrink per update, against the ~1.25%/update growth the accum-1
+# run showed (logit_std 2.9 -> 14 over ~130 updates). That is a starting
+# point, not a solved value: logit_std is the dial, and the 2-hourly check
+# watches it -- it should settle toward 3, not keep climbing.
+weight_decay: 1.0
+warmup: 20
+lr_decay: cosine
+lr_min_ratio: 0.1
+save_every: 50
+keep_optimizer: 1
+out_dir: runs
+# 8 ranks shard the trunk, so nothing has to be offloaded and the teacher
+# heat can collect a whole head group per launch.
+offload_blocks: 0
+prefetch: 1
+mlp_chunk_rows: 8192
+veda_collect_mib: 2048
+offload_optimizer: false
+monitor_updates: true
