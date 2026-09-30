@@ -143,9 +143,12 @@ def main():
         geometry = data.parse_geometry(args.geometry[
             i if len(args.geometry) > 1 else 0])
         if sample.latent_t not in (None, geometry.latent_t):
+            # repr, not str: the mismatch is sometimes only in the type
+            # (a manifest that quoted latent_t), and '102' vs 102 prints
+            # as the same number otherwise.
             raise ValueError(f'{sample.id} was written for latent_t '
-                             f'{sample.latent_t}, geometry has '
-                             f'{geometry.latent_t}')
+                             f'{sample.latent_t!r}, geometry has '
+                             f'{geometry.latent_t!r}')
         out_dir = (args.out_dir if len(args.sample_id) == 1 else
                    os.path.join(args.out_dir, f'{sample.id}_{geometry.name}'))
         os.makedirs(out_dir, exist_ok=True)

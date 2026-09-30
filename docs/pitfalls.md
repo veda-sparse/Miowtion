@@ -124,3 +124,5 @@
 | 性能扫描崩在最后一个几何，前面成功的几何结果一起没了 | 只在全部跑完后写一次 JSON | 每跑完一个 (几何, 模式) 就重写 `--out` | [inference](features/inference.md) |
 | SM120 反向：块稀疏被拒，而且就算放行梯度也会是错的 | 上游 arch-12 反向分支 `assert` 拒绝块稀疏，且给反向 kernel 传的是空 kwargs（`mask_mod` 与 subtile factor 全丢）；dQ/dK/dV 的 postprocess 线程数又写死成"非 arch 8 就 128"，与主 kernel 的 256 对不上时会静默算错梯度 | 补丁 0007 把 arch-12 配置并进 arch-8 分支（smem 相同），传同一套 kwargs，postprocess 线程数扩到 arch 12；测试里钉"梯度必须离稀疏比离稠密更近" | [veda_kernel](features/veda_kernel.md) |
 | 拉完一批生成的视频，拼接脚本安静地少拼了一半 | 按 mp4 总数判断拉全了没有，而 `generate.py` 在 dense+veda 同跑时每个目录还多写一个 `dense_vs_veda.mp4`：16 条应该是 48 个文件，不是 32 个 | 逐目录核对 `dense.mp4` 与 `veda.mp4` 都在，别核对总数 | [evaluation](features/evaluation.md) |
+| 对比视频里某两条的 prompt 和画面对不上 | 按 key 在文件名里做子串匹配：`hf_test_1` 也匹配 `hf_test_190`，`hf_test_18` 也匹配 `hf_test_182` | 用精确 key 配，生成后再拿 prompt 哈希回对一遍索引 | [evaluation](features/evaluation.md) |
+| manifest 里 `latent_t` 写成字符串，几小时后 `generate.py` 才失败，报错还两边都印 `102` | 编码时原样存进 cache，`'102' != 102` 只在类型上，`str()` 印不出来 | `encode_samples.py` 读 manifest 时就拒绝非 int（不静默转换）；`generate.py` 报错改用 `repr` | [evaluation](features/evaluation.md) |

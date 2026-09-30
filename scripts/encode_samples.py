@@ -34,6 +34,14 @@ def main():
         records = [json.loads(line) for line in f if line.strip()]
     for r in records:
         data.validate_prompt(r['prompt'], r['task'])
+        # A quoted latent_t survives encoding intact and then fails the
+        # geometry check in generate.py, hours later, against a value that
+        # prints identically. Reject it here rather than coerce it: a
+        # manifest that quotes one field usually quotes others.
+        if not isinstance(r.get('latent_t'), (int, type(None))):
+            raise ValueError(
+                f"{r['id']}: latent_t must be an int or absent, got "
+                f"{r['latent_t']!r}")
     splits = data.split_ids([r['id'] for r in records], args.num_test,
                             args.seed)
     variant_dir = f'{args.root}/FL2VA'

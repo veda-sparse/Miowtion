@@ -184,6 +184,15 @@ seed、他们的步数，只有 prompt 是共享的。所以它读的是"整条�
   的特殊字符也不再需要为 drawtext 转义。字体策略与 `infer.decode.title_bar` 共用一份，
   所以 `generate.py` 的并排图和这里的拼接图标题长得一样。
 
+- **按 key 去文件名里做子串匹配来配 prompt，会被前缀吃掉**：`hf_test_1` 同时匹配
+  `hf_test_190`，`hf_test_18` 同时匹配 `hf_test_182`，于是这两条跑的是别人的 prompt，
+  而且在对比里和错误的那一路并排。用**精确 key**（`index.json` 的 `key` 字段）配，
+  别用 `in`。生成完之后拿 prompt 的哈希回对一遍 `index.json` 才算数——只看文件名对不出来。
+- **manifest 里把 `latent_t` 写成字符串**：`encode_samples.py` 原样存进 cache，几小时后
+  `generate.py` 的几何检查才失败，而且报错信息两边都印 `102`（str 和 int 的 repr 不同、
+  str 相同）。现在 `encode_samples.py` 在读 manifest 时就拒绝非 int 的 `latent_t`
+  （不静默转换：会引号一个字段的 manifest 通常还会引号别的），`generate.py` 的报错改用
+  `repr`。
 - **别用 mp4 的总数判断一批生成拉全了没有**：`generate.py` 在 dense 和 veda 同跑时会多写
   一个 `dense_vs_veda.mp4`，所以 16 条的目录里应该有 48 个文件而不是 32 个。我按 32 收工，
   结果 9 条的 `veda.mp4` 根本没拉下来，拼接脚本安静地跳过它们（只拼出 8 条）才暴露。
