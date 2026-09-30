@@ -149,6 +149,27 @@ CUDA_VISIBLE_DEVICES=0 python scripts/predictor_precision.py \
 **横版（含正方形）竖堆、竖版横排**。拿不到 ffprobe 就直接报错要求显式 `--stack h/v`，
 不猜——猜错了产出的是一个没人能看的对比。
 
+## 另一个集合：OpenVDN 的 16 条（`artifacts/compare/`）
+
+别人放出来的 prompt + 别人自己的视频，用来回答"在**不是我们挑的** prompt 上，我们的稀疏
+路是不是也站得住"。和 v1 不同，它**不是控制变量的**：他们的视频是他们的模型、他们的
+seed、他们的步数，只有 prompt 是共享的。所以它读的是"整条路线的观感"，不是"某个改动的
+效果"——后者仍然只能在 v1 上读。
+
+- 6 条 `cmp_*`：他们同时放了 50NFE 稠密和 8NFE VDN 两版，拼成 **2×2**
+  （`Dense H3 50NFE (theirs)` / `VDN-H3 8NFE (theirs)` / `Dense 8NFE (ours)` /
+  `Veda 8NFE 90% (ours)`）。
+- 10 条 `only_*`：他们只放了一版，拼成 **3 路竖堆**
+  （`OpenVDN (theirs)` / `Dense 8NFE (ours)` / `Veda 8NFE 90% (ours)`）。
+- 全部 16:9@102，seed 0，我们这两路用
+  `artifacts/init/accum8_100_leap08_fp8.safetensors`（leap 0.8，fp32 上混完再量化到 fp8）。
+- 产物：每路单独 mp4 在 `artifacts/generate/openvdn16/<key>/`，拼接视频集中在
+  `artifacts/visual_checks/joined_openvdn16/`（16 个文件，2688×1632 或 1344×2448）。
+
+这 16 条同时是我们自己稠密 vs 稀疏计时的一个独立样本（同机同几何，非我们挑的 prompt）：
+1×RTX PRO 6000 Blackwell 上稳态 step **56.4 s → 18.8 s**，其中注意力
+**44.3 s → 6.8 s**，即注意力 **6.50×**、端到端 **3.00×**。
+
 ## 另一个集合：训练语料自己的 holdout
 
 `artifacts/samples/moviegen_video_bench`（1003 条 MovieGen Video Bench 扩写，
@@ -163,6 +184,11 @@ CUDA_VISIBLE_DEVICES=0 python scripts/predictor_precision.py \
   的特殊字符也不再需要为 drawtext 转义。字体策略与 `infer.decode.title_bar` 共用一份，
   所以 `generate.py` 的并排图和这里的拼接图标题长得一样。
 
+- **别用 mp4 的总数判断一批生成拉全了没有**：`generate.py` 在 dense 和 veda 同跑时会多写
+  一个 `dense_vs_veda.mp4`，所以 16 条的目录里应该有 48 个文件而不是 32 个。我按 32 收工，
+  结果 9 条的 `veda.mp4` 根本没拉下来，拼接脚本安静地跳过它们（只拼出 8 条）才暴露。
+  按目录逐个核对 `dense.mp4` + `veda.mp4` 是否都在，别核对总数。
+
 - **拿新 cache 去和旧视频拼**：id、几何、初始噪声全都不同，拼出来的对比毫无意义。要么
   用同一个 cache，要么把每一路都重跑一遍（dense 也要重跑，代价是小时级）。
 - **`predictor_precision.py` 默认拒绝跨 step 比较**：它是为"同一 step 的不同存储精度"
@@ -173,6 +199,10 @@ CUDA_VISIBLE_DEVICES=0 python scripts/predictor_precision.py \
 
 ## 验证记录
 
+- 2026-09-30，8×RTX PRO 6000 Blackwell：OpenVDN 16 条 prompt 的对比已生成，拼接视频在
+  `artifacts/visual_checks/joined_openvdn16/`（6 个 2×2 + 10 个三路竖堆），单独视频在
+  `artifacts/generate/openvdn16/`。同批测得注意力 6.50×、端到端 3.00×。
+  **人工确认尚未进行。**
 - 2026-09-29，1×RTX PRO 6000 Blackwell：v1 集合 20 条的三路对比
   （Dense / Veda t37 step600 / Veda 续训 step15）已生成，在
   `artifacts/visual_checks/holdout20_step200/2026-09-29/<clip>/`：每路一个单独 mp4 +

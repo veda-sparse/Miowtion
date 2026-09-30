@@ -123,3 +123,4 @@
 | 一个进程里 VAE 解码器常驻卡上，latent_t 102 的去噪必 OOM | 2.4B 视频 VAE 占约 5 GiB，正好是 104k token 注意力激活缺的那几 GiB；单次生成不会遇到（解码器是去噪后才建的） | `decode.Decoder.to()` 在两次解码之间把 VAE 停到主机内存，搬运不计入解码计时 | [inference](features/inference.md) |
 | 性能扫描崩在最后一个几何，前面成功的几何结果一起没了 | 只在全部跑完后写一次 JSON | 每跑完一个 (几何, 模式) 就重写 `--out` | [inference](features/inference.md) |
 | SM120 反向：块稀疏被拒，而且就算放行梯度也会是错的 | 上游 arch-12 反向分支 `assert` 拒绝块稀疏，且给反向 kernel 传的是空 kwargs（`mask_mod` 与 subtile factor 全丢）；dQ/dK/dV 的 postprocess 线程数又写死成"非 arch 8 就 128"，与主 kernel 的 256 对不上时会静默算错梯度 | 补丁 0007 把 arch-12 配置并进 arch-8 分支（smem 相同），传同一套 kwargs，postprocess 线程数扩到 arch 12；测试里钉"梯度必须离稀疏比离稠密更近" | [veda_kernel](features/veda_kernel.md) |
+| 拉完一批生成的视频，拼接脚本安静地少拼了一半 | 按 mp4 总数判断拉全了没有，而 `generate.py` 在 dense+veda 同跑时每个目录还多写一个 `dense_vs_veda.mp4`：16 条应该是 48 个文件，不是 32 个 | 逐目录核对 `dense.mp4` 与 `veda.mp4` 都在，别核对总数 | [evaluation](features/evaluation.md) |
