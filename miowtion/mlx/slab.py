@@ -42,7 +42,7 @@ FORMAT_VERSION = 1
 SLAB_ALIGNMENT = 16384
 # Bytes per positional read. Several reads in flight keep the SSD queue
 # busy; 16 MiB pieces over 4 threads reach the sequential read bandwidth
-# (see docs/features/mlx_inference.md).
+# (see the MLX offload API).
 DEFAULT_PIECE_BYTES = 16 << 20
 DEFAULT_READ_THREADS = 4
 

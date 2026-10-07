@@ -5,7 +5,7 @@ writes a full [S, hidden] (or [S, H, D]) bf16 tensor: RoPE is four kernels
 (mul, cat, neg, mul, add plus the pass-through copy), the AdaLN modulation
 and the gated residual are an index_select, a mul and an add each, SwiGLU a
 silu and a mul. Together they were ~17% of a Veda step on an RTX PRO 6000
-at latent_t 102 (docs/benchmark/performance.md §11.2), all of it memory
+at long latent lengths, all of it memory
 traffic. Each kernel here reads its inputs once and writes its output once.
 
 Numerics: bitwise equal to the eager chains, not merely close. Every
@@ -46,7 +46,20 @@ def _triton():
 
 
 def available() -> bool:
-    return torch.cuda.is_available() and _triton() is not None
+    """Whether Triton's exact-math options are supported by this runtime.
+
+    Triton 3.4 does not expose ``enable_reflect_ftz``. Passing that option
+    fails only at first launch, so detect support before selecting these
+    kernels and let the model use its eager path otherwise.
+    """
+    if not torch.cuda.is_available() or _triton() is None:
+        return False
+    try:
+        from triton.backends.nvidia.compiler import CUDAOptions  # pylint: disable=import-outside-toplevel
+    except (ImportError, AttributeError):
+        return False
+    fields = getattr(CUDAOptions, '__dataclass_fields__', {})
+    return all(option in fields for option in _EXACT)
 
 
 def usable(*tensors: torch.Tensor) -> bool:

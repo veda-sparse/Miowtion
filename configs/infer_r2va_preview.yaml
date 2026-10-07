@@ -1,0 +1,15 @@
+# Official MiniMax-H3 Ref2VA example with the R2VA preview predictor.
+root: weights/MiniMax-H3
+variant: Ref2VA
+schedule: turbo
+num_steps: 8
+adapter: weights/turbo_lora/minimax_h3_turbo_v4_step600_ema.safetensors
+sample_cache: artifacts/samples/demo
+sample_id: [demo]
+geometry: ['16:9@37']
+attention: [veda]
+predictor: weights/veda/h3-r2va-8nfe-600/minimax_h3_r2va_veda_8nfe_600step_preview_fp8.safetensors
+keep_tiles: 32
+ref_keep_tiles: 32
+tile_conditions: true
+out_dir: artifacts/generate/r2va-preview

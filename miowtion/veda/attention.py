@@ -52,7 +52,7 @@ class VedaConfig:
             independent, so it changes only the launch count, never the
             result. The default fits a 24 GB card at latent_t 102; on a
             card with room, a larger bound runs a whole group per launch,
-            which is much faster (docs/benchmark/performance.md §11.3).
+            which avoids unnecessary host synchronization.
     """
 
     target_budget: veda_mask.Budget = veda_mask.Budget(ratio=0.1)

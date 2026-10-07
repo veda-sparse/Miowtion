@@ -73,7 +73,7 @@ from miowtion.veda import mask as veda_mask
 
 
 # Text rows of holdout14s_0000, the sample of the real-weight records in
-# docs/benchmark/performance.md, so random-weight runs have the same layout.
+# so random-weight runs have the same layout as real-weight runs.
 RANDOM_TEXT_LEN = 589
 # Seed of the random weights, prompt rows and predictor.
 _RANDOM_SEED = 0

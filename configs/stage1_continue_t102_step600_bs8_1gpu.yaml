@@ -54,8 +54,7 @@ save_every: 5
 keep_optimizer: 1
 out_dir: runs
 # A 96 GB card: nothing is offloaded and the whole head group of the
-# teacher heat is collected in one launch (see docs/benchmark/
-# performance.md 11.3).
+# teacher heat is collected in one launch.
 offload_blocks: 0
 prefetch: 1
 mlp_chunk_rows: 8192

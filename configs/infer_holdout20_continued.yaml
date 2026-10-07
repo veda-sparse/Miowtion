@@ -1,11 +1,9 @@
-# The Veda arm of the eval-v1 holdout (docs/features/evaluation.md) with a
+# The Veda arm of a fixed holdout with a
 # predictor continued from the released step-600 bundle, on ONE RTX PRO 6000
 # Blackwell.
 #
-# Same cache, same 20 sample ids, same geometries and the same seed as
-# configs/infer_holdout20_step600.yaml, because that is what makes the panes
-# comparable: the dense and released-predictor videos of this set already
-# exist and are not recomputed. Only `attention`, `predictor` and `out_dir`
+# Keep the sample ids, geometries and seed fixed when comparing predictors.
+# Only `attention`, `predictor` and `out_dir`
 # differ, plus the memory settings a 96 GB card allows.
 root: weights/MiniMax-H3
 variant: FL2VA

@@ -3,7 +3,7 @@
 The reference these mirror is `diffusers.AutoencoderKLMiniMaxH3`, which is
 not installable next to the release's own diffusers pin, so the checks that
 need it live in scripts/mlx_check_video_vae.py and are recorded in
-docs/features/mlx_inference.md. What is checked here is everything that can
+the MLX decoder implementation. What is checked here is everything that can
 be stated without it: the tile layout's invariants, the blend and the stitch
 as pure data transforms, and the property the batching rests on -- decoding
 B tiles at once is bitwise the same as decoding them one at a time.
@@ -11,9 +11,10 @@ B tiles at once is bitwise the same as decoding them one at a time.
 
 import math
 
-import mlx.core as mx
 import numpy as np
 import pytest
+
+mx = pytest.importorskip('mlx.core', reason='MLX requires Apple silicon')
 
 from miowtion.mlx import video_vae
 

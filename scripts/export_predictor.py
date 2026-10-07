@@ -11,6 +11,12 @@ Example:
         --checkpoint runs/stage1_fast_t37_4090/ckpt/step_0000600 \\
         --plan-dir runs/search_turbo8_multigeo_4090/plans \\
         --keep-ratio 0.1 --out weights/veda/stage1_fast_t37_step600.safetensors
+
+    python scripts/export_predictor.py \\
+        --checkpoint runs/stage1_r2va/ckpt/step_0000600 \\
+        --plan-dir artifacts/init/veda_8nfe_step600_plans \\
+        --keep-tiles 32 --ref-keep-tiles 32 --tile-conditions \\
+        --out weights/veda/stage1_r2va_step600.safetensors
 """
 
 import argparse
@@ -33,9 +39,15 @@ def main():
     parser.add_argument('--plan-dir', required=True,
                         help='plans the run trained against')
     parser.add_argument('--out', required=True, help='.safetensors to write')
-    parser.add_argument('--keep-ratio', type=float, default=0.1,
+    parser.add_argument('--keep-ratio', type=float, default=None,
                         help='keep ratio the run trained with; recorded as '
                         'the default budget for inference')
+    parser.add_argument('--keep-tiles', type=float, default=None,
+                        help='absolute current/target tile budget')
+    parser.add_argument('--ref-keep-ratio', type=float, default=None)
+    parser.add_argument('--ref-keep-tiles', type=float, default=None)
+    parser.add_argument('--tile-conditions', action='store_true',
+                        help='record independently tiled visual references')
     parser.add_argument('--dtype', default='bfloat16',
                         choices=sorted(veda_bundle.DTYPES),
                         help='storage dtype; scoring upcasts to fp32 either '
@@ -57,6 +69,8 @@ def main():
                         "EMA's own halflife, where the shadow still "
                         'averages weights the run has moved away from')
     args = parser.parse_args()
+    if args.keep_ratio is None and args.keep_tiles is None:
+        args.keep_ratio = 0.1
     if args.leap is not None:
         if args.ema:
             raise ValueError('--leap and --ema are exclusive: --leap 0.0 is '
@@ -89,7 +103,11 @@ def main():
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     veda_bundle.save(args.out, weights, plans, num_layers=num_layers,
                      num_heads=shape[0], head_dim=shape[2],
-                     keep_ratio=args.keep_ratio, source=args.checkpoint,
+                     keep_ratio=args.keep_ratio, keep_tiles=args.keep_tiles,
+                     ref_keep_ratio=args.ref_keep_ratio,
+                     ref_keep_tiles=args.ref_keep_tiles,
+                     tile_conditions=args.tile_conditions,
+                     source=args.checkpoint,
                      source_weights=(f'leap{args.leap:g}'
                                      if args.leap is not None else
                                      'ema' if args.ema else 'live'),

@@ -1,4 +1,4 @@
-# Stage-1 training performance on ONE 4090 (docs/benchmark/performance.md).
+# Stage-1 training performance smoke configuration.
 #
 # Not a run that learns anything: 8 updates from a fresh predictor, at
 # accum 1 so an update is exactly one micro-step and the logged per-update

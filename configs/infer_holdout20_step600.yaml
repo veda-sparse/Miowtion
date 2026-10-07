@@ -4,7 +4,7 @@
 #
 # offload_blocks 50 (not 40) and mlp_chunk_rows 4096: at 24 GB the short
 # geometries run fine with 40 offloaded blocks and then t102 dies of OOM an
-# hour into the run. See docs/pitfalls.md.
+# Long generations can require substantial host memory and offloading.
 root: weights/MiniMax-H3
 variant: FL2VA
 schedule: turbo

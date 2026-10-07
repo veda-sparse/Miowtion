@@ -5,7 +5,7 @@
 # Phase A trained latent_t 37 only, because a t102 update costs 5-8x a t37
 # one. The step-600 holdout comparison showed that predictor already
 # extrapolates to t72/t102, and that t102 is where the speedup is largest
-# (end to end 2.76x vs 1.57x at t37, see docs/features/inference.md). So
+# (end to end 2.76x vs 1.57x at t37). So
 # phase B spends its whole budget on the length that was never trained and
 # that pays the most, instead of cycling all twelve geometries: mixing t37
 # back in would spend wall clock re-fitting what phase A already fits.

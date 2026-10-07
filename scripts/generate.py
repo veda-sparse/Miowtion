@@ -45,10 +45,27 @@ from miowtion.veda import plan as veda_plan
 _DECODE_DTYPES = {'bf16': torch.bfloat16, 'fp32': torch.float32}
 
 
-def _title(mode: str, keep_ratio: float) -> str:
+def _budget(ratio: float | None, tiles: float | None
+            ) -> veda_mask.Budget | None:
+    if ratio is None and tiles is None:
+        return None
+    return veda_mask.Budget(ratio=ratio, tiles=tiles)
+
+
+def _budget_text(budget: veda_mask.Budget) -> str:
+    if budget.tiles is not None:
+        return f'{budget.tiles:g} tiles'
+    return f'{budget.ratio:g} ratio'
+
+
+def _title(mode: str, target_budget: veda_mask.Budget,
+           ref_budget: veda_mask.Budget | None = None) -> str:
     if mode == 'dense':
         return 'Dense'
-    return f'Veda {100.0 * (1.0 - keep_ratio):g}% Sparsity'
+    target = _budget_text(target_budget)
+    if ref_budget is None:
+        return f'Veda current={target}'
+    return f'Veda ref={_budget_text(ref_budget)}, current={target}'
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -83,6 +100,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--keep-ratio', type=float, default=None,
                         help='block budget; defaults to the bundle\'s own '
                         'ratio, else 0.1')
+    parser.add_argument('--keep-tiles', type=float, default=None,
+                        help='absolute current/target key tiles per query; '
+                        'exclusive with --keep-ratio')
+    parser.add_argument('--ref-keep-ratio', type=float, default=None,
+                        help='reference visual block keep ratio')
+    parser.add_argument('--ref-keep-tiles', type=float, default=None,
+                        help='absolute reference visual key tiles per query')
+    parser.add_argument('--tile-conditions', action=argparse.BooleanOptionalAction,
+                        default=None, help='tile visual references and apply '
+                        'their independent budget')
     parser.add_argument('--dense-steps', type=int, nargs='*', default=[],
                         help='denoising steps that stay dense in veda runs')
     parser.add_argument('--offload-blocks', type=int, default=40)
@@ -119,17 +146,60 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     infer_config.require(args, ['root', 'sample_cache', 'sample_id',
                                 'geometry', 'out_dir'])
-    if args.keep_ratio is None:
-        # A bundle records the ratio its predictor trained with; without one
-        # there is nothing to inherit and the stage-1 default applies.
-        args.keep_ratio = (
-            float(veda_bundle.read_metadata(args.predictor)['keep_ratio'])
-            if args.predictor else 0.1)
+    if args.keep_ratio is not None and args.keep_tiles is not None:
+        raise ValueError('--keep-ratio and --keep-tiles are exclusive')
+    if args.ref_keep_ratio is not None and args.ref_keep_tiles is not None:
+        raise ValueError('--ref-keep-ratio and --ref-keep-tiles are exclusive')
+    if (args.keep_ratio is None and args.keep_tiles is None
+            and not args.predictor):
+        args.keep_ratio = 0.1
+    ref_budget = _budget(args.ref_keep_ratio, args.ref_keep_tiles)
+    if args.tile_conditions is True and ref_budget is None \
+            and not args.predictor:
+        raise ValueError('--tile-conditions requires --ref-keep-ratio or '
+                         '--ref-keep-tiles')
+    if (ref_budget is not None and args.tile_conditions is not True
+            and not args.predictor):
+        raise ValueError('a reference budget requires --tile-conditions')
     return args
+
+
+def _resolve_policy(args: argparse.Namespace) -> None:
+    """Fills policy fields inherited from a bundle, then validates them.
+
+    Kept out of parse_args so versioned configs can be linted on machines
+    that do not hold the large predictor artifact.
+    """
+    inherited_target = inherited_ref = None
+    inherited_tiling = False
+    if args.predictor:
+        metadata = veda_bundle.read_metadata(args.predictor)
+        inherited_target = veda_bundle._read_budget(  # pylint: disable=protected-access
+            metadata, 'target', legacy_ratio='keep_ratio')
+        inherited_ref = veda_bundle._read_budget(  # pylint: disable=protected-access
+            metadata, 'ref')
+        inherited_tiling = metadata.get('tile_conditions', 'false') == 'true'
+    if args.keep_ratio is None and args.keep_tiles is None:
+        inherited_target = inherited_target or veda_mask.Budget(ratio=0.1)
+        args.keep_ratio = inherited_target.ratio
+        args.keep_tiles = inherited_target.tiles
+    if args.ref_keep_ratio is None and args.ref_keep_tiles is None \
+            and inherited_ref is not None:
+        args.ref_keep_ratio = inherited_ref.ratio
+        args.ref_keep_tiles = inherited_ref.tiles
+    if args.tile_conditions is None:
+        args.tile_conditions = inherited_tiling
+    ref_budget = _budget(args.ref_keep_ratio, args.ref_keep_tiles)
+    if args.tile_conditions and ref_budget is None:
+        raise ValueError('--tile-conditions requires --ref-keep-ratio or '
+                         '--ref-keep-tiles')
+    if ref_budget is not None and not args.tile_conditions:
+        raise ValueError('a reference budget requires --tile-conditions')
 
 
 def main():
     args = parse_args()
+    _resolve_policy(args)
     env = parallel.init_distributed()
     cache = data.SampleCache(args.sample_cache)
     by_id = {s.id: s for s in cache.samples}
@@ -143,9 +213,12 @@ def main():
         geometry = data.parse_geometry(args.geometry[
             i if len(args.geometry) > 1 else 0])
         if sample.latent_t not in (None, geometry.latent_t):
+            # repr, not str: the mismatch is sometimes only in the type
+            # (a manifest that quoted latent_t), and '102' vs 102 prints
+            # as the same number otherwise.
             raise ValueError(f'{sample.id} was written for latent_t '
-                             f'{sample.latent_t}, geometry has '
-                             f'{geometry.latent_t}')
+                             f'{sample.latent_t!r}, geometry has '
+                             f'{geometry.latent_t!r}')
         out_dir = (args.out_dir if len(args.sample_id) == 1 else
                    os.path.join(args.out_dir, f'{sample.id}_{geometry.name}'))
         os.makedirs(out_dir, exist_ok=True)
@@ -214,11 +287,16 @@ def _denoise_all(args, env, cache, jobs, devices, assigned) -> list[dict]:
         else:
             raise ValueError('veda needs --predictor, or --plan-dir with '
                              '--checkpoint')
+        target_budget = _budget(args.keep_ratio, args.keep_tiles)
+        ref_budget = _budget(args.ref_keep_ratio, args.ref_keep_tiles)
         veda_config = veda_attention.VedaConfig(
-            target_budget=veda_mask.Budget(ratio=args.keep_ratio),
+            target_budget=target_budget, ref_budget=ref_budget,
+            tile_conditions=args.tile_conditions,
             collect_bytes=args.veda_collect_mib * 2**20)
-        progress.log(f'veda: {source}, keep {args.keep_ratio}, dense '
-                     f'steps {args.dense_steps}')
+        progress.log(f'veda: {source}, target {_budget_text(target_budget)}, '
+                     f'ref {(_budget_text(ref_budget) if ref_budget else "global")}, '
+                     f'tile_conditions={args.tile_conditions}, dense steps '
+                     f'{args.dense_steps}')
     replicas = [(tch.model, tch.tables, predictor)]
     for device in devices[1:]:
         with progress.Timer(f'replicate the teacher on {device}'):
@@ -267,10 +345,16 @@ def _decode_and_compare(args, sample, geometry, results, decoder,
                         out_dir) -> dict:
     """Decodes every mode, writes the videos, timing and comparison."""
     frames = {}
+    target_budget = _budget(args.keep_ratio, args.keep_tiles)
+    ref_budget = _budget(args.ref_keep_ratio, args.ref_keep_tiles)
     summary = {'sample': sample.id, 'geometry': geometry.name,
                'seed': args.seed, 'schedule': args.schedule,
                'num_steps': args.num_steps, 'adapter': args.adapter,
                'checkpoint': args.checkpoint, 'keep_ratio': args.keep_ratio,
+               'keep_tiles': args.keep_tiles,
+               'ref_keep_ratio': args.ref_keep_ratio,
+               'ref_keep_tiles': args.ref_keep_tiles,
+               'tile_conditions': args.tile_conditions,
                'dense_steps': args.dense_steps, 'modes': {}}
     waveforms = {}
     for mode, result in results.items():
@@ -278,10 +362,11 @@ def _decode_and_compare(args, sample, geometry, results, decoder,
         waveforms[mode] = decoder.audio(result.audio_rows)
         path = os.path.join(out_dir, f'{mode}.mp4')
         decode.write_mp4(path, frames[mode],
-                         [(waveforms[mode], _title(mode, args.keep_ratio))],
+                         [(waveforms[mode], _title(
+                             mode, target_budget, ref_budget))],
                          decoder.sample_rate)
         summary['modes'][mode] = {
-            'title': _title(mode, args.keep_ratio),
+            'title': _title(mode, target_budget, ref_budget),
             'total_seconds': result.seconds,
             'seconds_excl_step0': sum(result.step_seconds[1:]),
             'attention_seconds_excl_step0': sum(
@@ -308,11 +393,12 @@ def _decode_and_compare(args, sample, geometry, results, decoder,
         # difference (14 GB at 14.4 s, 1344x768), which on a loaded host
         # spends longer in reclaim than the whole denoise took.
         side = decode.side_by_side([
-            decode.add_title(frames[m], _title(m, args.keep_ratio))
+            decode.add_title(frames[m], _title(
+                m, target_budget, ref_budget))
             for m in ('dense', 'veda')])
         path = os.path.join(out_dir, 'dense_vs_veda.mp4')
         decode.write_mp4(path, side, [
-            (waveforms[m], _title(m, args.keep_ratio))
+            (waveforms[m], _title(m, target_budget, ref_budget))
             for m in ('dense', 'veda')], decoder.sample_rate)
         for mode in ('dense', 'veda'):
             m = summary['modes'][mode]

@@ -48,7 +48,7 @@ TILE_MIN_OVERLAP = 64
 # measured 1.91 s/tile at 1, 1.86 at 2, 1.84 at 4, 1.83 at 8, against a
 # peak of 4.78 / 5.03 / 5.55 / 6.11 GB. Two is that curve's knee, and on
 # 18 GB of unified memory the peak is what matters -- see the pitfall on
-# memory pressure in docs/features/mlx_inference.md, where the same batch
+# memory pressure, where the same batch
 # is 20x slower with the machine under pressure.
 DEFAULT_TILE_BATCH = 2
 
