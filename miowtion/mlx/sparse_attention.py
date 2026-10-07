@@ -4,7 +4,7 @@ MLX's fused SDPA (`mx.fast.scaled_dot_product_attention`) takes a boolean
 mask but applies it *after* the Q@K.T tile matmul: only the built-in
 `"causal"` mask shrinks the key loop, an arbitrary block mask does not. So a
 mask buys correctness and O(S) memory but no FLOPs (measured: 0.97x at 90 %
-block sparsity, see docs/features/mlx_inference.md).
+block sparsity).
 
 This module gets the FLOPs back without a custom Metal kernel. Veda gives
 every query tile the *same* number of key tiles (a fixed budget), so the

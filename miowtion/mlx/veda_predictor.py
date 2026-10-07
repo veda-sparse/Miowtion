@@ -22,7 +22,7 @@ predictor checkpoint exists -- it is content-based, unlike
 Alignment with the torch reference: max / min pooling is bitwise equal,
 while the mean, the projection and the logit matmul are reductions whose
 accumulation order differs between the two backends (~1e-6 relative, see
-docs/features/mlx_inference.md).
+the MLX inference API).
 """
 
 from __future__ import annotations

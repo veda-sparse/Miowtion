@@ -12,7 +12,7 @@ Two modes:
   kernel evicts them.
 
 Both go through the page cache, which cannot hold 50 blocks; see
-docs/features/mlx_inference.md for the measured behaviour.
+the module docstring for the measured behaviour.
 """
 
 from __future__ import annotations

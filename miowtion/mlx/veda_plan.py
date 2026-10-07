@@ -25,7 +25,7 @@ tiles are contiguous only after `layout.gather_index` has been applied.
 
 Because Veda runs its top-k per head, the index is per head, and because
 `TilePlan` allows two tile shapes (hence two permutations) per layer, a
-layer needs one plan per head group -- see docs/features/mlx_inference.md.
+layer needs one plan per head group.
 """
 
 from __future__ import annotations

@@ -242,7 +242,7 @@ def steps_summary(step_seconds: Sequence[float]) -> str:
 # with (h3.schedule.ShiftScales).
 TURBO_SHIFT = h3_schedule.ShiftScales(video=5.0, audio=2.0)
 # Head / row chunking of the trunk blocks. 18 GB machines need both;
-# see docs/features/mlx_inference.md.
+# see the MLX pipeline API.
 CLIP_OPTIONS = mlx_block.BlockOptions(head_chunk=8, row_chunk=4096)
 
 

@@ -6,7 +6,7 @@
 
 **Sparse acceleration and LoRA fine-tuning of [MiniMax-H3](https://github.com/MiniMax-AI/MiniMax-H3) on resource-constrained machines.**
 
-| <a href="docs/INDEX.md"><b>Documentation</b></a> | <a href="#getting-started"><b>Quick Start</b></a> | <a href="docs/pitfalls.md"><b>Pitfalls</b></a> | <a href="AGENTS.md"><b>Contributing</b></a> |
+| <a href="docs/INDEX.md"><b>Documentation</b></a> | <a href="#getting-started"><b>Quick Start</b></a> | <a href="AGENTS.md"><b>Contributing</b></a> |
 
 </div>
 
@@ -110,6 +110,29 @@ Pass the released bundle to `scripts/generate.py` with `--predictor
 weights/veda/h3-t2va-8nfe-600/minimax_h3_t2va_veda_8nfe_600step_preview_fp8.safetensors`;
 it replaces `--checkpoint` and `--plan-dir`.
 
+### R2VA preview
+
+The R2VA predictor uses the Ref2VA backbone with image, video and audio
+references. Download it and prepare the official H3 example (requires
+ffmpeg and ffprobe; its prompt is already PE-expanded):
+
+```bash
+hf download Veda-Sparse/Minimax-H3-R2VA-Veda-8NFE-600Step-Preview \
+  --local-dir weights/veda/h3-r2va-8nfe-600
+python scripts/prepare_official_r2va_demo.py \
+  --out artifacts/examples/minimax_h3_ref2va
+python scripts/encode_samples.py --root weights/MiniMax-H3 \
+  --manifest artifacts/examples/minimax_h3_ref2va/manifests/prompts.jsonl \
+  --out artifacts/samples/demo
+python scripts/generate.py --config configs/infer_r2va_preview.yaml
+```
+
+The preview independently keeps up to 32 visual reference tiles and
+32 current-video tiles per query tile and head. Text and audio stay fully
+attended. Use `--attention dense veda` for a paired comparison. See
+[Ref2VA documentation](docs/features/r2va.md) for input formats, parallel
+encoding and training settings.
+
 ### Install with an AI coding agent
 
 ```text
@@ -175,7 +198,7 @@ miowtion/train   parallel (FSDP2), teacher, trajectory, trainer, checkpoint, lor
 miowtion/infer   pipeline (dense / Veda denoising), decode (VAEs, mp4, comparison)
 scripts/         thin CLI entry points          configs/   run configs
 tests/unit       CPU tests (run before every commit)   tests/gpu   GPU tests
-docs/            knowledge base: features, pitfalls, dependencies
+docs/            user-facing feature and dependency documentation
 data/prompts     released prompt sets (see its README for source and license)
 third_party/     pinned submodules (MiniMax-H3)
 ```
@@ -183,7 +206,7 @@ third_party/     pinned submodules (MiniMax-H3)
 ## Contributing
 
 Read [AGENTS.md](AGENTS.md): Google Python style, docs updated with every feature
-and pitfall, bit-exact alignment for data transforms (visual human sign-off when
+bit-exact alignment for data transforms (visual human sign-off when
 bit-exactness is impossible), no machine-local information or secrets in the
 repository (enforced by the `.githooks` leak checks), and rules for multiple
 agents working in one tree.

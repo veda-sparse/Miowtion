@@ -99,6 +99,55 @@ def test_sample_cache_roundtrip(tmp_path):
         sampler.next(aspect='9:16')
 
 
+def test_shard_and_merge_sample_caches(tmp_path):
+    manifest = tmp_path / 'samples.jsonl'
+    with open(manifest, 'w') as f:
+        for sample_id in ('a', 'b', 'c', 'd', 'e'):
+            f.write(json.dumps({'id': sample_id}) + '\n')
+    shard_manifests = data.shard_jsonl_manifest(
+        str(manifest), str(tmp_path / 'manifests'), 2)
+    with open(shard_manifests[0]) as f:
+        assert [json.loads(line)['id'] for line in f] == ['a', 'c', 'e']
+    with open(shard_manifests[1]) as f:
+        assert [json.loads(line)['id'] for line in f] == ['b', 'd']
+
+    cache_dirs = []
+    for shard, ids in enumerate((('b', 'd'), ('a', 'c', 'e'))):
+        directory = tmp_path / f'cache_{shard}'
+        writer = data.SampleCacheWriter(str(directory))
+        for sample_id in ids:
+            value = ord(sample_id) - ord('a')
+            writer.add(
+                sample_id, 'ref2va', 'train',
+                torch.full((value + 1, 8), value),
+                torch.ones(value + 1, dtype=torch.long),
+                references=({'kind': 'image', 'latent_h': 2,
+                             'latent_w': 2},
+                            {'kind': 'audio', 'audio_t': 1}), latent_t=37,
+                cond_video=torch.full((1, 96), value),
+                cond_audio=torch.full((2, 32), value))
+        writer.finalize()
+        cache_dirs.append(str(directory))
+
+    merged_dir = tmp_path / 'merged'
+    order = ['a', 'b', 'c', 'd', 'e']
+    data.merge_sample_caches(cache_dirs, str(merged_dir), order)
+    merged = data.SampleCache(str(merged_dir))
+    assert [sample.id for sample in merged.samples] == order
+    for value, sample in enumerate(merged.samples):
+        hidden, tags = merged.text(sample)
+        video, audio = merged.conditions(sample)
+        assert torch.equal(hidden, torch.full(
+            (value + 1, 8), value, dtype=torch.bfloat16))
+        assert torch.equal(tags, torch.ones(value + 1, dtype=torch.long))
+        assert torch.equal(video, torch.full((1, 96), value).float())
+        assert torch.equal(audio, torch.full((2, 32), value).float())
+    summary = data.validate_training_cache(
+        str(merged_dir), order, 'train', ['ref2va'], ['16:9@37'])
+    assert summary['samples'] == 5
+    assert summary['max_sequence'] > 0
+
+
 def test_adaln_tables_match_live_projection(tmp_path):
     m = _write_release(str(tmp_path))
     tdir = os.path.join(str(tmp_path), 'FL2VA', 'transformer')
@@ -115,6 +164,20 @@ def test_adaln_tables_match_live_projection(tmp_path):
         cached = tables.get(state.timesteps)
         for a, b in zip(live, cached):
             assert all(torch.equal(x, y) for x, y in zip(a, b))
+
+
+def test_absolute_reference_and_target_budgets():
+    config = trainer_lib.TrainConfig(
+        run_name='ref_tiles', checkpoint_root='unused', sample_cache='unused',
+        geometries=['16:9@7'], variant='Ref2VA', tasks=['ref2va'],
+        tile_conditions=True, keep_tiles=32, ref_keep_tiles=32)
+    config.validate()
+    target, reference = config.budgets()
+    assert target.tiles == 32 and reference.tiles == 32
+    assert target.ratio is None and reference.ratio is None
+    config.ref_keep_tiles = 0
+    with pytest.raises(ValueError, match='ref_keep_tiles'):
+        config.validate()
 
 
 def test_stage1_trains_and_resumes(tmp_path):

@@ -2,7 +2,7 @@
 
 Synthetic weights with the real shapes (the real checkpoint is not needed to
 time I/O or compute), memory accounting of the process and the system, and
-the benchmarks behind docs/features/mlx_inference.md. Every benchmark checks
+the MLX benchmarks. Every benchmark checks
 the available memory first and refuses to start when it is too low.
 """
 

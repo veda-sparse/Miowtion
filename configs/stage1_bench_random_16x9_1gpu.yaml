@@ -1,5 +1,5 @@
 # Stage-1 training speed of ONE card on random weights (no checkpoint;
-# docs/benchmark/performance.md §11). Same per-update work as
+# Same per-update work as
 # stage1_bench_16x9_t37_1gpu (turbo 8-step trajectories, keep 0.1,
 # teacher_q_tiles 1.0, accum 1 so an update is one micro-step), except:
 # the teacher is random (miowtion.h3.synthetic) and has no few-step LoRA,

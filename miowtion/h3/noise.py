@@ -65,8 +65,10 @@ def augment_visual_conditions(clean_rows: torch.Tensor,
     """Noise-augments visual condition rows (keyframes, reference visuals).
 
     Each condition draws from a fresh generator seeded with `seed`, on a
-    [1, 24, target_latent_t + len(shapes), H, W] latent, keeps the first
-    latent_t frames and mixes 0.999 * clean + 0.001 * noise.
+    [1, 24, max(target_latent_t + len(shapes), latent_t), H, W] latent,
+    keeps the first latent_t frames and mixes 0.999 * clean + 0.001 * noise.
+    A reference may be longer than the target. Existing shorter references
+    keep their original random draw shape and therefore the same noise.
 
     Args:
         clean_rows: [N, 96] clean patchified condition latents, in the
@@ -83,8 +85,9 @@ def augment_visual_conditions(clean_rows: torch.Tensor,
     out = []
     offset = 0
     for latent_t, latent_h, latent_w in shapes:
+        noise_t = max(target_latent_t + len(shapes), latent_t)
         gen = torch.Generator().manual_seed(int(seed))
-        noise = torch.randn(1, VIDEO_CHANNELS, target_latent_t + len(shapes),
+        noise = torch.randn(1, VIDEO_CHANNELS, noise_t,
                             latent_h, latent_w, generator=gen,
                             dtype=torch.float32)[:, :, :latent_t]
         noise_rows = patchify(noise)

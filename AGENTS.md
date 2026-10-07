@@ -21,12 +21,9 @@ Miowtion 的主旨：**在资源受限的机器上实现 [MiniMax-H3](https://gi
 ### 1.1 文档：`docs/` 必须与代码同步
 
 - `docs/` 的组织方式类似 skill：`docs/INDEX.md` 是目录文件，每个子功能一个独立文档
-  （`docs/features/*.md`），外加跨功能的 `docs/pitfalls.md`（踩坑总表）。
+  （`docs/features/*.md`）。
 - **新增 feature**：必须同时新增或更新对应的 `docs/features/<feature>.md`，并在
   `docs/INDEX.md` 中登记一行。
-- **踩过的坑都要记录**：写进对应 feature 文档的「踩坑记录」一节，并在
-  `docs/pitfalls.md` 加一行索引（现象 / 原因 / 对策 / 链接）。只要花了超过十分钟排查的
-  问题，都算"坑"。
 - 文档写"为什么"和"不变量"，不要复述代码。代码行为改变时，同一个提交里更新文档。
 - 文档模板见 `docs/INDEX.md` 末尾。
 
@@ -168,8 +165,7 @@ plans/               已采纳的 tile 方案表（json，小文件，入库）
 tests/unit/          CPU 单元测试（每次提交前必须全过）
 tests/gpu/           GPU 测试（@pytest.mark.gpu，无 GPU 时自动 skip）
 tests/fixtures/      小型 golden 数据（必须可再生，附生成脚本与来源 commit）
-docs/                知识库：INDEX.md + features/*.md + pitfalls.md + dependencies.md +
-                     benchmark/（实测性能记录：每条记录带几何、硬件、并行与 offload 配置）
+docs/                知识库：INDEX.md + features/*.md + dependencies.md
 third_party/         外部仓库的 git submodule（只读，锁定 commit）
 runs/                [gitignore] 实验输出：日志、本地 checkpoint、评测结果
 artifacts/           [gitignore] 大文件：q/k/v 转储、渲染视频、样本缓存、可视化对比

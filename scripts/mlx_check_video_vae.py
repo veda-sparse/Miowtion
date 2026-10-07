@@ -4,7 +4,7 @@ The reference is `diffusers.AutoencoderKLMiniMaxH3`, which needs a diffusers
 version that cannot live in the same environment as the release's own pin
 (see infer.decode.DiffusersDecoder), so this check is a script rather than a
 unit test: run it with that diffusers on the path and paste the numbers into
-docs/features/mlx_inference.md.
+the MLX video VAE API.
 
 What it compares is a small randomly initialized decoder, both sides in
 fp32, so the only differences left are accumulation order. The tile layout,

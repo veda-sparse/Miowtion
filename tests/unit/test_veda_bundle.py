@@ -47,6 +47,9 @@ def test_round_trip_is_bit_wise_exact(tmp_path, dtype):
         assert got[name].dtype == dtype
         assert torch.equal(got[name], value.to(dtype))
     assert loaded.keep_ratio == 0.1
+    assert loaded.target_budget.ratio == 0.1
+    assert loaded.ref_budget is None
+    assert loaded.tile_conditions is False
     assert loaded.metadata['source_weights'] == 'live'
     assert loaded.metadata['step'] == '600'
 
@@ -124,6 +127,27 @@ def test_plans_travel_with_the_weights(tmp_path):
 def test_read_metadata_does_not_need_the_tensors(tmp_path):
     path, _ = _write(tmp_path)
     assert veda_bundle.read_metadata(path)['keep_ratio'] == '0.1'
+
+
+def test_fixed_target_and_reference_budgets_round_trip(tmp_path):
+    path, _ = _write(tmp_path, keep_ratio=None, keep_tiles=32,
+                     ref_keep_tiles=32, tile_conditions=True)
+    loaded = veda_bundle.load(path)
+    assert loaded.keep_ratio is None
+    assert loaded.target_budget.tiles == 32
+    assert loaded.ref_budget.tiles == 32
+    assert loaded.tile_conditions is True
+    assert 'keep_ratio' not in loaded.metadata
+
+
+@pytest.mark.parametrize('overrides,match', [
+    ({'keep_ratio': 0.1, 'keep_tiles': 32}, 'exactly one'),
+    ({'ref_keep_tiles': 32}, 'requires tile_conditions'),
+    ({'tile_conditions': True}, 'requires a reference budget'),
+])
+def test_invalid_budget_policy_is_rejected(tmp_path, overrides, match):
+    with pytest.raises(ValueError, match=match):
+        _write(tmp_path, **overrides)
 
 
 def test_a_foreign_safetensors_file_is_rejected(tmp_path):
