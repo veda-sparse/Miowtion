@@ -378,3 +378,95 @@ def test_count_term_parameter_count_and_pairing():
     with pytest.raises(ValueError, match='count_term must be set'):
         plain(feats, feats, torch.tensor([0]),
               log_count=torch.zeros(3))
+
+
+def _moments(heads=3, dim=16, seed=0, rank=None):
+    """PSD second moments from non-negative feature vectors, as collected."""
+    g = torch.Generator().manual_seed(seed)
+    out = []
+    for _ in range(2):
+        mats = []
+        for _ in range(heads):
+            n = rank or 4 * dim
+            feats = torch.rand(n, dim, generator=g)  # non-negative, as real
+            mats.append(feats.transpose(0, 1) @ feats / n)
+        out.append(torch.stack(mats))
+    return out
+
+
+def test_full_rank_low_rank_init_reproduces_the_exact_term():
+    """At r = head_dim the weighted SVD must land on c * I.
+
+    This is what ties the data-driven initialization to the closed-form
+    one: `so_q @ so_k^T` is the matrix the term multiplies by, and at full
+    rank the best rank-r answer is the exact answer regardless of data.
+    """
+    dim = 16
+    c_u, c_v = _moments(heads=3, dim=dim)
+    exact = veda_predictor.LayerPredictor(3, dim, second_order_rank=dim)
+    exact.init_exact_second_order_()
+    fitted = veda_predictor.LayerPredictor(3, dim, second_order_rank=dim)
+    fitted.init_low_rank_second_order_(c_u, c_v)
+    want = exact.so_q[0] @ exact.so_k[0].transpose(0, 1)
+    torch.testing.assert_close(want, torch.eye(dim) * (0.5 / dim),
+                               rtol=1e-5, atol=1e-7)
+    for head in range(3):
+        got = fitted.so_q[head] @ fitted.so_k[head].transpose(0, 1)
+        torch.testing.assert_close(got, want, rtol=1e-3, atol=1e-6)
+
+
+def test_low_rank_init_beats_a_truncated_identity():
+    """The point of fitting: a naive rank-r identity ignores the data."""
+    dim, rank, heads = 16, 4, 1
+    c_u, c_v = _moments(heads=heads, dim=dim, seed=3)
+    fitted = veda_predictor.LayerPredictor(heads, dim,
+                                           second_order_rank=rank)
+    fitted.init_low_rank_second_order_(c_u, c_v)
+    coefficient = 0.5 / dim
+    target = torch.eye(dim) * coefficient
+
+    def weighted_error(matrix):
+        delta = matrix - target
+        return float(torch.trace(c_u[0] @ delta @ c_v[0]
+                                 @ delta.transpose(0, 1)))
+
+    got = fitted.so_q[0] @ fitted.so_k[0].transpose(0, 1)
+    naive = torch.zeros(dim, dim)
+    naive[:rank, :rank] = torch.eye(rank) * coefficient
+    assert weighted_error(got) < weighted_error(naive)
+    # And dropping the term entirely is worse still.
+    assert weighted_error(got) < weighted_error(torch.zeros(dim, dim))
+
+
+def test_low_rank_init_checks_its_inputs():
+    plain = veda_predictor.LayerPredictor(2, 16)
+    c_u, c_v = _moments(heads=2, dim=16)
+    with pytest.raises(ValueError, match='no second-order head'):
+        plain.init_low_rank_second_order_(c_u, c_v)
+    layer = veda_predictor.LayerPredictor(2, 16, second_order_rank=4)
+    with pytest.raises(ValueError, match='c_u has shape'):
+        layer.init_low_rank_second_order_(c_u[:1], c_v)
+    stack = veda_predictor.TileScorePredictor(2, 2, 16,
+                                             second_order_rank=4)
+    three = c_u[None].expand(3, -1, -1, -1)
+    with pytest.raises(ValueError, match='moments cover'):
+        stack.init_low_rank_second_order_(three, three)
+
+
+def test_psd_roots_drop_the_null_space():
+    dim = 8
+    basis = torch.linalg.qr(torch.randn(dim, dim))[0]
+    values = torch.tensor([4.0, 1.0] + [0.0] * (dim - 2))
+    matrix = (basis * values[None, :]) @ basis.transpose(0, 1)
+    root, inverse = veda_predictor._psd_roots(matrix, 1e-6)
+    torch.testing.assert_close(root @ root, matrix, rtol=1e-4, atol=1e-5)
+    # The pseudo-inverse is the identity only on the kept subspace.
+    projector = root @ inverse
+    torch.testing.assert_close(projector @ projector, projector, rtol=1e-4,
+                               atol=1e-5)
+    # A projector's trace is its rank, and unlike matrix_rank that does
+    # not need a tolerance guessed against fp32 eigendecomposition noise.
+    assert float(torch.trace(projector)) == pytest.approx(2.0, abs=1e-4)
+    # It is the identity on the range and kills the null space.
+    torch.testing.assert_close(projector @ matrix, matrix, rtol=1e-4,
+                               atol=1e-5)

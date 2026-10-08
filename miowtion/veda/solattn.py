@@ -1882,3 +1882,162 @@ def run_init_probe(config: RunConfig) -> None:
                 f"recall {row['recall']:.4f}  heat_kept {row['heat_kept']:.4f}"
                 f"  kept/ceiling {row['kept_over_ceiling']:.4f}  "
                 f"logit_std {row['logit_std']:.4f}")
+
+# --- Second-moment calibration for the low-rank head --------------------
+#
+# `predictor.init_low_rank_second_order_` needs E[sq_q^T sq_q] and
+# E[var_k^T var_k] per (layer, head) to know which directions of the
+# diagonal cumulant term are worth spending rank on. Both are cheap: one
+# teacher rollout, and D^2 per tile.
+
+
+class SecondMomentProbe:
+    """AttentionFn accumulating the pooled second moments of one clip.
+
+    Only the video quadrant is weighted, because that is the only part of
+    the score `select_video_blocks` reads.
+    """
+
+    def __init__(self, layout, plan, clip, num_heads: int, head_dim: int,
+                 dense_backend: str = 'auto'):
+        """
+        Args:
+            layout: Packed layout of the clip.
+            plan: `veda.plan.TilePlan` giving each head's tile shape.
+            clip: `veda.attention.ClipTiling` of this clip.
+            num_heads: Heads per layer.
+            head_dim: Head dimension.
+            dense_backend: Backend of the dense attention.
+        """
+        self.layout = layout
+        self.plan = plan
+        self.clip = clip
+        self.dense_backend = dense_backend
+        shape = (plan.num_layers, num_heads, head_dim, head_dim)
+        self.c_u = torch.zeros(shape, dtype=torch.float64)
+        self.c_v = torch.zeros(shape, dtype=torch.float64)
+        self.tiles = torch.zeros(plan.num_layers, num_heads,
+                                 dtype=torch.float64)
+
+    @torch.no_grad()
+    def __call__(self, q, k, v, layer_index):
+        from miowtion.veda import predictor as veda_predictor  # pylint: disable=import-outside-toplevel
+        out, _ = h3_attention.dense_attention(
+            q, k, v, self.layout.used, return_lse=True,
+            backend=self.dense_backend)
+        for group in self.plan.head_groups(layer_index, self.clip.device):
+            tile_layout = self.clip.get(group.shape)
+            n_video = tile_layout.n_video_tiles
+            q_t, k_t = (tiling.gather_tiles(t, tile_layout, group.heads)
+                        for t in (q, k))
+            sq_q = veda_predictor.pool_tiles(
+                q_t, tile_layout, veda_predictor.SECOND_RAW)[:, :n_video]
+            var_k = veda_predictor.pool_tiles(
+                k_t, tile_layout,
+                veda_predictor.SECOND_CENTRAL)[:, :n_video]
+            heads = group.heads.cpu()
+            self.c_u[layer_index].index_add_(
+                0, heads, torch.einsum('hnd,hne->hde', sq_q, sq_q)
+                .double().cpu())
+            self.c_v[layer_index].index_add_(
+                0, heads, torch.einsum('hnd,hne->hde', var_k, var_k)
+                .double().cpu())
+            self.tiles[layer_index].index_add_(
+                0, heads, torch.full((heads.numel(),), float(n_video),
+                                     dtype=torch.float64))
+        return out
+
+    def moments(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Mean second moments as fp32 [L, H, D, D], ready for the init."""
+        counts = self.tiles.clamp(min=1.0)[:, :, None, None]
+        return ((self.c_u / counts).float(), (self.c_v / counts).float())
+
+
+def run_second_moments(config: RunConfig) -> None:
+    """Collects and saves the calibration moments for one geometry.
+
+    Raises:
+        ValueError: If launched with more than one rank, or a geometry has
+            no cached sample.
+    """
+    from miowtion.h3 import model as h3_model  # pylint: disable=import-outside-toplevel
+    from miowtion.train import data  # pylint: disable=import-outside-toplevel
+    from miowtion.train import parallel  # pylint: disable=import-outside-toplevel
+    from miowtion.train import teacher  # pylint: disable=import-outside-toplevel
+    from miowtion.train import trajectory  # pylint: disable=import-outside-toplevel
+
+    env = parallel.init_distributed()
+    if env.world_size != 1:
+        raise ValueError('run the calibration with one rank, not '
+                         f'{env.world_size}')
+    teacher_ = teacher.build_teacher(
+        config.checkpoint_root, config.variant, config.schedule,
+        config.num_steps, config.teacher_adapter, env,
+        visual_conditions=config.variant == 'Ref2VA'
+        or 'fl2va' in config.tasks,
+        audio_references=config.variant == 'Ref2VA',
+        offload_blocks=config.offload_blocks, prefetch=config.prefetch,
+        mlp_chunk_rows=config.mlp_chunk_rows)
+    model, schedule, tables = (teacher_.model, teacher_.schedule,
+                               teacher_.tables)
+    model.dense_backend = config.dense_backend
+    cache = data.SampleCache(config.sample_cache)
+    out_dir = os.path.join(config.out_dir, config.run_name)
+    os.makedirs(out_dir, exist_ok=True)
+    plans = None
+    if config.predictors:
+        from miowtion.veda import bundle as veda_bundle  # pylint: disable=import-outside-toplevel
+        path = config.predictors[0].split('=', 1)[-1]
+        plans = veda_bundle.load(path, 'cpu').plans
+    for spec in config.geometries:
+        geometry = data.parse_geometry(spec)
+        samples = [s for s in cache.select('train', config.tasks)
+                   if s.aspect in (None, geometry.aspect)
+                   and s.latent_t in (None, geometry.latent_t)]
+        if not samples:
+            raise ValueError(f'no cached sample for {geometry.name}')
+        samples = samples[:config.num_clips]
+        plan = (plans.select(geometry) if plans is not None
+                else veda_plan.TilePlan.uniform(
+                    geometry, tiling.TileShape.parse(config.tile_shape),
+                    model.config.num_layers, model.config.num_heads))
+        veda_config = veda_attention.VedaConfig(
+            target_budget=veda_mask.Budget(ratio=config.densities[0]))
+        probe = None
+        progress.log(f'second-moment calibration {geometry.name}: '
+                     f'{len(samples)} clips, steps {list(config.steps)}')
+        clips = progress.Progress(f'{geometry.name}: clips', len(samples))
+        for sample in samples:
+            traj = trajectory.Trajectory(model, cache, sample, geometry,
+                                         schedule, config.seed, env.device)
+            clip_tiling = veda_attention.ClipTiling(traj.layout,
+                                                    veda_config, env.device)
+            if probe is None:
+                probe = SecondMomentProbe(
+                    traj.layout, plan, clip_tiling,
+                    model.config.num_heads, model.config.head_dim,
+                    config.dense_backend)
+            else:
+                probe.layout, probe.clip = traj.layout, clip_tiling
+            last = max(config.steps)
+            while not traj.done and traj.step <= last:
+                inputs = traj.inputs()
+                if traj.step in config.steps:
+                    attention_fn = probe
+                else:
+                    attention_fn = h3_model.DenseAttention(
+                        traj.layout.used, config.dense_backend)
+                with torch.no_grad():
+                    video_v, audio_v = model(
+                        traj.clip, inputs.video_rows, inputs.audio_rows,
+                        inputs.timestep, attention_fn,
+                        tables.get(inputs.timestep.timesteps))
+                traj.advance(video_v, audio_v)
+            clips.update(sample.id)
+        c_u, c_v = probe.moments()
+        path = os.path.join(out_dir, f'{geometry.name}_moments.pt')
+        torch.save({'c_u': c_u, 'c_v': c_v,
+                    'geometry': geometry.name,
+                    'clips': [s.id for s in samples],
+                    'steps': list(config.steps)}, path)
+        progress.log(f'saved {path} ({tuple(c_u.shape)})')

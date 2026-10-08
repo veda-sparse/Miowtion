@@ -11,7 +11,7 @@
 | [features/veda_kernel.md](features/veda_kernel.md) | FA4 CuTe 块稀疏整合（含 vendored 的 SM8x 补丁）、架构支持、测速结果 | SM89 已通过 GPU 测试；SM120 前向 + 反向已验证；SM90/100 待验证 |
 | [features/tile_search.md](features/tile_search.md) | oracle 评分、投票、每层 ≤2 种形状、搜索驱动 | 真实权重上 50 步 / 8 步搜索已跑通 |
 | [features/sol_ablation.md](features/sol_ablation.md) | Sol-Attn 消融：选块目标（输出误差贡献 Ω vs 注意力质量）与每行可变预算（z-score / σ 自适应 vs 固定 top-k）的离线验证、两道门槛 G1/G2、机理诊断 | 16:9@37 真实权重 67200 行已跑：**G1、G2 均未通过**，瓶颈是打分器准确度而非选块目标；t102 与 49 步基座待复跑 |
-| [features/veda2.md](features/veda2.md) | Veda2（stage1 冻结 backbone、只训 adaptor）：块质量目标、打分器补上块行数与二阶矩特征（低秩二阶头）、静态每头预算；以及为什么零阶补偿和「预测修正权重」都不进 | 16:9@37 真实权重 134400 行已量：对角二阶特征补回 27~46% 的 oracle 差距、每头预算再省 6%；在块质量这个决定 ε 的度量上，未训练的 veda2 已超过发布的 step600 打分器；1:1@37 ρ=0.05 上 5 条 clip 的三路视频与实测速度已出，**但全秩二阶头比 Veda1 慢 6.7%**，低秩初始化待做 |
+| [features/veda2.md](features/veda2.md) | Veda2（stage1 冻结 backbone、只训 adaptor）：块质量目标、打分器补上块行数与二阶矩特征（低秩二阶头）、静态每头预算；以及为什么零阶补偿和「预测修正权重」都不进 | 16:9@37 真实权重 134400 行已量：对角二阶特征补回 27~46% 的 oracle 差距、每头预算再省 6%；在块质量这个决定 ε 的度量上，未训练的 veda2 已超过发布的 step600 打分器；1:1@37 ρ=0.05 上 5 条 clip 的三路视频与实测速度已出：**rank 16 + 融合池化后与 Veda1 等速（3.938 对 3.944 s/step）而质量更好**，画质待人工确认 |
 | [features/training.md](features/training.md) | FSDP2 训练框架：阶段 1/2、少步 LoRA 教师、AdaLN 表、数据、checkpoint | 阶段 1 已在 2×4090 真实权重上跑通；阶段 2 待 GPU 验证 |
 | [features/prompt_expansion.md](features/prompt_expansion.md) | prompt 扩写：短 prompt → H3 T2VA 结构化 prompt（DeepSeek；system prompt 由 H3 skill 拼成；校验 + repair 重试） | CPU 测试通过；MovieGenVideoBench 全量 1003 条已扩写并发布到 `data/prompts/` |
 | [features/evaluation.md](features/evaluation.md) | 评测集与评测流程 v1：固定的 20 条 holdout（3 种时长 × 4 种纵横比）、数值评测（打分器 recall / heat_kept）与人眼对比（每路单独视频 + 拼接视频）的跑法、成本与已有基线 | v1 已在 1×RTX PRO 6000 上用于数值对比；v1 与 OpenVDN 16 条的拼接视频已生成，待人工确认 |

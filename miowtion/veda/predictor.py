@@ -31,6 +31,21 @@ the predictor is bit-for-bit what it was. Set it to head_dim and
 `init_exact_second_order_()` makes an *untrained* predictor equal the full
 diagonal estimate of log mass rather than the zero-order one.
 
+At a rank below head_dim there is no identity to copy, but there is
+still a best answer. The term the full-rank head computes is
+`c * sq_q . var_k` with `c = 1 / (2 D)`, so a rank-r head wants
+projections A, B with `A B^T` as close to `c I` as the data makes
+necessary. Weighting by how the two features actually spread,
+
+    error(A, B) = E_ij (sq_q_i (A B^T - c I) var_k_j^T)^2
+                = tr(C_u M C_v M^T),   M = A B^T - c I,
+
+with `C_u = E[sq_q^T sq_q]` and `C_v = E[var_k^T var_k]`, the minimizer is
+the rank-r truncated SVD of `c * C_u^(1/2) C_v^(1/2)`, undone on each
+side. `init_low_rank_second_order_` does that from moments a calibration
+pass collects, and at r = head_dim it reproduces the exact term, which is
+what pins the two initializations against each other.
+
 `count_term` supplies `log B_j`, which is free: a per-key-tile constant
 read straight off the layout, added with one learned gain per head that
 starts at the exact coefficient of 1. Without it the score ranks a key
@@ -153,6 +168,32 @@ def _second_moment(tiles: torch.Tensor, mean: torch.Tensor,
     return acc / count[:, None, None]
 
 
+def _psd_roots(matrix: torch.Tensor,
+               floor: float) -> tuple[torch.Tensor, torch.Tensor]:
+    """Symmetric square root of a PSD matrix and its pseudo-inverse.
+
+    Args:
+        matrix: [D, D] fp32 symmetric PSD.
+        floor: Eigenvalues below this fraction of the largest are dropped
+            from the inverse, which is therefore a pseudo-inverse.
+
+    Returns:
+        (root, inverse_root) with `root @ root == matrix` on the kept
+        subspace.
+    """
+    values, vectors = torch.linalg.eigh(matrix)
+    values = values.clamp(min=0.0)
+    cut = float(values.max()) * floor
+    kept = values > cut
+    root_values = torch.where(kept, values.sqrt(),
+                              torch.zeros_like(values))
+    inv_values = torch.where(kept, values.clamp(min=cut).rsqrt(),
+                             torch.zeros_like(values))
+    root = (vectors * root_values[None, :]) @ vectors.transpose(0, 1)
+    inverse = (vectors * inv_values[None, :]) @ vectors.transpose(0, 1)
+    return root, inverse
+
+
 class LayerPredictor(nn.Module):
     """Projections of one layer: proj_q, proj_k [num_heads, 3D, D].
 
@@ -212,6 +253,48 @@ class LayerPredictor(nn.Module):
         """[H', n, 3D] fp32 features -> [H', n, D] tile embeddings."""
         mean = feats[..., :self.head_dim]
         return torch.bmm(feats, proj.index_select(0, heads).float()) + mean
+
+    @torch.no_grad()
+    def init_low_rank_second_order_(self, c_u: torch.Tensor,
+                                    c_v: torch.Tensor,
+                                    floor: float = 1e-6) -> None:
+        """Best rank-r head for the diagonal cumulant, given its moments.
+
+        See the module docstring for the derivation. At full rank this is
+        `init_exact_second_order_` to within the inverse square roots'
+        conditioning, which the test pins.
+
+        Args:
+            c_u: [num_heads, D, D] fp32 `E[sq_q^T sq_q]` per head.
+            c_v: [num_heads, D, D] fp32 `E[var_k^T var_k]` per head.
+            floor: Eigenvalues below this fraction of a head's largest are
+                clamped before the inverse square root. Both moments are
+                outer products of non-negative vectors, so they are PSD
+                but routinely near-singular.
+
+        Raises:
+            ValueError: If the head has no rank, or the moments are the
+                wrong shape.
+        """
+        if not self.second_order_rank:
+            raise ValueError('no second-order head to initialize')
+        heads, dim = self.so_q.shape[0], self.head_dim
+        want = (heads, dim, dim)
+        for name, moment in (('c_u', c_u), ('c_v', c_v)):
+            if tuple(moment.shape) != want:
+                raise ValueError(f'{name} has shape {tuple(moment.shape)}, '
+                                 f'expected {want}')
+        rank = self.second_order_rank
+        coefficient = 0.5 / dim
+        for head in range(heads):
+            root_u, inv_u = _psd_roots(c_u[head].float(), floor)
+            root_v, inv_v = _psd_roots(c_v[head].float(), floor)
+            gram = coefficient * (root_u @ root_v)
+            left, values, right = torch.linalg.svd(gram)
+            keep = values[:rank].clamp(min=0.0).sqrt()
+            self.so_q[head] = (inv_u @ left[:, :rank]) * keep[None, :]
+            self.so_k[head] = (inv_v @ right[:rank].transpose(0, 1)
+                               ) * keep[None, :]
 
     def forward(self, feats_q: torch.Tensor, feats_k: torch.Tensor,
                 heads: torch.Tensor, sq_q: torch.Tensor | None = None,
@@ -279,6 +362,27 @@ class TileScorePredictor(nn.Module):
         """Warm-start every layer's second-order head (see LayerPredictor)."""
         for layer in self.layers:
             layer.init_exact_second_order_()
+
+    @torch.no_grad()
+    def init_low_rank_second_order_(self, c_u: torch.Tensor,
+                                    c_v: torch.Tensor,
+                                    floor: float = 1e-6) -> None:
+        """Per-layer low-rank warm start from calibration moments.
+
+        Args:
+            c_u: [num_layers, num_heads, D, D] fp32.
+            c_v: Same shape.
+            floor: See LayerPredictor.init_low_rank_second_order_.
+
+        Raises:
+            ValueError: If the leading dimension is not num_layers.
+        """
+        if c_u.shape[0] != len(self.layers) or c_v.shape[0] != len(
+                self.layers):
+            raise ValueError(f'moments cover {c_u.shape[0]} layers, '
+                             f'expected {len(self.layers)}')
+        for index, layer in enumerate(self.layers):
+            layer.init_low_rank_second_order_(c_u[index], c_v[index], floor)
 
     def scores(self, layer: int, q_tiles: torch.Tensor, k_tiles: torch.Tensor,
                layout: tiling.TileLayout, heads: torch.Tensor) -> torch.Tensor:

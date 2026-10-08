@@ -17,7 +17,9 @@ teacher_adapter: weights/turbo_lora/minimax_h3_turbo_v4_step600_ema.safetensors
 tile_shape: 4x4x8
 predictors:
   - veda1_trained=weights/veda/Minimax-H3-T2VA-Veda-8NFE-600Step-Preview/minimax_h3_t2va_veda_8nfe_600step_preview_fp8.safetensors
-  - veda2_untrained=weights/veda/veda2_untrained.safetensors
+  - veda2_r128=weights/veda/veda2_untrained.safetensors
+  - veda2_r16=weights/veda/veda2_r16.safetensors
+  - veda2_r8=weights/veda/veda2_r8.safetensors
 num_clips: 5
 densities: [0.05]
 query_tiles: 16

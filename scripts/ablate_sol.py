@@ -100,6 +100,9 @@ def main():
     parser.add_argument('--config')
     parser.add_argument('--summarize', help='re-print a saved run instead '
                         'of measuring')
+    parser.add_argument('--second-moments', action='store_true',
+                        help='collect the calibration moments the low-rank '
+                        'second-order head is initialized from')
     parser.add_argument('--init-probe', action='store_true',
                         help="score predictor initializations in the "
                         "training loop's own metrics instead of running "
@@ -123,7 +126,9 @@ def main():
     if args.geometries:
         raw['geometries'] = args.geometries
     config = solattn.RunConfig(**raw)
-    if args.init_probe:
+    if args.second_moments:
+        solattn.run_second_moments(config)
+    elif args.init_probe:
         solattn.run_init_probe(config)
     else:
         solattn.run_ablation(config)

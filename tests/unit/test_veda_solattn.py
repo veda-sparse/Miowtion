@@ -1095,3 +1095,60 @@ def test_init_probe_by_clip_ranks_hardest_first():
     assert out[0]['heat_ceiling'] == pytest.approx(0.4)
     assert out[0]['heat_kept'] == {'a': 0.3, 'b': 0.35}
     assert solattn.init_probe_by_clip(rows, target='max')[0]['clip'] == 'hard'
+
+
+# --- second-moment calibration -------------------------------------------
+
+
+def test_second_moment_probe_collects_psd_moments_per_head():
+    """One rollout, D^2 per tile, and the result must be usable as-is."""
+    from miowtion.h3 import config as h3_config
+    from miowtion.h3 import layout as h3_layout
+    from miowtion.h3 import model as h3_model
+    from miowtion.h3 import noise
+    from miowtion.h3 import schedule as h3_schedule
+    from miowtion.veda import plan as veda_plan
+    from miowtion.veda import predictor as veda_predictor
+
+    cfg = h3_config.H3Config.tiny()
+    torch.manual_seed(0)
+    model = h3_model.H3DiT(cfg)
+    for param in model.parameters():
+        with torch.no_grad():
+            param.normal_(0.0, 0.02)
+    geo = geometry.Geometry('16:9', 256, 128, 22, 7, 8, 16, 37)
+    lay = h3_layout.pack(torch.ones(12, dtype=torch.long), geo)
+    plan = veda_plan.TilePlan.uniform(
+        geo, tiling.least_padding_shape(geo.video_grid), cfg.num_layers,
+        cfg.num_heads)
+    clip_tiling = veda_attention.ClipTiling(
+        lay, veda_attention.VedaConfig(
+            target_budget=veda_mask.Budget(ratio=0.9)), torch.device('cpu'))
+    probe = solattn.SecondMomentProbe(lay, plan, clip_tiling,
+                                      cfg.num_heads, cfg.head_dim,
+                                      dense_backend='math')
+    text = model.refine_text(torch.randn(12, cfg.text_dim))
+    clip = model.clip_inputs(lay, text, torch.device('cpu'))
+    video, audio = noise.initial_noise(geo, 0)
+    state = h3_schedule.build_timestep_state(lay, 0.3, 0.1)
+    with torch.no_grad():
+        model(clip, video, audio, state, probe)
+    c_u, c_v = probe.moments()
+    want = (cfg.num_layers, cfg.num_heads, cfg.head_dim, cfg.head_dim)
+    assert c_u.shape == want and c_v.shape == want
+    for moment in (c_u, c_v):
+        assert torch.isfinite(moment).all()
+        # Outer products of real feature vectors: symmetric PSD.
+        torch.testing.assert_close(moment, moment.transpose(-1, -2),
+                                   rtol=1e-5, atol=1e-6)
+        values = torch.linalg.eigvalsh(moment[0, 0].double())
+        assert float(values.min()) > -1e-8
+    # E[q^2] is non-negative, so its second moment has a positive diagonal.
+    assert float(c_u[0, 0].diagonal().min()) > 0.0
+    # And the moments drive the initialization without further massaging.
+    pred = veda_predictor.TileScorePredictor(cfg.num_layers, cfg.num_heads,
+                                            cfg.head_dim,
+                                            second_order_rank=4)
+    pred.init_low_rank_second_order_(c_u, c_v)
+    assert torch.isfinite(pred.layers[0].so_q).all()
+    assert float(pred.layers[0].so_q.abs().max()) > 0.0

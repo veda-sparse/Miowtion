@@ -248,3 +248,36 @@ def test_fa4_block_sparse_backward_matches_reference():
             f'd{name} is as close to the dense gradient ({dense_err:.3e}) as '
             f'to the sparse one ({sparse_err:.3e}): the block pattern was '
             'likely ignored')
+
+
+@pytest.mark.skipif(not tile_gather_triton.available(), reason='needs triton')
+def test_fused_second_moments_match_the_reference_pooling():
+    """The fused kernel computes both second moments in registers.
+
+    The centred variance is the one that matters: pooling it afterwards
+    needs the mean first, so it reads the tile-ordered rows a second time,
+    while inside the kernel the tile is already there. This pins the fused
+    result against predictor.pool_tiles.
+    """
+    from miowtion.veda import predictor as veda_predictor
+    lay = _layout()
+    q, _, _ = _qkv(lay.seq_len)
+    heads = torch.arange(4, device='cuda')
+    rows, feats, sq, var = tile_gather_triton.gather_and_pool(
+        q, lay, heads, second=True)
+    tiles = tiling.gather_tiles(q, lay, heads)
+    assert torch.equal(rows, tiles)
+    torch.testing.assert_close(feats,
+                               veda_predictor.pool_tiles(tiles, lay),
+                               rtol=1e-4, atol=1e-5)
+    torch.testing.assert_close(
+        sq, veda_predictor.pool_tiles(tiles, lay,
+                                      veda_predictor.SECOND_RAW),
+        rtol=1e-4, atol=1e-5)
+    torch.testing.assert_close(
+        var, veda_predictor.pool_tiles(tiles, lay,
+                                       veda_predictor.SECOND_CENTRAL),
+        rtol=1e-3, atol=1e-5)
+    # Empty tiles stay zero, as the three base features already do.
+    assert torch.isfinite(sq).all() and torch.isfinite(var).all()
+    assert torch.all(var >= 0.0)

@@ -470,16 +470,46 @@ def test_extra_features_are_empty_for_a_plain_predictor():
             target_budget=veda_mask.Budget(ratio=1.0)), torch.device('cpu'))
     tl = clip.get(tiling.TileShape(4, 4, 8))
     heads = torch.arange(4)
-    tiles = tiling.gather_tiles(q, tl, heads)
     plain = veda_predictor.TileScorePredictor(1, 4, 32)
-    assert veda_attention._extra_features(plain, tiles, tiles, tl) == {}
+    assert veda_attention._extra_features(plain, tl, None, None) == {}
     fancy = veda_predictor.TileScorePredictor(1, 4, 32,
                                               second_order_rank=8,
                                               count_term=True)
-    extra = veda_attention._extra_features(fancy, tiles, tiles, tl)
+    _, _, sq = veda_attention._gather_and_pool(
+        q, tl, heads, veda_predictor.SECOND_RAW)
+    _, _, var = veda_attention._gather_and_pool(
+        q, tl, heads, veda_predictor.SECOND_CENTRAL)
+    extra = veda_attention._extra_features(fancy, tl, sq, var)
     assert sorted(extra) == ['log_count', 'sq_q', 'var_k']
     assert extra['log_count'].shape == (tl.n_tiles,)
     rows = torch.tensor([0, 2])
-    sliced = veda_attention._extra_features(fancy, tiles, tiles, tl, rows)
+    sliced = veda_attention._extra_features(fancy, tl, sq, var, rows)
     assert sliced['sq_q'].shape[1] == 2
     assert sliced['var_k'].shape[1] == tl.n_tiles
+    with pytest.raises(ValueError, match='needs the pooled'):
+        veda_attention._extra_features(fancy, tl, None, None)
+
+
+def test_gather_and_pool_second_moments_match_pool_tiles():
+    """The fused path and the reference pooling must agree."""
+    from miowtion.h3 import geometry
+    from miowtion.h3 import layout as h3_layout
+    geo = geometry.Geometry('16:9', 512, 256, 39, 12, 16, 32, 20)
+    lay = h3_layout.pack(torch.ones(300, dtype=torch.long), geo)
+    q, _, _ = (t.float() for t in _qkv(lay.seq_len, heads=4))
+    clip = veda_attention.ClipTiling(
+        lay, veda_attention.VedaConfig(
+            target_budget=veda_mask.Budget(ratio=1.0)), torch.device('cpu'))
+    tl = clip.get(tiling.TileShape(4, 4, 8))
+    heads = torch.arange(4)
+    tiles = tiling.gather_tiles(q, tl, heads)
+    for which in (veda_predictor.SECOND_RAW, veda_predictor.SECOND_CENTRAL):
+        rows, feats, moment = veda_attention._gather_and_pool(
+            q, tl, heads, which)
+        assert torch.equal(rows, tiles)
+        torch.testing.assert_close(
+            feats, veda_predictor.pool_tiles(tiles, tl), rtol=1e-5,
+            atol=1e-6)
+        torch.testing.assert_close(
+            moment, veda_predictor.pool_tiles(tiles, tl, which), rtol=1e-5,
+            atol=1e-6)

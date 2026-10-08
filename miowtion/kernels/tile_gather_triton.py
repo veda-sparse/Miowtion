@@ -56,10 +56,11 @@ def _kernels():
 
     @triton.jit
     def gather_kernel(x_ptr, index_ptr, valid_ptr, heads_ptr, out_ptr,
-                      feats_ptr, count_ptr, stride_xn, stride_xh,
-                      stride_on, stride_oh, stride_fh, stride_fn,
+                      feats_ptr, count_ptr, sq_ptr, var_ptr, stride_xn,
+                      stride_xh, stride_on, stride_oh, stride_fh,
+                      stride_fn, stride_sh, stride_sn,
                       HEAD_DIM: tl.constexpr, TILE: tl.constexpr,
-                      POOL: tl.constexpr):
+                      POOL: tl.constexpr, SECOND: tl.constexpr):
         tile = tl.program_id(0)
         h = tl.program_id(1)
         head = tl.load(heads_ptr + h)
@@ -82,6 +83,20 @@ def _kernels():
             tl.store(base + dims, tl.where(empty, 0.0, mean))
             tl.store(base + HEAD_DIM + dims, tl.where(empty, 0.0, tmax))
             tl.store(base + 2 * HEAD_DIM + dims, tl.where(empty, 0.0, tmin))
+            if SECOND:
+                # The tile is already in registers, so both second moments
+                # are free of memory traffic -- including the *centred*
+                # variance, which needs the mean and would otherwise be a
+                # second pass. The one-pass identity is not an option
+                # here: see predictor._second_moment.
+                denom = tl.maximum(count, 1).to(tl.float32)
+                sq = tl.sum(xf * xf, axis=0) / denom
+                centred = tl.where(valid[:, None], xf - mean[None, :], 0.0)
+                var = tl.sum(centred * centred, axis=0) / denom
+                sq_base = sq_ptr + h * stride_sh + tile * stride_sn
+                var_base = var_ptr + h * stride_sh + tile * stride_sn
+                tl.store(sq_base + dims, tl.where(empty, 0.0, sq))
+                tl.store(var_base + dims, tl.where(empty, 0.0, var))
 
     @triton.jit
     def scatter_kernel(tiled_ptr, index_ptr, valid_ptr, heads_ptr, out_ptr,
@@ -120,17 +135,28 @@ def gather_tiles(x: torch.Tensor, layout: tiling.TileLayout,
 
 
 def gather_and_pool(x: torch.Tensor, layout: tiling.TileLayout,
-                    heads: torch.Tensor | None
-                    ) -> tuple[torch.Tensor, torch.Tensor]:
+                    heads: torch.Tensor | None, second: bool = False
+                    ) -> tuple:
     """tiling.gather_tiles and predictor.pool_tiles in one pass.
 
+    Args:
+        x: [S, H, D] packed rows.
+        layout: Tile layout.
+        heads: Heads to gather, or None for all of them.
+        second: Also return E[x^2] and the centred Var(x), which the
+            predictor's second-cumulant head needs. They are free here:
+            the tile is already in registers, so even the centred variance
+            costs no extra memory traffic, where pooling it afterwards
+            reads the tile-ordered rows twice more.
+
     Returns:
-        ([N, H', D] tile-ordered rows, [H', n_tiles, 3D] fp32 features).
+        ([N, H', D] rows, [H', n_tiles, 3D] fp32 features), plus
+        ([H', n_tiles, D], [H', n_tiles, D]) when `second`.
     """
-    return _gather(x, layout, heads, pool=True)
+    return _gather(x, layout, heads, pool=True, second=second)
 
 
-def _gather(x, layout, heads, pool):
+def _gather(x, layout, heads, pool, second=False):
     _check(x)
     heads = _heads(x, heads)
     num_heads, dim = heads.numel(), x.shape[-1]
@@ -139,14 +165,23 @@ def _gather(x, layout, heads, pool):
     feats = (torch.empty(num_heads, layout.n_tiles, 3 * dim,
                          dtype=torch.float32, device=x.device)
              if pool else out)
+
+    def moment():
+        return torch.empty(num_heads, layout.n_tiles, dim,
+                           dtype=torch.float32, device=x.device)
+
+    sq, var = (moment(), moment()) if second else (out, out)
     gather_kernel, _ = _kernels()
     gather_kernel[(layout.n_tiles, num_heads)](
         x, layout.gather_index, layout.slot_valid, heads, out, feats,
-        layout.valid_count, x.stride(0), x.stride(1), out.stride(0),
+        layout.valid_count, sq, var, x.stride(0), x.stride(1), out.stride(0),
         out.stride(1), feats.stride(0) if pool else 0,
-        feats.stride(1) if pool else 0, HEAD_DIM=dim, TILE=_TILE, POOL=pool,
-        num_warps=4)
-    return out, (feats if pool else None)
+        feats.stride(1) if pool else 0, sq.stride(0) if second else 0,
+        sq.stride(1) if second else 0, HEAD_DIM=dim, TILE=_TILE, POOL=pool,
+        SECOND=second, num_warps=4)
+    if not pool:
+        return out, None
+    return (out, feats, sq, var) if second else (out, feats)
 
 
 def scatter_tiles_(out: torch.Tensor, tiled: torch.Tensor,

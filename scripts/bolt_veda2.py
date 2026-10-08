@@ -55,6 +55,16 @@ def main():
                         'different spread, so this has to be re-fit')
     parser.add_argument('--count-scale', type=float, default=1.0,
                         help='multiplier on the log B_j gain, same reason')
+    parser.add_argument('--second-order-rank', type=int, default=None,
+                        help='rank of the second-order head; the default '
+                        'is head_dim, the only rank with a closed-form '
+                        'initialization. Any smaller rank needs --moments, '
+                        'and costs rank/head_dim of the n^2 term instead '
+                        'of doubling it')
+    parser.add_argument('--moments', default=None,
+                        help='calibration moments from '
+                        "'ablate_sol.py --second-moments', required for a "
+                        'rank below head_dim')
     args = parser.parse_args()
 
     source = veda_bundle.load(args.source)
@@ -64,11 +74,18 @@ def main():
     head_dim = int(meta['head_dim'])
     if source.predictor.second_order_rank or source.predictor.count_term:
         raise ValueError(f'{args.source} already carries the Veda2 terms')
-    rank = 0 if args.no_second_order else head_dim
+    rank = 0 if args.no_second_order else (args.second_order_rank
+                                           if args.second_order_rank
+                                           is not None else head_dim)
+    if 0 < rank < head_dim and not args.moments:
+        raise ValueError(f'rank {rank} < head_dim {head_dim} needs '
+                         '--moments; only full rank has a closed form')
     count = not args.no_count_term
+    fitted = bool(args.moments) or rank not in (0, head_dim)
     progress.log(f'bolting onto {layers} layers x {heads} heads x '
                  f'{head_dim}: second_order_rank {rank}, count_term '
-                 f'{count}, base {args.base}')
+                 f'{count}, base {args.base}, '
+                 f'second-order init {"fitted" if fitted else "exact"}')
 
     target = veda_predictor.TileScorePredictor(
         layers, heads, head_dim, second_order_rank=rank, count_term=count)
@@ -84,8 +101,14 @@ def main():
             expected.add(f'layers.{i}.count_gain')
     if set(missing) != expected:
         raise ValueError(f'unexpected missing keys: {sorted(missing)}')
-    if rank:
+    if rank and not fitted:
         target.init_exact_second_order_()
+    elif rank:
+        moments = torch.load(args.moments, map_location='cpu')
+        progress.log(f"moments from {args.moments}: "
+                     f"{moments.get('geometry')}, clips "
+                     f"{moments.get('clips')}")
+        target.init_low_rank_second_order_(moments['c_u'], moments['c_v'])
     if args.base == 'reset':
         with torch.no_grad():
             for layer in target.layers:

@@ -133,50 +133,74 @@ def _gather(x: torch.Tensor, tile_layout: tiling.TileLayout,
 
 
 def _gather_and_pool(x: torch.Tensor, tile_layout: tiling.TileLayout,
-                     heads: torch.Tensor
-                     ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Tile-ordered rows and predictor features (one fused pass on CUDA)."""
+                     heads: torch.Tensor, second: str | None = None
+                     ) -> tuple:
+    """Tile-ordered rows and predictor features (one fused pass on CUDA).
+
+    Args:
+        x: [S, H, D] packed rows.
+        tile_layout: Tile layout.
+        heads: Heads to gather.
+        second: Also return the second moment the predictor's extra head
+            needs on this side: `predictor.SECOND_RAW` for the query side,
+            `SECOND_CENTRAL` for the key side, None for neither.
+
+    Returns:
+        (rows, features), plus the second moment when asked.
+    """
+    if second is None:
+        if _fused(x):
+            return tile_gather_triton.gather_and_pool(x, tile_layout, heads)
+        tiles = tiling.gather_tiles(x, tile_layout, heads)
+        return tiles, veda_predictor.pool_tiles(tiles, tile_layout)
     if _fused(x):
-        return tile_gather_triton.gather_and_pool(x, tile_layout, heads)
+        tiles, feats, sq, var = tile_gather_triton.gather_and_pool(
+            x, tile_layout, heads, second=True)
+        return tiles, feats, (sq if second == veda_predictor.SECOND_RAW
+                              else var)
     tiles = tiling.gather_tiles(x, tile_layout, heads)
-    return tiles, veda_predictor.pool_tiles(tiles, tile_layout)
+    return (tiles, veda_predictor.pool_tiles(tiles, tile_layout),
+            veda_predictor.pool_tiles(tiles, tile_layout, second))
 
 
 def _extra_features(predictor: veda_predictor.TileScorePredictor,
-                    q_tiles: torch.Tensor, k_tiles: torch.Tensor,
                     tile_layout: tiling.TileLayout,
+                    sq_q: torch.Tensor | None,
+                    var_k: torch.Tensor | None,
                     rows: torch.Tensor | None = None) -> dict:
     """Inputs the predictor's optional score terms need, as kwargs.
 
-    `_gather_and_pool` only produces [mean|max|min], because that is what
-    the fused gather kernel writes. The second-cumulant head additionally
-    wants E[q^2] and Var(k), which are pooled here from the tile-ordered
-    rows that were gathered anyway, and the log B_j term wants nothing but
-    the layout. Returns {} for a plain predictor, so the call site is the
+    The second moments come from `_gather_and_pool`, which computes them
+    inside the fused gather kernel. The log B_j term wants nothing but the
+    layout. Returns {} for a plain predictor, so the call site reads the
     same either way.
 
     Args:
         predictor: The predictor about to be called.
-        q_tiles: [N, H', D] tile-ordered queries.
-        k_tiles: [N, H', D] tile-ordered keys.
-        tile_layout: Their layout.
+        tile_layout: Layout of the gathered tiles.
+        sq_q: [H', n_tiles, D] pooled E[q^2], or None.
+        var_k: [H', n_tiles, D] pooled Var(k), or None.
         rows: Query tiles the logits are restricted to, if any; the query
-            side features are sliced to match.
+            side is sliced to match.
 
     Returns:
         Keyword arguments for `LayerPredictor.forward`.
+
+    Raises:
+        ValueError: If the predictor wants a second moment and none came.
     """
     extra: dict = {}
     if predictor.count_term:
         extra['log_count'] = torch.log(
             tile_layout.valid_count.clamp(min=1).to(torch.float32))
     if predictor.second_order_rank:
-        sq_q = veda_predictor.pool_tiles(q_tiles, tile_layout,
-                                         veda_predictor.SECOND_RAW)
+        if sq_q is None or var_k is None:
+            raise ValueError('the second-order head needs the pooled '
+                             'second moments; gather with second=...')
         extra['sq_q'] = sq_q if rows is None else sq_q[:, rows]
-        extra['var_k'] = veda_predictor.pool_tiles(
-            k_tiles, tile_layout, veda_predictor.SECOND_CENTRAL)
+        extra['var_k'] = var_k
     return extra
+
 
 
 def _scatter_(out: torch.Tensor, tiled: torch.Tensor,
@@ -290,13 +314,20 @@ class TeacherCollector:
             # each at 103k tokens) would not fit next to the trunk.
             for heads in group.heads.split(
                     _chunk_heads(tile_layout, self.clip.config.collect_bytes)):
-                q_tiles, feats_q = _gather_and_pool(q, tile_layout, heads)
-                k_tiles, feats_k = _gather_and_pool(k, tile_layout, heads)
+                want = self.predictor.second_order_rank
+                q_tiles, feats_q, sq_q = (
+                    _gather_and_pool(q, tile_layout, heads,
+                                     veda_predictor.SECOND_RAW) if want
+                    else (*_gather_and_pool(q, tile_layout, heads), None))
+                k_tiles, feats_k, var_k = (
+                    _gather_and_pool(k, tile_layout, heads,
+                                     veda_predictor.SECOND_CENTRAL) if want
+                    else (*_gather_and_pool(k, tile_layout, heads), None))
                 heat = heatmap.teacher_heat(
                     q_tiles, k_tiles, _gather_lse(lse, tile_layout, heads),
                     tile_layout, rows)
-                extra = _extra_features(self.predictor, q_tiles, k_tiles,
-                                        tile_layout, rows)
+                extra = _extra_features(self.predictor, tile_layout, sq_q,
+                                        var_k, rows)
                 del q_tiles, k_tiles
                 weight = heads.numel() / self._num_heads
                 with torch.enable_grad():
@@ -388,14 +419,21 @@ class SparseStudent:
                 tile_layout: tiling.TileLayout, heads: torch.Tensor,
                 out: torch.Tensor) -> None:
         """Sparse attention of some heads of one group, scattered to out."""
-        q_tiles, feats_q = _gather_and_pool(q, tile_layout, heads)
-        k_tiles, feats_k = _gather_and_pool(k, tile_layout, heads)
+        want = self.predictor.second_order_rank
+        q_tiles, feats_q, sq_q = (
+            _gather_and_pool(q, tile_layout, heads,
+                             veda_predictor.SECOND_RAW) if want
+            else (*_gather_and_pool(q, tile_layout, heads), None))
+        k_tiles, feats_k, var_k = (
+            _gather_and_pool(k, tile_layout, heads,
+                             veda_predictor.SECOND_CENTRAL) if want
+            else (*_gather_and_pool(k, tile_layout, heads), None))
         v_tiles = _gather(v, tile_layout, heads)
         with torch.no_grad():
             logits = self.predictor.layers[layer_index](
                 feats_q, feats_k, heads,
-                **_extra_features(self.predictor, q_tiles, k_tiles,
-                                  tile_layout))
+                **_extra_features(self.predictor, tile_layout, sq_q,
+                                  var_k))
             # Only video query tiles are selected; global rows are dense.
             selection = veda_mask.select_video_blocks(
                 logits[:, :tile_layout.n_video_tiles], tile_layout,

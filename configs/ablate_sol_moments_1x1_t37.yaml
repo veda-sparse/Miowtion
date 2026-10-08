@@ -1,0 +1,25 @@
+# Calibration moments for the low-rank second-order head. One clip is
+# enough: the moments are second moments of pooled features over every
+# tile, so a single rollout already averages thousands of tiles per head.
+# Uses the released bundle's plans, so the subspace is fitted on the tile
+# shapes the head will actually serve.
+run_name: sol_moments_1x1_t37
+checkpoint_root: weights/MiniMax-H3
+sample_cache: artifacts/samples/moviegen_holdout20
+geometries: ['1:1@37']
+variant: FL2VA
+tasks: [t2va]
+num_clips: 1
+steps: [0, 3, 7]
+schedule: turbo
+num_steps: 8
+teacher_adapter: weights/turbo_lora/minimax_h3_turbo_v4_step600_ema.safetensors
+predictors:
+  - veda1_trained=weights/veda/Minimax-H3-T2VA-Veda-8NFE-600Step-Preview/minimax_h3_t2va_veda_8nfe_600step_preview_fp8.safetensors
+tile_shape: 4x4x8
+densities: [0.05]
+query_tiles: 16
+out_dir: runs
+offload_blocks: 30
+prefetch: 1
+mlp_chunk_rows: 8192
