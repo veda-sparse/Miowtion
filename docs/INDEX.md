@@ -13,6 +13,7 @@
 | [features/training.md](features/training.md) | FSDP2 训练框架：阶段 1/2、少步 LoRA 教师、AdaLN 表、数据、checkpoint | 阶段 1 已在 2×4090 真实权重上跑通；阶段 2 待 GPU 验证 |
 | [features/prompt_expansion.md](features/prompt_expansion.md) | prompt 扩写：短 prompt → H3 T2VA 结构化 prompt（DeepSeek；system prompt 由 H3 skill 拼成；校验 + repair 重试） | CPU 测试通过；MovieGenVideoBench 全量 1003 条已扩写并发布到 `data/prompts/` |
 | [features/evaluation.md](features/evaluation.md) | 评测集与评测流程 v1：固定的 20 条 holdout（3 种时长 × 4 种纵横比）、数值评测（打分器 recall / heat_kept）与人眼对比（每路单独视频 + 拼接视频）的跑法、成本与已有基线 | v1 已在 1×RTX PRO 6000 上用于数值对比；v1 与 OpenVDN 16 条的拼接视频已生成，待人工确认 |
+| [features/two_stage_inference.md](features/two_stage_inference.md) | 社区双采 / 分块工作流（selflift-Avatar、YCNodes）的实际参数与调用方式，以及它们给 Veda 方案选择带来的约束 | 读源码确认；GPU 未实跑 |
 | [features/inference.md](features/inference.md) | 推理：少步 LoRA 教师 + Veda 稀疏，稠密 / 稀疏并排对比，VAE 解码与 mp4 | 实现中，4090 上首次生成 |
 | [features/mlx_inference.md](features/mlx_inference.md) | Apple silicon 推理：MLX block 前向、Veda 块稀疏（gather 版）、NVMe offloading（slab / mx.load / mmap）、视频 VAE 的 MLX 解码、实测 I/O 与算力 | 可行性研究 + 原型；CPU 测试通过，合成权重实测，真实权重待验证 |
 | [features/quant_scoring.md](features/quant_scoring.md) | 低精度块打分：fp8 / nvfp4 / mx 的 fake quant（含 smooth-K）与 top-k 选择误差探针；打分器 bundle 的 bf16 / fp8 存储精度对比 | CPU 测试通过；GPU 实测进行中 |
