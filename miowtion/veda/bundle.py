@@ -42,6 +42,7 @@ from safetensors.torch import save_file
 from miowtion.h3 import geometry as h3_geometry
 from miowtion.veda import plan as veda_plan
 from miowtion.veda import predictor as veda_predictor
+from miowtion.veda import mask as veda_mask
 from miowtion.veda import tiling
 
 FORMAT = 'miowtion-veda-predictor-v1'
@@ -99,20 +100,58 @@ class Bundle:
     Attributes:
         predictor: The predictor, on the requested device, in eval mode.
         plans: Tile plans the predictor was trained against.
-        keep_ratio: Keep ratio the run trained with; a default for
-            inference, not a constraint.
+        target_budget: Target/current visual block budget used in training.
+        ref_budget: Reference visual block budget, when references are tiled.
+        tile_conditions: Whether visual references are tiled instead of
+            staying in the dense global block.
+        keep_ratio: Legacy alias for a ratio target budget; None for an
+            absolute-tile target budget.
         metadata: The file's raw string metadata (provenance).
     """
 
     predictor: veda_predictor.TileScorePredictor
     plans: veda_plan.PlanTable
-    keep_ratio: float
+    target_budget: veda_mask.Budget
+    ref_budget: veda_mask.Budget | None
+    tile_conditions: bool
+    keep_ratio: float | None
     metadata: dict[str, str]
+
+
+def _budget_metadata(prefix: str, ratio: float | None,
+                     tiles: float | None) -> dict[str, str]:
+    if (ratio is None) == (tiles is None):
+        raise ValueError(f'set exactly one of {prefix}_ratio / {prefix}_tiles')
+    if tiles is not None:
+        veda_mask.Budget(tiles=tiles)
+        return {f'{prefix}_budget_kind': 'tiles',
+                f'{prefix}_budget_value': repr(float(tiles))}
+    veda_mask.Budget(ratio=ratio)
+    return {f'{prefix}_budget_kind': 'ratio',
+            f'{prefix}_budget_value': repr(float(ratio))}
+
+
+def _read_budget(metadata: dict[str, str], prefix: str,
+                 *, legacy_ratio: str | None = None
+                 ) -> veda_mask.Budget | None:
+    kind = metadata.get(f'{prefix}_budget_kind')
+    value = metadata.get(f'{prefix}_budget_value')
+    if kind is None:
+        return (veda_mask.Budget(ratio=float(metadata[legacy_ratio]))
+                if legacy_ratio and legacy_ratio in metadata else None)
+    if kind not in ('ratio', 'tiles') or value is None:
+        raise ValueError(f'invalid {prefix} budget metadata: kind={kind!r}, '
+                         f'value={value!r}')
+    return veda_mask.Budget(**{kind: float(value)})
 
 
 def save(path: str, weights: dict[str, torch.Tensor],
          plans: veda_plan.PlanTable, *, num_layers: int, num_heads: int,
-         head_dim: int, keep_ratio: float, source: str,
+         head_dim: int, keep_ratio: float | None = None,
+         keep_tiles: float | None = None,
+         ref_keep_ratio: float | None = None,
+         ref_keep_tiles: float | None = None,
+         tile_conditions: bool = False, source: str,
          source_weights: str, step: int,
          dtype: torch.dtype = torch.bfloat16) -> None:
     """Writes a bundle.
@@ -125,7 +164,9 @@ def save(path: str, weights: dict[str, torch.Tensor],
         num_layers: Layers the predictor was built with.
         num_heads: Heads per layer.
         head_dim: Head dimension.
-        keep_ratio: Keep ratio the run trained with.
+        keep_ratio / keep_tiles: Target/current budget used in training.
+        ref_keep_ratio / ref_keep_tiles: Independent reference budget.
+        tile_conditions: Whether visual references were tiled in training.
         source: Checkpoint directory the weights came from (provenance).
         source_weights: 'live' or 'ema' (which of the two was exported).
         step: Training update the checkpoint was written at.
@@ -137,6 +178,16 @@ def save(path: str, weights: dict[str, torch.Tensor],
     """
     if not weights:
         raise ValueError('no predictor weights to save')
+    target_metadata = _budget_metadata('target', keep_ratio, keep_tiles)
+    if (ref_keep_ratio is not None or ref_keep_tiles is not None):
+        if not tile_conditions:
+            raise ValueError('a reference budget requires tile_conditions')
+        ref_metadata = _budget_metadata(
+            'ref', ref_keep_ratio, ref_keep_tiles)
+    else:
+        if tile_conditions:
+            raise ValueError('tile_conditions requires a reference budget')
+        ref_metadata = {}
     names = {v: k for k, v in DTYPES.items()}
     if dtype not in names:
         raise ValueError(f'unsupported storage dtype {dtype}; '
@@ -162,13 +213,18 @@ def save(path: str, weights: dict[str, torch.Tensor],
         'num_heads': str(num_heads),
         'head_dim': str(head_dim),
         'dtype': names[dtype],
-        'keep_ratio': repr(float(keep_ratio)),
+        'tile_conditions': str(bool(tile_conditions)).lower(),
         'source': source,
         'source_weights': source_weights,
         'step': str(step),
         'plans': json.dumps({name: p.to_json()
                              for name, p in sorted(plans.plans.items())}),
     }
+    metadata.update(target_metadata)
+    metadata.update(ref_metadata)
+    # Older readers understand ratio-only bundles through this key.
+    if keep_ratio is not None:
+        metadata['keep_ratio'] = repr(float(keep_ratio))
     save_file(tensors, path, metadata=metadata)
 
 
@@ -242,9 +298,19 @@ def load(path: str, device: torch.device | str = 'cpu') -> Bundle:
     plans = veda_plan.PlanTable(
         [veda_plan.TilePlan.from_json(p)
          for p in json.loads(metadata['plans']).values()])
-    return Bundle(predictor=model.to(device).eval(), plans=plans,
-                  keep_ratio=float(metadata['keep_ratio']),
-                  metadata=metadata)
+    target_budget = _read_budget(metadata, 'target',
+                                 legacy_ratio='keep_ratio')
+    if target_budget is None:
+        raise ValueError(f'{path}: bundle has no target budget')
+    ref_budget = _read_budget(metadata, 'ref')
+    tile_conditions = metadata.get('tile_conditions', 'false') == 'true'
+    if tile_conditions and ref_budget is None:
+        raise ValueError(f'{path}: tiled references need a ref budget')
+    return Bundle(
+        predictor=model.to(device).eval(), plans=plans,
+        target_budget=target_budget, ref_budget=ref_budget,
+        tile_conditions=tile_conditions,
+        keep_ratio=target_budget.ratio, metadata=metadata)
 
 
 def random_bundle(num_layers: int, num_heads: int, head_dim: int,
@@ -274,6 +340,9 @@ def random_bundle(num_layers: int, num_heads: int, head_dim: int,
         veda_plan.TilePlan.uniform(
             g, tiling.least_padding_shape(g.video_grid), num_layers,
             num_heads) for g in geometries])
+    target_budget = veda_mask.Budget(ratio=keep_ratio)
     return Bundle(predictor=predictor.to(device, torch.bfloat16).eval(),
-                  plans=plans, keep_ratio=keep_ratio,
+                  plans=plans, target_budget=target_budget,
+                  ref_budget=None, tile_conditions=False,
+                  keep_ratio=keep_ratio,
                   metadata={'source': 'random', 'seed': str(seed)})

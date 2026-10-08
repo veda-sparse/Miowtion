@@ -2,7 +2,7 @@
 
 | 依赖 | 方式 | 锁定版本 | 用途 | 我们依赖的内部接口 |
 |---|---|---|---|---|
-| MiniMax-H3（GitHub 仓库） | git submodule `third_party/MiniMax-H3`，浅克隆 | `d21241f` | config、tokenizer/processor、VAE 代码、prompt-writing skill | `FL2VA/transformer/config.json` 的键名；`model_index.json` 中的 `_minimax_h3.sigma_shift_scales`；`video_vae.minimax_h3_video_vae.MiniMaxH3VideoVAE`（`encode_images`/`encode_videos`） |
+| MiniMax-H3（GitHub 仓库） | git submodule `third_party/MiniMax-H3`，浅克隆 | `d21241f` | config、tokenizer/processor、VAE 代码、prompt-writing skill | `FL2VA/transformer/config.json` 的键名；`model_index.json` 中的 `_minimax_h3.sigma_shift_scales`；`video_vae.minimax_h3_video_vae.MiniMaxH3VideoVAE`（`encode_images`/`encode_videos`）；AudioVAE posterior-mean 编码 |
 | MiniMax-H3 权重（HF `MiniMaxAI/MiniMax-H3`） | `hf download`，不进 git | revision `42ed227` | DiT（FL2VA / Ref2VA）、text encoder、VAE | 原始（非 diffusers）格式的 key 与 dtype；融合 QKV 按头交错 |
 | MiniMax-H3 Turbo LoRA（HF `larryvrh/MiniMax-H3-Turbo-Lora`） | `hf download`，不进 git | revision `43a7455`；推荐 `minimax_h3_turbo_v4_step600_ema.safetensors` | 少步（4/8 步）教师：合并进冻结 trunk | key 为 `<module>.lora_A/B.weight`，模块名与发布 checkpoint 一致（含 `blocks.N.adaln_proj.linear`、token refiner、final_layer AdaLN）；qkv 为 [q;k;v]、fc1 为 [gate;up]（与 ComfyUI 版 H3 一致）；`W_eff = W + B@A`，alpha=rank |
 | torch | pip | ≥2.8（已验证 2.14+cu126） | 全部 | FSDP2 `fully_shard(ignored_params=…)`、`CPUOffloadPolicy`、`set_modules_to_forward_prefetch`；`torch.distributed.tensor._utils.compute_local_shape_and_global_offset`；`aten._scaled_dot_product_flash_attention`（取 LSE） |
@@ -35,11 +35,18 @@ pip install imageio-ffmpeg && cp "$(python -c 'import imageio_ffmpeg;print(image
   torch 2.14.0+cu130 对应 torchvision 0.29.0+cu130，装完立刻
   `import torchvision; from torchvision.transforms import Normalize` 验证。
   只有发布版 video VAE 用到它（`Normalize`）。
-- **不必为 t2va 装图像栈**：`train.encode.TextEncoder` 的 processor 是惰性的，纯文本
-  编码不需要 pillow / torchvision（见 [h3_model](features/h3_model.md)）。解码需要。
+- **不必为纯文本输入装图像栈**：文本编码器的 processor 是惰性的，纯文本编码不需要
+  pillow / torchvision。图像、视频输入和解码需要。
 - **去噪的结果不会丢**：`scripts/generate.py` 每条片子都把 latent 存成
   `<mode>_latents.pt`，所以解码挂了用 `--decode-only` 续，不用重新去噪。
 
 仅用于测速对照、不参与训练的第三方代码（不进仓库）：FastVideo
 fastvideo-kernel（d995516）、SageAttention（d1a57a5）、SpargeAttn（ae5b629）、NVlabs/Sana sol-engine
 （Sol-Attn）。
+
+## Ref2VA 编码与官方示例
+
+编码复用 MiniMax-H3 的 Qwen3-VL 与 Visual/Audio VAE；不会调用托管 PE API。
+视频输入需要 ffmpeg，官方示例准备还需要 ffprobe。音轨提取为 32 kHz 双声道，
+并在 JSONL 中显式列为 audio reference。示例请求固定到 MiniMax-H3 submodule
+的 `d21241f0a4b3acbb34c97dae47fa417b7065e438`，解析 JSON 数据而不执行上游 shell。

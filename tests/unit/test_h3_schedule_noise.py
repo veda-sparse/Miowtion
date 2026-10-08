@@ -86,3 +86,21 @@ def test_visual_condition_augmentation():
     assert torch.equal(out[8:], expected_second)
     with pytest.raises(ValueError):
         noise.augment_visual_conditions(clean[:5], shapes, 7, 3)
+
+
+def test_reference_longer_than_target_is_not_truncated():
+    shapes = ((1, 4, 8), (62, 4, 8))
+    clean = torch.arange(63 * 8 * 96, dtype=torch.float32).view(-1, 96)
+    got = noise.augment_visual_conditions(clean, shapes, 37, 19)
+    expected = []
+    offset = 0
+    ratio = torch.tensor(schedule.VISUAL_COND_TIMESTEP)
+    for t, h, w in shapes:
+        generator = torch.Generator().manual_seed(19)
+        raw = torch.randn(1, 24, max(39, t), h, w, generator=generator)
+        rows = noise.patchify(raw[:, :, :t])
+        expected.append(ratio * clean[offset:offset + len(rows)] +
+                        (1 - ratio) * rows)
+        offset += len(rows)
+    assert torch.equal(got, torch.cat(expected))
+    assert got.shape == clean.shape

@@ -26,6 +26,8 @@ def _rotate_half(x):
 
 
 @pytest.mark.parametrize('heads,rope_dim', [(56, 96), (5, 96), (4, 128)])
+@pytest.mark.skipif(not elementwise_triton.available(),
+                    reason='Triton exact math options unavailable')
 def test_rope_is_bitwise_eager(heads, rope_dim):
     x = _bf16(333, heads, 128, seed=1, scale=3.0)
     cos, sin = _bf16(333, 1, rope_dim, seed=2), _bf16(333, 1, rope_dim,
@@ -37,6 +39,8 @@ def test_rope_is_bitwise_eager(heads, rope_dim):
 
 
 @pytest.mark.parametrize('cols', [5376, 1000, 2048])
+@pytest.mark.skipif(not elementwise_triton.available(),
+                    reason='Triton exact math options unavailable')
 def test_modulate_and_gated_residual_are_bitwise_eager(cols):
     x, h = _bf16(517, cols, seed=1, scale=4.0), _bf16(517, cols, seed=2)
     scale, shift = _bf16(3, cols, seed=3), _bf16(3, cols, seed=4)
@@ -52,6 +56,8 @@ def test_modulate_and_gated_residual_are_bitwise_eager(cols):
         x + gate.index_select(0, index) * h)
 
 
+@pytest.mark.skipif(not elementwise_triton.available(),
+                    reason='Triton exact math options unavailable')
 def test_swiglu_on_strided_fc1_halves_is_bitwise_eager():
     fc1 = _bf16(300, 2 * 3000, seed=1, scale=4.0)
     gate, up = fc1.chunk(2, dim=-1)
@@ -59,6 +65,8 @@ def test_swiglu_on_strided_fc1_halves_is_bitwise_eager():
                        F.silu(gate) * up)
 
 
+@pytest.mark.skipif(not elementwise_triton.available(),
+                    reason='Triton exact math options unavailable')
 def test_silu_over_every_bf16_value():
     bits = torch.arange(-2**15, 2**15, dtype=torch.int32).to(torch.int16)
     gate = bits.view(torch.bfloat16).cuda()[None, :]
@@ -69,6 +77,8 @@ def test_silu_over_every_bf16_value():
     assert torch.equal(got[finite], expected[finite])
 
 
+@pytest.mark.skipif(not elementwise_triton.available(),
+                    reason='Triton exact math options unavailable')
 def test_block_forward_is_bitwise_eager(monkeypatch):
     cfg = h3_config.H3Config.tiny(num_layers=2, num_heads=4)
     torch.manual_seed(0)
@@ -104,4 +114,4 @@ def test_gradients_keep_the_eager_path():
     x = _bf16(4, 64).requires_grad_()
     assert not h3_model._fused(x)  # pylint: disable=protected-access
     with torch.no_grad():
-        assert h3_model._fused(x)  # pylint: disable=protected-access
+        assert h3_model._fused(x) == elementwise_triton.available()  # pylint: disable=protected-access

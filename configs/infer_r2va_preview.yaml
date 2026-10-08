@@ -1,0 +1,22 @@
+# Official MiniMax-H3 Ref2VA example with the R2VA preview predictor.
+root: weights/MiniMax-H3
+variant: Ref2VA
+schedule: turbo
+num_steps: 8
+adapter: weights/turbo_lora/minimax_h3_turbo_v4_step600_ema.safetensors
+sample_cache: artifacts/samples/demo
+sample_id: [demo]
+geometry: ['16:9@37']
+attention: [veda]
+predictor: weights/veda/h3-r2va-preview/minimax_h3_r2va_veda_preview_fp8.safetensors
+keep_tiles: 32
+ref_keep_tiles: 32
+tile_conditions: true
+# This preview preset targets a >=64 GiB GPU: keep the DiT resident on the
+# GPU and avoid repeated host-to-device block streaming. On a 24 GiB card,
+# override with `--offload-blocks 40` (or 50) and expect slower startup and
+# denoising.
+offload_blocks: 0
+prefetch: 1
+mlp_chunk_rows: 4096
+out_dir: artifacts/generate/r2va-preview

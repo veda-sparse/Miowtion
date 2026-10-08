@@ -11,9 +11,10 @@ B tiles at once is bitwise the same as decoding them one at a time.
 
 import math
 
-import mlx.core as mx
 import numpy as np
 import pytest
+
+mx = pytest.importorskip('mlx.core', reason='MLX requires Apple silicon')
 
 from miowtion.mlx import video_vae
 

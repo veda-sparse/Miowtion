@@ -73,6 +73,9 @@ class TrainConfig:
     trajectory_steps: int | None = None
     keep_ratio: float = 0.1
     ref_keep_ratio: float | None = None
+    # Absolute per-query tile budgets take precedence over the ratio fields.
+    keep_tiles: int | None = None
+    ref_keep_tiles: int | None = None
     tile_conditions: bool = False
     teacher_q_tiles: float = 1.0
     recall_every: int = 1  # mask diagnostics on every n-th layer
@@ -163,6 +166,21 @@ class TrainConfig:
         if not 0.0 <= self.lr_min_ratio <= 1.0:
             raise ValueError(f'lr_min_ratio must be in [0, 1], got '
                              f'{self.lr_min_ratio}')
+        for name in ('keep_tiles', 'ref_keep_tiles'):
+            count = getattr(self, name)
+            if count is not None and (type(count) is not int or count <= 0):
+                raise ValueError(f'{name} must be a positive integer')
+
+    def budgets(self) -> tuple[veda_mask.Budget, veda_mask.Budget | None]:
+        """Resolve target/reference budgets for this training run."""
+        target = (veda_mask.Budget(tiles=self.keep_tiles)
+                  if self.keep_tiles is not None else
+                  veda_mask.Budget(ratio=self.keep_ratio))
+        reference = (veda_mask.Budget(tiles=self.ref_keep_tiles)
+                     if self.ref_keep_tiles is not None else
+                     veda_mask.Budget(ratio=self.ref_keep_ratio)
+                     if self.ref_keep_ratio is not None else None)
+        return target, reference
 
 
 LR_DECAYS = ('none', 'cosine')
@@ -234,10 +252,10 @@ class Trainer:
             cfg.num_layers, cfg.num_heads, cfg.head_dim).to(self.device)
         self.plans = (veda_plan.PlanTable.load_dir(config.plan_dir)
                       if config.plan_dir else None)
+        target_budget, ref_budget = config.budgets()
         self.veda_config = veda_attention.VedaConfig(
-            target_budget=veda_mask.Budget(ratio=config.keep_ratio),
-            ref_budget=(veda_mask.Budget(ratio=config.ref_keep_ratio)
-                        if config.ref_keep_ratio else None),
+            target_budget=target_budget,
+            ref_budget=ref_budget,
             tile_conditions=config.tile_conditions,
             teacher_q_tiles=config.teacher_q_tiles,
             recall_every=config.recall_every,

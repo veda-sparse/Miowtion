@@ -46,7 +46,20 @@ def _triton():
 
 
 def available() -> bool:
-    return torch.cuda.is_available() and _triton() is not None
+    """Whether Triton's exact-math options are supported by this runtime.
+
+    Triton 3.4 does not expose ``enable_reflect_ftz``. Passing that option
+    fails only at first launch, so detect support before selecting these
+    kernels and let the model use its eager path otherwise.
+    """
+    if not torch.cuda.is_available() or _triton() is None:
+        return False
+    try:
+        from triton.backends.nvidia.compiler import CUDAOptions  # pylint: disable=import-outside-toplevel
+    except (ImportError, AttributeError):
+        return False
+    fields = getattr(CUDAOptions, '__dataclass_fields__', {})
+    return all(option in fields for option in _EXACT)
 
 
 def usable(*tensors: torch.Tensor) -> bool:
