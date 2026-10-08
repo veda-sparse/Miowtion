@@ -98,6 +98,20 @@ RoPE、AdaLN modulate、门控残差、SwiGLU 的 silu×up 在 eager 下每个�
   [S, 56, 128] 的临时张量，78k token 时约 4 GB，训练在 4:3 14.4 s 上 OOM。按行分块后临时显存有界，
   结果逐位不变。之后 16:9 14.4 s（104k token）又在 `_modulate`（`index_select` 出的 [S, 5376]
   调制向量、乘积、和）处 OOM，调制和 gate 残差同样按行分块。
+- **稠密 SDPA 悄悄走了 math 后端，38k token 时想要 303 GiB**：`dense_attention` 的
+  `backend='sdpa'` 分支在 `return_lse=False` 时传的是 3 维 `[H, S, D]` q/k/v。PyTorch 的
+  **所有** 融合 SDPA kernel 都要求 4 维，于是 dispatcher 静默退回 math 后端，展开
+  `[H, S, S]` 的分数矩阵。短序列只是慢，看不出来；16:9@37（38010 token）直接
+  `OutOfMemoryError: Tried to allocate 303.50 GiB`。
+  难发现的原因是 `return_lse=True` 分支**本来就是 4 维**（它直接调
+  `aten._scaled_dot_product_flash_attention` 并加了 `[None]`），所以打分 / 教师热力图这些
+  要 LSE 的路径一直是融合 kernel，只有不要 LSE 的纯稠密步会炸。
+  诊断手法：`torch.nn.attention.sdpa_kernel(SDPBackend.FLASH_ATTENTION)` 强制后端会报
+  `No available kernel`，配合 warning `All fused kernels requires query, key and value to
+  be 4 dimensional, but got Query dim: 3`。
+  对策：无 LSE 分支同样加批轴 `[None]`，出来再 `[0]`。`tests/gpu/test_h3_attention_gpu.py`
+  用 38010 token 钉死——融合 kernel 是 O(S) 显存，退回 math 是 O(S²)，所以测试断言这次调用
+  占用 < 8 GiB，任何显卡上都不可能侥幸通过。
 - **发布的 checkpoint 有两套命名**：最早的 `MiniMaxH3DiTModel`（diffusers 0.32）用
   `blocks.N.attn.qkv_proj.weight` 这类 H3 原生名字，后来上游改成 diffusers 移植版
   `MiniMaxH3Transformer3DModel`（diffusers 0.36），config.json 的键几乎全部改名

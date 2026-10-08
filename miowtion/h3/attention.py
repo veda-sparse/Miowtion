@@ -61,9 +61,13 @@ def dense_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
             out = out[0].transpose(0, 1)
             lse = lse[0].transpose(0, 1).float()
         else:
+            # The batch axis is not optional: every fused SDPA kernel
+            # requires 4-D q/k/v, and a 3-D call is silently served by the
+            # math backend, which materializes [H, S, S]. At 38k tokens
+            # that is 300+ GiB, so the packed sequence must be batched.
             out = F.scaled_dot_product_attention(
-                qr.transpose(0, 1), kr.transpose(0, 1), vr.transpose(0, 1),
-                scale=scale).transpose(0, 1)
+                qr.transpose(0, 1)[None], kr.transpose(0, 1)[None],
+                vr.transpose(0, 1)[None], scale=scale)[0].transpose(0, 1)
             lse = None
     elif backend == 'math':
         out, lse = _math_attention(qr, kr, vr, scale)
