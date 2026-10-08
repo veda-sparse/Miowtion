@@ -115,6 +115,71 @@ log E_ij = log B_j + Qbar_i . Kbar_j / sqrt(D) + Qbar2_i^T Cov_j Qbar2_i / (2D) 
 的 veda2 可能更好，也可能把二阶系数学歪，没测。而且只有一条 clip、一种几何。真正的训练
 对比是 §7 的待办 1 和 2。
 
+## 2.2 端到端：真实生成、真实测速、真实视频
+
+`recall` / `heat_kept` 只是掩码和 oracle 的重合度，不是输出质量。所以跑了完整的
+8 步去噪，三路同 seed、同 prompt、同几何，并实测每步时间。
+
+设置：1:1@37（**768×768、124 帧、21312 video token**，最小的几何）、**ρ=0.05**、
+`moviegen_holdout20` 里**全部 5 条**该长度的 clip、1×RTX PRO 6000 Blackwell、
+FA4 块稀疏（sm_120，vendored 补丁）。ρ=0.05 下即使 oracle 也只保住 **50~56%** 的块
+质量（实测，`runs/sol_initprobe_1x1_t37`），所以这是稀疏最吃力的区间。
+
+### 速度（5 条 clip 的均值，排除 step 0 的 kernel 编译）
+
+| 路线 | 每步 | 注意力 | 每步加速 | 注意力加速 |
+|---|---|---|---|---|
+| Dense | 5.450 s | 1.920 s | 1.00× | 1.00× |
+| Veda1（发布的 step600） | 3.944 s | 0.468 s | **1.38×** | **4.10×** |
+| Veda2（未训练，两项都开，rank 128） | 4.209 s | 0.746 s | 1.29× | 2.58× |
+
+**这里要说清楚一件事：按当前实现，Veda2 比 Veda1 慢 6.7%（每步 4.209 对 3.944 s），
+没有满足「速度不降低」。** 原因是两条，都在 §3 预告过：
+
+1. `init_exact_second_order_()` 需要 **full rank 128**，而二阶头本身是又一个 rank-D
+   双线性，所以它把打分器的 n² 项**翻了一倍**。注意力时间从 0.468 涨到 0.746 s，+0.278 s，
+   占每步 5.1%。
+2. 池化还是三次 `pool_tiles` 调用、各读一遍 q/k 的 tile 数据，没有融合。
+
+低秩头（§3.1）正是为这件事准备的：rank 16 的 n² 增量是 rank 128 的 1/8，按实测外推约
++0.035 s 注意力、+0.8% 每步。但 **rank < 128 没有闭式初始化**（`init_exact_second_order_`
+要求全秩），所以它要么训练、要么用校准集上 `Var(k)` 的 top-r 主成分来定投影。两者都没做，
+见 §7。
+
+也就是说：**本文档证明了二阶项值多少，但还没给出它的便宜实现。** 现在能同时拿到质量和
+速度的组合是「只开 `log B`」（零 n² 成本），那一项单独就补回 22~36% 的 oracle 差距，
+但没有单独实测它的端到端质量。
+
+### 视频
+
+每条 clip 都有三路各自的单独视频，加一张固定顺序 `Dense → Veda1 → Veda2` 的带标题
+拼接视频（标题里带实测每步耗时与加速），放在
+`artifacts/visual_checks/veda2/<date>/`：`joined/<clip>.mp4` 是拼接版，
+`<clip>/` 里是每一路的单独视频加 `side_by_side.mp4`。
+
+**画质结论必须由人看过才能写。** 按 AGENTS.md 1.5.1，这里只记录交付物已生成、
+以及生成它的命令，结论一栏留空待人工确认。
+
+| 日期 | 确认人 | commit | 结论 |
+|---|---|---|---|
+| 2026-10-09 | **待确认** | 本次提交 | 5 条 clip × 3 路已生成 |
+
+Sol 没有进这一轮对比（用户标为可选）：它的两个机制都已被实测否掉（§5 与
+[sol_ablation](sol_ablation.md) §3），而把它的 `μ+βσ` 阈值接进推理路径要改
+`miowtion/veda/mask.py`，那个文件被别的 agent 占用。
+
+复现：
+
+```bash
+python scripts/bolt_veda2.py --in <released bundle> --base reset \
+    --out weights/veda/veda2_untrained.safetensors
+python scripts/generate.py --config configs/infer_veda2_1x1_t37_sparse05.yaml
+python scripts/generate.py \
+    --config configs/infer_veda2_1x1_t37_sparse05_veda2.yaml
+# then one scripts/visual_check.py per clip, three --video panes
+```
+
+
 ## 3. 设计与不变量
 
 ### 3.1 低秩二阶头（`miowtion/veda/predictor.py`）
@@ -296,8 +361,11 @@ attend 到」。给一个方向错误的向量配上更大更准的权重，只�
 2. **把低秩二阶头接进 stage1**。`TileScorePredictor` 已经支持 `second_order_rank`，但
    `trainer.py`（被占用）需要一个配置项，`bundle.py` / `import_predictor.py`（被占用）
    需要在加载旧 checkpoint 时把 `so_*` 补零，这样 step600 的发布权重能原样续训。
-3. **融合池化**，否则多出来的 DRAM 流量会吃掉零成本的说法（§3.2）。
-4. **放宽预算分配的实测范围**到 ρ∈[0.02, 0.4]，现在的 6.2% 是被 [0.05, 0.206] 的网格
+4. **低秩二阶头的廉价初始化**，这是「速度不降低」的唯一缺口（§2.2）。两条路：
+   (a) 在校准集上对每个 (layer, head) 的 `Var(k)` 做 PCA，取 top-r 主成分当固定投影，
+   不需要训练；(b) 直接训练 `so_q` / `so_k`。rank 16 按实测外推是 +0.8% 每步。
+5. **融合池化**，否则多出来的 DRAM 流量也要算进第 4 条的账。
+6. **放宽预算分配的实测范围**到 ρ∈[0.02, 0.4]，现在的 6.2% 是被 [0.05, 0.206] 的网格
    夹住的下界。
 5. **把发布的打分器放进 ε 的度量里**。§2.1 已经在 recall / heat_kept 上量过它，但
    §2 那张「补回差距比例」的表里所有「proxy」仍然是**未训练**的池化分数。把
@@ -312,7 +380,8 @@ attend 到」。给一个方向错误的向量配上更大更准的权重，只�
 |---|---|---|---|
 | 2026-10-08 | CPU（macOS） | 本次提交 | `pytest tests/unit` 462 passed |
 | 2026-10-08 | 1×RTX PRO 6000 Blackwell（sm_120，未装 flash-attn-4） | 本次提交 | 16:9@37 真实权重 134400 行 / 约 40 min；§2 / §3.4 / §5 的全部数字 |
-| 2026-10-09 | 同上 | 本次提交 | 初始化探针 2400 行 / 1m46s（`--init-probe`，含发布的 step600 打分器与它自带的方案表）：§2.1 的三方对比 |
+| 2026-10-09 | 同上 | 本次提交 | 初始化探针（`--init-probe`，含发布的 step600 打分器与它自带的方案表）：§2.1 的三方对比，以及 1:1@37 ρ=0.05 上 5 条 clip 的 12000 行 |
+| 2026-10-09 | 同上，FA4 块稀疏已装（sm_120 vendored 补丁，`tests/gpu` 20 passed / 9 skipped） | 本次提交 | §2.2 的端到端：5 条 clip × 3 路真实生成、实测每步耗时、15 个单独视频加 5 个三路拼接视频 |
 
 ε 是数值量，按 AGENTS.md 1.5 与参考实现对拍（见 [sol_ablation](sol_ablation.md) §测试）。
 本 feature 不生成视频，不涉及 1.5.1 的人工可视化确认；**端到端画质要等待办 1 和 2 落地、

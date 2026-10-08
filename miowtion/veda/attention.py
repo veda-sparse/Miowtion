@@ -142,6 +142,43 @@ def _gather_and_pool(x: torch.Tensor, tile_layout: tiling.TileLayout,
     return tiles, veda_predictor.pool_tiles(tiles, tile_layout)
 
 
+def _extra_features(predictor: veda_predictor.TileScorePredictor,
+                    q_tiles: torch.Tensor, k_tiles: torch.Tensor,
+                    tile_layout: tiling.TileLayout,
+                    rows: torch.Tensor | None = None) -> dict:
+    """Inputs the predictor's optional score terms need, as kwargs.
+
+    `_gather_and_pool` only produces [mean|max|min], because that is what
+    the fused gather kernel writes. The second-cumulant head additionally
+    wants E[q^2] and Var(k), which are pooled here from the tile-ordered
+    rows that were gathered anyway, and the log B_j term wants nothing but
+    the layout. Returns {} for a plain predictor, so the call site is the
+    same either way.
+
+    Args:
+        predictor: The predictor about to be called.
+        q_tiles: [N, H', D] tile-ordered queries.
+        k_tiles: [N, H', D] tile-ordered keys.
+        tile_layout: Their layout.
+        rows: Query tiles the logits are restricted to, if any; the query
+            side features are sliced to match.
+
+    Returns:
+        Keyword arguments for `LayerPredictor.forward`.
+    """
+    extra: dict = {}
+    if predictor.count_term:
+        extra['log_count'] = torch.log(
+            tile_layout.valid_count.clamp(min=1).to(torch.float32))
+    if predictor.second_order_rank:
+        sq_q = veda_predictor.pool_tiles(q_tiles, tile_layout,
+                                         veda_predictor.SECOND_RAW)
+        extra['sq_q'] = sq_q if rows is None else sq_q[:, rows]
+        extra['var_k'] = veda_predictor.pool_tiles(
+            k_tiles, tile_layout, veda_predictor.SECOND_CENTRAL)
+    return extra
+
+
 def _scatter_(out: torch.Tensor, tiled: torch.Tensor,
               tile_layout: tiling.TileLayout, heads: torch.Tensor) -> None:
     if _fused(out):
@@ -258,11 +295,13 @@ class TeacherCollector:
                 heat = heatmap.teacher_heat(
                     q_tiles, k_tiles, _gather_lse(lse, tile_layout, heads),
                     tile_layout, rows)
+                extra = _extra_features(self.predictor, q_tiles, k_tiles,
+                                        tile_layout, rows)
                 del q_tiles, k_tiles
                 weight = heads.numel() / self._num_heads
                 with torch.enable_grad():
                     logits = self.predictor.layers[layer_index](
-                        feats_q[:, rows], feats_k, heads)
+                        feats_q[:, rows], feats_k, heads, **extra)
                     kl = heatmap.seer_kl(logits, heat, tile_layout)
                     loss = kl
                     if self.topk_weight:
@@ -353,8 +392,10 @@ class SparseStudent:
         k_tiles, feats_k = _gather_and_pool(k, tile_layout, heads)
         v_tiles = _gather(v, tile_layout, heads)
         with torch.no_grad():
-            logits = self.predictor.layers[layer_index](feats_q, feats_k,
-                                                        heads)
+            logits = self.predictor.layers[layer_index](
+                feats_q, feats_k, heads,
+                **_extra_features(self.predictor, q_tiles, k_tiles,
+                                  tile_layout))
             # Only video query tiles are selected; global rows are dense.
             selection = veda_mask.select_video_blocks(
                 logits[:, :tile_layout.n_video_tiles], tile_layout,

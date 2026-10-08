@@ -422,3 +422,64 @@ def test_teacher_heat_rejects_an_unknown_reduction():
     with pytest.raises(ValueError, match="reduce must be"):
         heatmap.teacher_heat_reference(qt, kt, lse_t, lay,
                                        torch.tensor([0]), reduce='mean')
+
+
+def test_sparse_student_drives_a_second_order_predictor():
+    """The student calls the layer directly, so it must supply the extras.
+
+    `_gather_and_pool` only produces [mean|max|min], because that is what
+    the fused gather kernel writes. A predictor with the Veda2 terms needs
+    E[q^2], Var(k) and the row counts too, and the call site has to add
+    them or the layer refuses.
+    """
+    from miowtion.h3 import geometry
+    from miowtion.h3 import layout as h3_layout
+    from miowtion.veda import plan as veda_plan
+    geo = geometry.Geometry('16:9', 512, 256, 39, 12, 16, 32, 20)
+    lay = h3_layout.pack(torch.ones(300, dtype=torch.long), geo)
+    q, k, v = (t.float() for t in _qkv(lay.seq_len, heads=4))
+    plan = veda_plan.TilePlan(geo.name, geo.video_grid,
+                              [tiling.TileShape(4, 4, 8)], [[0, 0, 0, 0]])
+    plain = veda_predictor.TileScorePredictor(1, 4, 32)
+    fancy = veda_predictor.TileScorePredictor(1, 4, 32,
+                                              second_order_rank=32,
+                                              count_term=True)
+    config = veda_attention.VedaConfig(
+        target_budget=veda_mask.Budget(ratio=1.0))
+    clip = veda_attention.ClipTiling(lay, config, torch.device('cpu'))
+    dense = h3_attention.dense_attention(q, k, v, lay.used,
+                                         backend='math')[0]
+    for pred in (plain, fancy):
+        student = veda_attention.SparseStudent(clip, plan, pred,
+                                               allow_reference_kernel=True)
+        with torch.no_grad():
+            out = student(q, k, v, 0)
+        # Keeping everything equals dense whatever the score says, which
+        # is the one thing a predictor can never change.
+        torch.testing.assert_close(out, dense, rtol=1e-5, atol=1e-5)
+
+
+def test_extra_features_are_empty_for_a_plain_predictor():
+    from miowtion.h3 import geometry
+    from miowtion.h3 import layout as h3_layout
+    geo = geometry.Geometry('16:9', 512, 256, 39, 12, 16, 32, 20)
+    lay = h3_layout.pack(torch.ones(300, dtype=torch.long), geo)
+    q, _, _ = (t.float() for t in _qkv(lay.seq_len, heads=4))
+    clip = veda_attention.ClipTiling(
+        lay, veda_attention.VedaConfig(
+            target_budget=veda_mask.Budget(ratio=1.0)), torch.device('cpu'))
+    tl = clip.get(tiling.TileShape(4, 4, 8))
+    heads = torch.arange(4)
+    tiles = tiling.gather_tiles(q, tl, heads)
+    plain = veda_predictor.TileScorePredictor(1, 4, 32)
+    assert veda_attention._extra_features(plain, tiles, tiles, tl) == {}
+    fancy = veda_predictor.TileScorePredictor(1, 4, 32,
+                                              second_order_rank=8,
+                                              count_term=True)
+    extra = veda_attention._extra_features(fancy, tiles, tiles, tl)
+    assert sorted(extra) == ['log_count', 'sq_q', 'var_k']
+    assert extra['log_count'].shape == (tl.n_tiles,)
+    rows = torch.tensor([0, 2])
+    sliced = veda_attention._extra_features(fancy, tiles, tiles, tl, rows)
+    assert sliced['sq_q'].shape[1] == 2
+    assert sliced['var_k'].shape[1] == tl.n_tiles

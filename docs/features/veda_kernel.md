@@ -249,6 +249,8 @@ MFU 的分母是**稠密** bf16 tensor core 峰值 504 TFLOP/s（厂商宣传的
   kernel 时间面前已经无关紧要。
 
 ## 验证记录
+
+- 2026-10-09，1×RTX PRO 6000 Blackwell Server Edition（sm_120，96 GB）：装上 FA4 `4.0.0b32 @ d15f153` 后 `pytest tests/gpu -m gpu` **20 passed, 9 skipped**，其中块稀疏前向与反向都走 vendored 的 SM120 补丁。安装注意：从单 SHA 浅克隆装时要设 `SETUPTOOLS_SCM_PRETEND_VERSION_FOR_FLASH_ATTN_4=4.0.0b32`，否则 setuptools_scm 找不到 `fa4-vX` tag、回落到 fallback 版本号，`fa4_sm8x.install()` 会拒绝。
 - 2026-09-23 RTX 4090：见上表。结论：上游 FA4 在 SM89 上不支持块稀疏；我们的补丁达到效率门槛，
   已作为 vendored 模块合入（`miowtion/kernels/fa4_sm8x`）。
 - H100 / B200：待测（正确性对拍 + 效率 ≥ 0.75 的门槛）。
