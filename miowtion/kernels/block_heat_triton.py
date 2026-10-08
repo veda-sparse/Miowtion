@@ -1,5 +1,6 @@
 """Fused Triton kernel for block attention heat (teacher heat / oracle mask).
 
+`reduce='max'` gives
 heat[i, j] = max over the 128x128 block of exp(q.k / sqrt(D) - lse): the
 largest true attention probability inside a block. It supervises the
 predictor (teacher heat) and defines the oracle mask of the tile search.
@@ -63,7 +64,8 @@ def _kernel():
                     stride_qn, stride_qh, stride_kn, stride_kh, stride_ln,
                     stride_lh, stride_oh, stride_or, n_tiles, scale,
                     HEAD_DIM: tl.constexpr, TILE: tl.constexpr,
-                    TILES_PER_PROGRAM: tl.constexpr):
+                    TILES_PER_PROGRAM: tl.constexpr,
+                    SUM: tl.constexpr):
         r = tl.program_id(0)
         group = tl.program_id(1)
         h = tl.program_id(2)
@@ -84,19 +86,30 @@ def _kernel():
             col_ok = tl.load(valid_ptr + cols) != 0
             s = tl.dot(q, tl.trans(k))
             s = tl.where(col_ok[None, :], s, float('-inf'))
-            row_max = tl.max(s, axis=1).to(tl.bfloat16).to(tl.float32)
-            best = tl.max(row_max * scale - lse, axis=0)
-            tl.store(out_ptr + h * stride_oh + r * stride_or + j,
-                     tl.exp(best))
+            if SUM:
+                # Every masked term is exp(-inf) = 0: invalid columns are
+                # -inf above, and invalid rows carry lse = +inf.
+                p = tl.exp(s * scale - lse[:, None])
+                agg = tl.sum(tl.sum(p, axis=1), axis=0)
+            else:
+                row_max = tl.max(s, axis=1).to(tl.bfloat16).to(tl.float32)
+                agg = tl.exp(tl.max(row_max * scale - lse, axis=0))
+            tl.store(out_ptr + h * stride_oh + r * stride_or + j, agg)
 
     return heat_kernel
 
 
 @torch.no_grad()
 def teacher_heat(q: torch.Tensor, k: torch.Tensor, lse: torch.Tensor,
-                 layout: tiling.TileLayout,
-                 q_tiles: torch.Tensor) -> torch.Tensor:
-    """Same contract as heatmap.teacher_heat_reference."""
+                 layout: tiling.TileLayout, q_tiles: torch.Tensor,
+                 reduce: str = 'max') -> torch.Tensor:
+    """Same contract as heatmap.teacher_heat_reference.
+
+    Raises:
+        ValueError: On an unknown reduction or an unsupported head_dim.
+    """
+    if reduce not in ('max', 'sum'):
+        raise ValueError(f"reduce must be 'max' or 'sum': {reduce!r}")
     if q.shape[-1] not in (64, 128) or q.stride(-1) != 1 or k.stride(-1) != 1:
         raise ValueError('heat kernel needs contiguous head_dim 64 or 128')
     heads, n_tiles = q.shape[1], layout.n_tiles
@@ -108,6 +121,6 @@ def teacher_heat(q: torch.Tensor, k: torch.Tensor, lse: torch.Tensor,
         q.stride(0), q.stride(1), k.stride(0), k.stride(1), lse.stride(0),
         lse.stride(1), out.stride(0), out.stride(1), n_tiles,
         1.0 / math.sqrt(q.shape[-1]), HEAD_DIM=q.shape[-1], TILE=_TILE,
-        TILES_PER_PROGRAM=_KEY_TILES_PER_PROGRAM, num_warps=_NUM_WARPS,
-        num_stages=_NUM_STAGES)
+        TILES_PER_PROGRAM=_KEY_TILES_PER_PROGRAM, SUM=reduce == 'sum',
+        num_warps=_NUM_WARPS, num_stages=_NUM_STAGES)
     return out

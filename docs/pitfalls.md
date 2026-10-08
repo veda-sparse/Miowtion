@@ -130,3 +130,7 @@
 | 单测断言「Ω top-k 的 ε 小于 Mx top-k」在随机 Q/K/V 上反过来（1.97 vs 1.77） | 两层原因：`c=0` 时 `Σ_j ξ_uj = 0`，块间误差可抵消，按 `Σ‖ξ‖` 取 top-k 最小化的是三角不等式**上界**而非 ε；iid 高斯又让注意力近均匀，根本没有「该选哪些块」的信号 | H1 是实验要回答的问题，不是可单测的不变量。改成在构造信号上测机制：分数极小（`A`/`Mx` 排名近随机）但 V 范数按块差很多 | [sol_ablation](features/sol_ablation.md) |
 | `torch.equal(out, dense_attention(...))` 报 "must be Tensor, not tuple" | `dense_attention` 即使 `return_lse=False` 也返回 `(out, None)` | 解包后再比 | [sol_ablation](features/sol_ablation.md) |
 | 一行的 `μ`/`σ` 整行变成 NaN | 代理分数只在视频象限有定义，全局列存的是 NaN（故意的，全局列无条件保留、不参与排名），算矩时把它们一起纳入了 | 所有读 `proxy` 的地方只取前 `n_video_tiles` 列并按 `kv_ok` 过滤 | [sol_ablation](features/sol_ablation.md) |
+| 块方差特征在某些 tile 上相对误差到 31% | 用一遍恒等式 `E[x²]−E[x]²` 算方差，而 RMSNorm 过的 key 在同一个空间块内彼此很近，相减两个几乎相等的大数 | `_second_moment` 改成两遍（先均值再减），按行分块限制 fp32 临时显存；单测用「各行几乎相同」的紧致 tile 钉死 | [veda2](features/veda2.md) |
+| 打分器把只有 32 行真实 key 的补齐块和 128 行的满块排在同等位置 | 分数是均值池化的 QK，看不到 `valid_count`；而块的注意力**质量**与行数成正比。这在 max 目标下是自洽的，一换成质量目标就是系统性偏差 | 把 `log B_j` 加进 logits（layout 直接读，零成本）；实测补回 22~36% 的 oracle 差距 | [veda2](features/veda2.md) |
+| 补偿的等算力对比，中位数之比说赢 14.7% vs 8.7%，逐头配对说只赢 1% | 两个臂的 ε 分布形状不同，「中位数之比」把差距放大了；配对才是同一个头自己和自己比 | 这类同成本对比一律用逐头配对（本例补偿只在 50.8~62.7% 的头上更好） | [veda2](features/veda2.md) |
+| 预算分配器在目标等于实测最小密度时报「outside the grid」 | 网格用 `exp(log(lo)+...)` 生成，端点漂移到 lo 之上；而且 n 份精确的 0.05 求和再平均会比 0.05 大一个 ulp | 网格端点钉成 lo / hi；可行性判断用相对松量而不是裸 `<=` | [veda2](features/veda2.md) |

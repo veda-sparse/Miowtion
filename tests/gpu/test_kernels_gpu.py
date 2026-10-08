@@ -56,6 +56,42 @@ def test_heat_triton_matches_reference():
     torch.testing.assert_close(fused, ref, rtol=3e-2, atol=1e-5)
 
 
+@pytest.mark.skipif(not block_heat_triton.available(), reason='needs triton')
+def test_mass_heat_triton_matches_reference():
+    """The block-mass reduction, which Veda2 distils against."""
+    lay = _layout()
+    q, k, v = _qkv(lay.seq_len)
+    _, lse = h3_attention.dense_attention(q, k, v, lay.used, return_lse=True)
+    heads = torch.arange(4, device='cuda')
+    qt, kt = (tiling.gather_tiles(t, lay, heads) for t in (q, k))
+    lse_t = lse[lay.gather_index][:, heads].contiguous()
+    lse_t[lay.pad_slots] = 0
+    rows = torch.arange(0, lay.n_tiles, 3, device='cuda')
+    fused = block_heat_triton.teacher_heat(qt, kt, lse_t, lay, rows,
+                                           reduce='sum')
+    ref = heatmap.teacher_heat_reference(qt, kt, lse_t, lay, rows,
+                                         reduce='sum')
+    torch.testing.assert_close(fused, ref, rtol=3e-2, atol=1e-4)
+    # Every row's probabilities sum to 1, so a tile's mass is its row count.
+    want = lay.valid_count.index_select(0, rows).float()
+    torch.testing.assert_close(fused.sum(-1), want.expand(4, rows.numel()),
+                               rtol=3e-2, atol=3e-2)
+
+
+@pytest.mark.skipif(not block_heat_triton.available(), reason='needs triton')
+def test_heat_kernel_rejects_an_unknown_reduction():
+    lay = _layout()
+    q, k, _ = _qkv(lay.seq_len)
+    heads = torch.arange(1, device='cuda')
+    qt, kt = (tiling.gather_tiles(t, lay, heads) for t in (q, k))
+    lse_t = torch.zeros(lay.num_slots, 1, device='cuda')
+    with pytest.raises(ValueError, match='reduce must be'):
+        block_heat_triton.teacher_heat(qt, kt, lse_t, lay,
+                                       torch.zeros(1, dtype=torch.long,
+                                                   device='cuda'),
+                                       reduce='mean')
+
+
 @pytest.mark.skipif(not fa4.available(), reason='FA4 block sparsity '
                     'unsupported on this architecture')
 def test_fa4_block_sparse_matches_reference():

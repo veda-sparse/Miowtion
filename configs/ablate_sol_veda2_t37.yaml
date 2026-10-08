@@ -1,0 +1,38 @@
+# Veda2 design measurement. Three questions, one pass over the teacher.
+#
+# 1. Scorer features. Veda's predictor, before training, computes exactly
+#    the zero-order pooled score. The log mass of a block has a second
+#    cumulant that the predictor structurally cannot express:
+#      log E_uj = log B_j + q.Kbar_j/sqrt(d) + q^T Cov_j q / (2d) + ...
+#    proxy_diag adds the diagonal of that term, which costs one more
+#    pooled feature per side and leaves the n^2 bilinear at rank head_dim.
+#    proxy_full is the ceiling of any second-order correction.
+# 2. Distillation target. A (block mass) against Mx (block max, which is
+#    what the teacher heat currently is) against the ideal importance.
+# 3. Compensation. c=2 is the equal-cost ceiling of predicting the
+#    correction weight, and the primed densities are the iso-FLOP control
+#    for spending compensation's arithmetic on more blocks instead.
+#
+# H2's variable-budget rules are off: that question is settled and they
+# were most of the pass-two cost.
+densities: [0.05, 0.05742, 0.10, 0.10703, 0.20, 0.20625]
+budget_rules: false
+run_name: sol_veda2_t37
+checkpoint_root: weights/MiniMax-H3
+sample_cache: artifacts/samples/moviegen_holdout20
+geometries: ['16:9@37']
+variant: FL2VA
+tasks: [t2va]
+num_clips: 2
+steps: [0, 2, 5, 7]
+schedule: turbo
+num_steps: 8
+teacher_adapter: weights/turbo_lora/minimax_h3_turbo_v4_step600_ema.safetensors
+tile_shape: 4x4x8
+alphas: [1.0]
+query_tiles: 6
+oracle: Omega0
+out_dir: runs
+offload_blocks: 30
+prefetch: 1
+mlp_chunk_rows: 8192

@@ -359,3 +359,66 @@ def test_oracle_bce_gradient_pushes_towards_the_oracle_set():
     # The diagonal is forced by the kernel, so it gets no gradient at all.
     assert torch.equal(grad[diag.expand_as(grad)],
                        torch.zeros(int(diag.expand_as(grad).sum())))
+
+
+def _heat_case(reduce):
+    lay = _layout()
+    q, k, v = _qkv(lay.seq_len)
+    _, lse = h3_attention.dense_attention(q, k, v, lay.used, return_lse=True,
+                                          backend='math')
+    heads = torch.tensor([0, 1])
+    qt, kt = (tiling.gather_tiles(t, lay, heads) for t in (q, k))
+    lse_t = lse[lay.gather_index][:, heads]
+    lse_t[lay.pad_slots] = 0
+    rows = torch.tensor([0, 2, lay.n_tiles - 1])
+    heat = heatmap.teacher_heat_reference(qt, kt, lse_t, lay, rows,
+                                          q_chunk=128, k_chunk=256,
+                                          reduce=reduce)
+    return lay, q, k, rows, heat
+
+
+def test_mass_heat_matches_brute_force_block_sum():
+    lay, q, k, rows, heat = _heat_case('sum')
+    scores = torch.einsum('qhd,khd->hqk', q[:lay.used].float(),
+                          k[:lay.used].float()) / 32**0.5
+    probs = torch.softmax(scores, -1)
+    perm = lay.perm
+    for r_i, r in enumerate(rows.tolist()):
+        for j in range(lay.n_tiles):
+            qi = perm[r * 128:(r + 1) * 128]
+            kj = perm[j * 128:(j + 1) * 128]
+            qi, kj = qi[qi >= 0], kj[kj >= 0]
+            if not qi.numel() or not kj.numel():
+                assert torch.all(heat[:, r_i, j] == 0)
+                continue
+            want = probs[:, qi][:, :, kj].sum((1, 2))
+            torch.testing.assert_close(heat[:, r_i, j], want, rtol=2e-2,
+                                       atol=2e-3)
+
+
+def test_mass_heat_rows_sum_to_the_real_query_rows():
+    """Every row's probabilities sum to 1, so a tile's mass is its count."""
+    lay, _, _, rows, heat = _heat_case('sum')
+    want = lay.valid_count.index_select(0, rows).float()
+    torch.testing.assert_close(heat.sum(-1), want.expand_as(heat.sum(-1)),
+                               rtol=2e-2, atol=2e-2)
+
+
+def test_mass_heat_is_not_max_heat():
+    _, _, _, _, mass = _heat_case('sum')
+    _, _, _, _, peak = _heat_case('max')
+    assert mass.shape == peak.shape
+    # Mass sums 128x128 terms, peak takes one: mass must dominate.
+    assert torch.all(mass >= peak - 1e-6)
+    assert float((mass - peak).abs().max()) > 1e-2
+
+
+def test_teacher_heat_rejects_an_unknown_reduction():
+    lay = _layout()
+    q, k, _ = _qkv(lay.seq_len)
+    heads = torch.tensor([0])
+    qt, kt = (tiling.gather_tiles(t, lay, heads) for t in (q, k))
+    lse_t = torch.zeros(lay.num_slots, 1)
+    with pytest.raises(ValueError, match="reduce must be"):
+        heatmap.teacher_heat_reference(qt, kt, lse_t, lay,
+                                       torch.tensor([0]), reduce='mean')

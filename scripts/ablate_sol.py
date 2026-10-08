@@ -43,6 +43,56 @@ def _print_summary(path: str, eta: float, g2_margin: float) -> None:
         print(f"  proxy vs Omega Spearman: {row['median_spearman']}")
         print(f"  proxy z-score skew {row['median_skew']:+.3f}, "
               f"excess kurtosis {row['median_excess_kurtosis']:+.3f}")
+        _print_scorers(records, row['density'])
+    _print_allocation(records)
+
+
+def _print_scorers(records, density: float) -> None:
+    """Each score's distance from the oracle, at one density."""
+    try:
+        rows = solattn.scorer_report(records, density)
+    except ValueError as exc:
+        print(f'  scorer report unavailable: {exc}')
+        return
+    print('  scores, ranked by error (gap closed: 0 = untrained pooled '
+          'score, 1 = oracle):')
+    print(f"    {'mask':24s} {'eps':>8s} {'gap':>8s} {'rec/Om':>8s} "
+          f"{'rec/A':>8s}")
+    for row in rows:
+        print(f"    {row['mask']:24s} {row['median_error']:8.5f} "
+              f"{row['gap_closed']:+8.1%} {row['recall_vs_omega']:8.3f} "
+              f"{row['recall_vs_mass']:8.3f}")
+
+
+def _print_allocation(records) -> None:
+    """What a static per-head budget buys at the same total cost."""
+    for mask in ('proxy_topk', 'R1_topk'):
+        try:
+            curves = solattn.error_curve(records, mask=mask)
+        except ValueError:
+            continue
+        break
+    else:
+        print('\nno per-head curves available')
+        return
+    densities = sorted({r.density for r in records})
+    if len(densities) < 2:
+        print('\nper-head allocation needs at least two densities')
+        return
+    print(f'\nstatic per-head budget vs uniform, same total cost '
+          f'({len(curves)} heads, {mask}):')
+    lo, hi = densities[0], densities[-1]
+    for i in range(5):
+        target = lo * (hi / lo) ** (i / 4.0)
+        try:
+            rep = solattn.allocation_report(curves, target)
+        except ValueError as exc:
+            print(f'  rho={target:.3f}: {exc}')
+            continue
+        print(f"  rho={target:.3f}: total eps "
+              f"{rep['relative_saving']:+.2%}   per-head rho "
+              f"p10 {rep['density_p10']:.3f} med {rep['density_median']:.3f} "
+              f"p90 {rep['density_p90']:.3f}")
 
 
 def main():

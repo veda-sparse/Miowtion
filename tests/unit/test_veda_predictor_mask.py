@@ -192,3 +192,131 @@ def test_diagonal_without_nonzero_is_bitwise_the_original():
                                            rows)
         assert torch.equal(sel.index, index)
         assert torch.equal(sel.keep, keep)
+
+
+# --- second-order head ---------------------------------------------------
+
+
+def test_second_moment_pooling_matches_naive_masked_stats():
+    lay = _layout()
+    x = torch.randn(lay.seq_len, 3, 16).to(torch.bfloat16)
+    tiles = tiling.gather_tiles(x, lay, None)
+    raw = veda_predictor.pool_tiles(tiles, lay, veda_predictor.SECOND_RAW)
+    central = veda_predictor.pool_tiles(tiles, lay,
+                                        veda_predictor.SECOND_CENTRAL)
+    assert raw.shape == central.shape == (3, lay.n_tiles, 16)
+    view = tiles.view(lay.n_tiles, 128, 3, 16).float()
+    for j in range(lay.n_tiles):
+        rows = view[j, :lay.valid_count[j].item()]
+        torch.testing.assert_close(raw[:, j], rows.square().mean(0),
+                                   rtol=1e-5, atol=1e-5)
+        torch.testing.assert_close(central[:, j], rows.var(0, unbiased=False),
+                                   rtol=1e-5, atol=1e-5)
+
+
+def test_pooling_rejects_an_unknown_second_moment():
+    lay = _layout()
+    tiles = torch.zeros(lay.num_slots, 1, 8).to(torch.bfloat16)
+    with pytest.raises(ValueError, match='unknown second moment'):
+        veda_predictor.pool_tiles(tiles, lay, 'stddev')
+
+
+def test_rank_zero_second_order_is_the_old_predictor():
+    """The default must stay bit-for-bit what it was."""
+    lay = _layout()
+    torch.manual_seed(3)
+    old = veda_predictor.TileScorePredictor(2, 4, 16)
+    torch.manual_seed(3)
+    new = veda_predictor.TileScorePredictor(2, 4, 16, second_order_rank=0)
+    q = torch.randn(lay.seq_len, 4, 16).to(torch.bfloat16)
+    k = torch.randn(lay.seq_len, 4, 16).to(torch.bfloat16)
+    heads = torch.tensor([0, 2])
+    qt, kt = (tiling.gather_tiles(t, lay, heads) for t in (q, k))
+    assert torch.equal(old.scores(1, qt, kt, lay, heads),
+                       new.scores(1, qt, kt, lay, heads))
+    assert not any(n.startswith('so_') for n, _ in old.named_parameters())
+
+
+def test_exact_warm_start_equals_the_diagonal_cumulant():
+    """At full rank the warm start reproduces the term in closed form.
+
+    log mass has the expansion
+        log E = log B + Qbar . Kbar / sqrt(D) + E[q^2] . Var(k) / (2 D),
+    and the predictor must land on its last two terms exactly, with the
+    base projections zeroed so only the pooled means survive.
+    """
+    dim = 16
+    lay = _layout()
+    pred = veda_predictor.TileScorePredictor(2, 4, dim,
+                                             second_order_rank=dim)
+    pred.init_exact_second_order_()
+    with torch.no_grad():
+        for layer in pred.layers:
+            layer.proj_q.zero_()
+            layer.proj_k.zero_()
+    q = torch.randn(lay.seq_len, 4, dim).to(torch.bfloat16)
+    k = torch.randn(lay.seq_len, 4, dim).to(torch.bfloat16)
+    heads = torch.tensor([1, 3])
+    qt, kt = (tiling.gather_tiles(t, lay, heads) for t in (q, k))
+    logits = pred.scores(0, qt, kt, lay, heads)
+
+    mean_q = veda_predictor.pool_tiles(qt, lay)[..., :dim]
+    mean_k = veda_predictor.pool_tiles(kt, lay)[..., :dim]
+    sq_q = veda_predictor.pool_tiles(qt, lay, veda_predictor.SECOND_RAW)
+    var_k = veda_predictor.pool_tiles(kt, lay, veda_predictor.SECOND_CENTRAL)
+    want = (mean_q @ mean_k.transpose(1, 2) / math.sqrt(dim)
+            + sq_q @ var_k.transpose(1, 2) / (2 * dim))
+    torch.testing.assert_close(logits, want, rtol=1e-4, atol=1e-5)
+
+
+def test_low_rank_head_costs_only_its_rank():
+    dim, rank = 16, 4
+    pred = veda_predictor.TileScorePredictor(2, 4, dim,
+                                             second_order_rank=rank)
+    base = 2 * 2 * 4 * 3 * dim * dim
+    assert sum(p.numel() for p in pred.parameters()) == \
+        base + 2 * 2 * 4 * dim * rank
+
+
+def test_second_order_rank_is_range_checked():
+    with pytest.raises(ValueError, match='must be'):
+        veda_predictor.LayerPredictor(2, 16, second_order_rank=17)
+    with pytest.raises(ValueError, match='must be'):
+        veda_predictor.LayerPredictor(2, 16, second_order_rank=-1)
+
+
+def test_exact_warm_start_needs_full_rank():
+    pred = veda_predictor.LayerPredictor(2, 16, second_order_rank=8)
+    with pytest.raises(ValueError, match='second_order_rank == '):
+        pred.init_exact_second_order_()
+
+
+def test_features_and_rank_must_agree():
+    lay = _layout()
+    layer = veda_predictor.LayerPredictor(4, 16, second_order_rank=4)
+    feats = torch.zeros(1, lay.n_tiles, 48)
+    with pytest.raises(ValueError, match='must be set together'):
+        layer(feats, feats, torch.tensor([0]))
+
+
+def test_variance_feature_survives_a_tight_tile():
+    """Nearly aligned rows are the case the one-pass identity cannot do.
+
+    `E[x^2] - E[x]^2` on rows this close loses almost every digit, so the
+    two-pass form is not a nicety. The variance must stay non-negative and
+    still match a direct computation.
+    """
+    lay = _layout()
+    base = torch.randn(1, 2, 16)
+    x = (base + 1e-4 * torch.randn(lay.seq_len, 2, 16)).to(torch.bfloat16)
+    tiles = tiling.gather_tiles(x, lay, None)
+    central = veda_predictor.pool_tiles(tiles, lay,
+                                        veda_predictor.SECOND_CENTRAL)
+    assert torch.all(central >= 0.0)
+    assert torch.isfinite(central).all()
+    view = tiles.view(lay.n_tiles, 128, 2, 16).float()
+    for j in range(lay.n_tiles):
+        rows = view[j, :lay.valid_count[j].item()]
+        torch.testing.assert_close(central[:, j],
+                                   rows.var(0, unbiased=False),
+                                   rtol=1e-4, atol=1e-7)

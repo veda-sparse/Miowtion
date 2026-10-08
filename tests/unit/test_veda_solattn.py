@@ -1,5 +1,6 @@
 """Tests for miowtion.veda.solattn (Sol-Attn selection / budget ablation)."""
 
+import json
 import math
 
 import pytest
@@ -452,8 +453,13 @@ def test_head_report_covers_every_density_and_mask():
     names = {key.split('|')[0] for key in entries[0]['errors']}
     assert {'A', 'Mx', 'Omega0', 'Omega1', 'R1_topk', 'R2_zscore',
             'R3_sigma_a1', 'oracle_topk', 'oracle_threshold',
-            'R2g_zscore_global'} == names
-    assert all(key.endswith('|0') or key.endswith('|1')
+            'R2g_zscore_global', 'proxy_topk', 'proxy_logb_topk',
+            'proxy_diag_topk', 'proxy_full_topk'} == names
+    # proxy_topk is R1_topk by another name: same score, same budget.
+    assert entries[0]['errors']['proxy_topk|0'] == \
+        entries[0]['errors']['R1_topk|0']
+    assert entries[0]['recall_vs_omega']['Omega0'] == 1.0
+    assert all(key.rsplit('|', 1)[1] in ('0', '1', '2')
                for key in entries[0]['errors'])
 
 
@@ -479,6 +485,7 @@ def test_summarize_reports_one_row_per_density():
 def test_g1_verdict_follows_the_required_margin():
     base = dict(clip='c', step=0, layer=0, head=0, density=0.1,
                 shape='4x4x8', kept_mean={}, kept_max_over_mean={},
+                recall_vs_omega={}, recall_vs_mass={},
                 spearman={}, skew=0.0, excess_kurtosis=0.0,
                 dropped_mass_r1=0.0)
     better = solattn.Record(errors={'Omega0|0': 0.5, 'Mx|0': 1.0}, **base)
@@ -492,6 +499,7 @@ def test_g1_verdict_follows_the_required_margin():
 def test_g2_verdict_follows_the_oracle_gap():
     base = dict(clip='c', step=0, layer=0, head=0, density=0.1,
                 shape='4x4x8', kept_mean={}, kept_max_over_mean={},
+                recall_vs_omega={}, recall_vs_mass={},
                 spearman={}, skew=0.0, excess_kurtosis=0.0,
                 dropped_mass_r1=0.0)
     wide = solattn.Record(errors={'oracle_topk|0': 1.0,
@@ -633,3 +641,321 @@ def test_dropped_mass_in_the_report_is_a_per_token_fraction():
                                                        query_tiles=4,
                                                        alphas=(1.0,)))[0]
     assert 0.0 < entry['dropped_mass_r1'] < 1.0
+
+
+def test_oracle_mass_compensation_is_exact_when_v_is_block_constant():
+    """c=2 only approximates the direction inside a dropped block.
+
+    Give every key tile a single value vector and that approximation is no
+    approximation at all: the block mean *is* every member, and c=2's
+    denominator is exact by construction, so the error must vanish at any
+    mask. c=1 still misses, because its mass is a zero-order guess. This
+    pins what the equal-cost ceiling can and cannot reach.
+    """
+    head = 0
+    lay, tl = _layout()
+    g = torch.Generator().manual_seed(7)
+    dim = 32
+    q = torch.randn(lay.seq_len, 1, dim, generator=g)
+    k = torch.randn(lay.seq_len, 1, dim, generator=g)
+    v = torch.zeros(lay.seq_len, 1, dim)
+    per_tile = torch.randn(tl.n_tiles, dim, generator=g)
+    for slot in range(tl.num_slots):
+        row = int(tl.perm[slot])
+        if row >= 0:
+            v[row, 0] = per_tile[slot // TILE]
+    lse = _lse(q, k, lay.used)
+    whiten = solattn.whitening(_out_proj(1, dim), head, dim)
+    rows = torch.arange(tl.n_video_tiles)
+    tab = solattn.head_tables(q, k, v, lse, tl, rows, head, whiten)
+    budget = solattn.video_budget(0.4, tab.n_tiles,
+                                  tab.n_tiles - tab.n_video_tiles)
+    mask = solattn.fixed_topk_mask(tab.proxy, budget, tab.kv_ok,
+                                   tab.n_video_tiles, rows)
+    err = solattn.relative_errors(q, k, v, lse, tl, rows, head, whiten,
+                                  {'m': mask}, compensate=(0, 1, 2))
+    assert err[('m', 2)] < 1e-5
+    assert err[('m', 1)] > 1e-3
+    assert err[('m', 0)] > 1e-3
+
+
+def test_oracle_mass_compensation_has_an_exact_denominator():
+    """Dropping everything leaves sum_j a_uj == 1, so c=2 cannot blow up."""
+    tab, args = _tables()
+    q, k, v, lse, tl, rows, head, whiten, _ = args
+    # Keep only the global columns: every video block is dropped.
+    mask = torch.zeros(rows.numel(), tab.n_tiles, dtype=torch.bool)
+    mask[:, tab.n_video_tiles:] = tab.kv_ok[None, tab.n_video_tiles:]
+    err = solattn.relative_errors(q, k, v, lse, tl, rows, head, whiten,
+                                  {'m': mask}, compensate=(0, 1, 2))
+    assert err[('m', 2)] < err[('m', 0)]
+    assert all(math.isfinite(e) for e in err.values())
+
+
+def test_relative_errors_rejects_an_unknown_compensation():
+    tab, args = _tables()
+    q, k, v, lse, tl, rows, head, whiten, _ = args
+    with pytest.raises(ValueError, match='compensate must be'):
+        solattn.relative_errors(q, k, v, lse, tl, rows, head, whiten,
+                                {'m': _keep_all(tab)}, compensate=(3,))
+
+
+# --- second-order proxy variants -----------------------------------------
+
+
+def _block_constant_keys(seed=5, dim=32):
+    """q random, but every key tile holds one repeated key vector."""
+    lay, tl = _layout()
+    g = torch.Generator().manual_seed(seed)
+    q = torch.randn(lay.seq_len, 1, dim, generator=g)
+    k = torch.zeros(lay.seq_len, 1, dim)
+    v = torch.randn(lay.seq_len, 1, dim, generator=g)
+    per_tile = torch.randn(tl.n_tiles, dim, generator=g)
+    for slot in range(tl.num_slots):
+        row = int(tl.perm[slot])
+        if row >= 0:
+            k[row, 0] = per_tile[slot // TILE]
+    return lay, tl, q, k, v
+
+
+def test_second_order_terms_vanish_when_keys_are_block_constant():
+    """No within-block spread means no cumulant beyond the mean."""
+    lay, tl, q, k, v = _block_constant_keys()
+    lse = _lse(q, k, lay.used)
+    whiten = solattn.whitening(_out_proj(1, 32), 0, 32)
+    rows = torch.arange(tl.n_video_tiles)
+    tab = solattn.head_tables(q, k, v, lse, tl, rows, 0, whiten)
+    nv = tab.n_video_tiles
+    base = tab.proxy_logb[:, :nv]
+    torch.testing.assert_close(tab.proxy_diag[:, :nv], base,
+                               rtol=0, atol=2e-3)
+    torch.testing.assert_close(tab.proxy_full[:, :nv], base,
+                               rtol=0, atol=2e-3)
+
+
+def test_log_count_term_only_moves_partial_tiles():
+    tab, _ = _tables()
+    nv = tab.n_video_tiles
+    delta = (tab.proxy_logb - tab.proxy)[:, :nv]
+    # Every row sees the same per-column offset: log of the row count.
+    assert torch.allclose(delta, delta[0:1].expand_as(delta), atol=1e-5)
+    full = tab.valid_rows.new_tensor(TILE)
+    assert torch.all(delta <= math.log(float(full)) + 1e-5)
+
+
+def test_diagonal_second_order_ranks_the_block_mass_better():
+    """The term the predictor structurally cannot express is worth a lot.
+
+    Veda's untrained predictor is exactly `proxy`. Adding the diagonal
+    cumulant term costs one more pooled feature per side and leaves the
+    n^2 bilinear at rank head_dim, so this gap is the headroom of a
+    feature change rather than a capacity change.
+    """
+    tab, _ = _tables()
+    nv = tab.n_video_tiles
+    support = tab.kv_ok[:nv]
+    log_mass = torch.log(tab.attn_mass[:, :nv][:, support].clamp(min=1e-30))
+    rho = {}
+    for name in ('proxy', 'proxy_diag', 'proxy_full'):
+        t = tab.score(name)[:, :nv][:, support]
+        rho[name] = sum(solattn._spearman(t[r], log_mass[r])
+                        for r in range(t.shape[0])) / t.shape[0]
+    assert rho['proxy_diag'] > rho['proxy'] + 0.2
+    assert rho['proxy_full'] >= rho['proxy_diag'] - 0.05
+
+
+def test_scorer_masks_share_the_budget_with_the_oracle():
+    tab, _ = _tables()
+    masks = solattn.scorer_masks(tab, density=0.5)
+    assert sorted(masks) == ['proxy_diag_topk', 'proxy_full_topk',
+                             'proxy_logb_topk', 'proxy_topk']
+    kept = {n: float(solattn.kept_per_row(m, tab.n_video_tiles)
+                     .float().mean()) for n, m in masks.items()}
+    assert len(set(round(x, 6) for x in kept.values())) == 1
+
+
+def test_recall_against_is_a_fraction_and_exact_on_itself():
+    tab, _ = _tables()
+    masks = solattn.selection_masks(tab, density=0.3)
+    nv = tab.n_video_tiles
+    assert solattn.recall_against(masks['A'], masks['A'], nv) == 1.0
+    r = solattn.recall_against(masks['Mx'], masks['A'], nv)
+    assert 0.0 < r < 1.0
+
+
+def test_budget_rules_can_be_switched_off():
+    tab, args = _tables()
+    cfg = solattn.AblationConfig(densities=(0.5,), query_tiles=4,
+                                 alphas=(1.0,), budget_rules=False)
+    entry = solattn.head_report(*args[:4], args[4], args[5], args[6],
+                                args[7], cfg)[0]
+    names = {k.split('|')[0] for k in entry['errors']}
+    assert names == {'A', 'Mx', 'Omega0', 'Omega1', 'proxy_topk',
+                     'proxy_logb_topk', 'proxy_diag_topk',
+                     'proxy_full_topk'}
+    # G2 has no oracle threshold to compare, so it must simply abstain.
+    rec = solattn.Record(clip='c', step=0, layer=0, head=0, shape='s',
+                         **entry)
+    row = solattn.summarize([rec])[0]
+    assert math.isnan(row['g2_oracle_gap'])
+    assert row['g2_pass'] is False
+
+
+def test_predictor_can_express_the_measured_diagonal_proxy():
+    """The ablation's proxy_diag and the predictor's head are one formula.
+
+    solattn measures the diagonal cumulant offline; predictor serves it as
+    a low-rank head. Two independent implementations, so pin them against
+    each other: at full rank with the exact warm start and the base
+    projections zeroed, the predictor's logits must equal
+    `proxy_diag - log B` on the sampled rows.
+    """
+    from miowtion.veda import predictor as veda_predictor
+
+    dim = 32
+    lay, tl = _layout()
+    g = torch.Generator().manual_seed(4)
+    q = torch.randn(lay.seq_len, 1, dim, generator=g).to(torch.bfloat16)
+    k = torch.randn(lay.seq_len, 1, dim, generator=g).to(torch.bfloat16)
+    v = torch.randn(lay.seq_len, 1, dim, generator=g).to(torch.bfloat16)
+    lse = _lse(q.float(), k.float(), lay.used)
+    whiten = solattn.whitening(_out_proj(1, dim), 0, dim)
+    rows = torch.arange(tl.n_video_tiles)
+    tab = solattn.head_tables(q, k, v, lse, tl, rows, 0, whiten)
+
+    pred = veda_predictor.TileScorePredictor(1, 1, dim,
+                                             second_order_rank=dim)
+    pred.init_exact_second_order_()
+    with torch.no_grad():
+        pred.layers[0].proj_q.zero_()
+        pred.layers[0].proj_k.zero_()
+    heads = torch.tensor([0])
+    qt, kt = (tiling.gather_tiles(t, tl, heads) for t in (q, k))
+    logits = pred.scores(0, qt, kt, tl, heads)[0]
+
+    nv = tab.n_video_tiles
+    want = (tab.proxy_diag - tab.proxy_logb + tab.proxy)[:, :nv]
+    got = logits.index_select(0, rows)[:, :nv]
+    torch.testing.assert_close(got, want, rtol=2e-3, atol=2e-3)
+
+
+# --- static per-head budget allocation -----------------------------------
+
+
+def _curve_record(layer, head, density, err):
+    return solattn.Record(
+        clip='c', step=0, layer=layer, head=head, density=density,
+        shape='s', errors={'proxy_topk|0': err}, recall_vs_omega={},
+        recall_vs_mass={}, kept_mean={}, kept_max_over_mean={},
+        spearman={}, skew=0.0, excess_kurtosis=0.0, dropped_mass_r1=0.0)
+
+
+def test_error_curve_medians_over_clips_and_steps():
+    records = [_curve_record(0, 0, 0.1, 0.4), _curve_record(0, 0, 0.1, 0.6),
+               _curve_record(0, 0, 0.2, 0.2), _curve_record(1, 0, 0.1, 0.9)]
+    curves = solattn.error_curve(records)
+    assert curves[(0, 0)] == [(0.1, 0.5), (0.2, 0.2)]
+    assert curves[(1, 0)] == [(0.1, 0.9)]
+    with pytest.raises(ValueError, match='no record carries'):
+        solattn.error_curve(records, mask='nope')
+
+
+def test_log_log_interpolation_is_exact_on_a_power_law():
+    curve = [(0.05, 0.4), (0.20, 0.1)]      # eps proportional to rho^-1
+    mid = solattn._interpolate_log_log(curve, 0.10)
+    assert mid == pytest.approx(0.4 * (0.10 / 0.05) ** -1.0, rel=1e-9)
+    # Outside the range it extrapolates along the same slope.
+    assert solattn._interpolate_log_log(curve, 0.40) == pytest.approx(
+        0.05, rel=1e-9)
+
+
+def test_allocation_hits_the_mean_density_and_beats_uniform():
+    """One sensitive head and one flat head: the budget should move."""
+    records = []
+    for density in (0.05, 0.1, 0.2):
+        # Head A halves its error when the budget doubles; head B barely
+        # moves, so every block is worth more to A than to B.
+        records.append(_curve_record(0, 0, density, 0.5 * (density / 0.05)
+                                     ** -1.0))
+        records.append(_curve_record(0, 1, density, 0.5 * (density / 0.05)
+                                     ** -0.05))
+    curves = solattn.error_curve(records)
+    report = solattn.allocation_report(curves, mean_density=0.1)
+    # Never overspend; with two heads on a grid the target is not exactly
+    # attainable, so only the ceiling is guaranteed.
+    assert report['achieved_mean_density'] <= 0.1 * (1 + 1e-9) + 1e-12
+    assert report['achieved_mean_density'] > 0.09
+    assert report['relative_saving'] > 0.05
+    chosen = solattn.allocate_budget(curves, mean_density=0.1)
+    assert chosen[(0, 0)] > chosen[(0, 1)]
+
+
+def test_allocation_is_uniform_when_every_head_is_identical():
+    records = [_curve_record(0, h, d, 0.5 * (d / 0.05) ** -0.6)
+               for h in range(4) for d in (0.05, 0.1, 0.2)]
+    curves = solattn.error_curve(records)
+    chosen = solattn.allocate_budget(curves, mean_density=0.1)
+    assert len(set(chosen.values())) == 1
+    assert sum(chosen.values()) / len(chosen) <= 0.1 * (1 + 1e-9) + 1e-12
+    report = solattn.allocation_report(curves, mean_density=0.1)
+    assert abs(report['relative_saving']) < 0.02
+
+
+def test_allocation_rejects_an_out_of_range_target():
+    records = [_curve_record(0, 0, d, 0.5 / d) for d in (0.05, 0.2)]
+    curves = solattn.error_curve(records)
+    with pytest.raises(ValueError, match='outside the grid'):
+        solattn.allocate_budget(curves, mean_density=0.9)
+    with pytest.raises(ValueError, match='no error curves'):
+        solattn.allocate_budget({}, mean_density=0.1)
+
+
+def test_records_load_from_a_file_without_the_recall_fields(tmp_path):
+    """Runs written before the recall maps existed must still load."""
+    tab, args = _tables()
+    records = _records(tab, args, densities=(0.5,))
+    path = str(tmp_path / 'old.json')
+    solattn.save_records(path, records, {})
+    raw = json.loads(open(path).read())
+    for row in raw['records']:
+        row.pop('recall_vs_omega')
+        row.pop('recall_vs_mass')
+        row['a_future_field'] = 1
+    open(path, 'w').write(json.dumps(raw))
+    back, _ = solattn.load_records(path)
+    assert len(back) == len(records)
+    assert back[0].recall_vs_omega == {}
+    assert back[0].errors == records[0].errors
+
+
+def test_allocation_accepts_a_target_at_the_measured_boundary():
+    """exp(log(x)) drift must not push the grid past its own endpoints."""
+    records = [_curve_record(0, h, d, 0.5 * (d / 0.05) ** -0.6)
+               for h in range(3) for d in (0.05, 0.1, 0.2)]
+    curves = solattn.error_curve(records)
+    for target in (0.05, 0.2):
+        chosen = solattn.allocate_budget(curves, mean_density=target)
+        mean = sum(chosen.values()) / len(chosen)
+        assert mean == pytest.approx(target, rel=1e-9)
+
+
+def test_scorer_report_measures_the_gap_closed():
+    base = dict(clip='c', step=0, layer=0, head=0, density=0.1, shape='s',
+                kept_mean={}, kept_max_over_mean={}, spearman={},
+                skew=0.0, excess_kurtosis=0.0, dropped_mass_r1=0.0)
+    rec = solattn.Record(
+        errors={'proxy_topk|0': 1.0, 'proxy_diag_topk|0': 0.7,
+                'Omega0|0': 0.5},
+        recall_vs_omega={'proxy_topk': 0.4, 'proxy_diag_topk': 0.6,
+                         'Omega0': 1.0},
+        recall_vs_mass={}, **base)
+    rows = {r['mask']: r for r in solattn.scorer_report([rec], 0.1)}
+    assert rows['proxy_topk']['gap_closed'] == pytest.approx(0.0)
+    assert rows['Omega0']['gap_closed'] == pytest.approx(1.0)
+    assert rows['proxy_diag_topk']['gap_closed'] == pytest.approx(0.6)
+    assert rows['proxy_diag_topk']['recall_vs_omega'] == pytest.approx(0.6)
+    assert math.isnan(rows['proxy_topk']['recall_vs_mass'])
+    with pytest.raises(ValueError, match='no record at density'):
+        solattn.scorer_report([rec], 0.99)
+    with pytest.raises(ValueError, match='is missing'):
+        solattn.scorer_report([rec], 0.1, oracle='nope')

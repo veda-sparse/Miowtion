@@ -10,7 +10,8 @@ H2 (budget allocation): a per-row variable budget beats a fixed top-k.
 
 Both reduce to one exact identity. For query token `u` in query tile `i`,
 with the kept set `S_i`, the dropped set `U_i` and `c` in {0, 1} selecting
-whether Sol's zero-order compensation is applied to the dropped blocks:
+whether Sol's zero-order compensation is applied to the dropped blocks
+(c = 2 is the equal-cost upper bound on it, see `relative_errors`):
 
     O_u^(M,c) - O_u = -(Z_u / D_u) * sum_{j in U_i} xi_uj,
     xi_uj = (dN_uj - dE_uj * O_u) / Z_u,
@@ -119,6 +120,78 @@ def whitening(out_proj_weight: torch.Tensor, head: int,
         return evecs * evals.clamp(min=0.0).sqrt()[None, :]
 
 
+# The log mass of a block is a cumulant expansion of the pooled score:
+#   log E_uj = log B_j + s_mean + 1/2 var + ...,
+# with s_mean = q_u . Kbar_j / sqrt(d) and var = q_u^T Cov_j q_u / d.
+# Veda's predictor, before training, computes exactly `s_mean` and nothing
+# else, so the whole second-order term is signal it cannot express. These
+# variants measure how much of it matters.
+
+
+@torch.no_grad()
+def _proxy_variants(q_t: torch.Tensor, k_t: torch.Tensor,
+                    q_mean: torch.Tensor, k_mean: torch.Tensor,
+                    counts: torch.Tensor, layout: tiling.TileLayout,
+                    rows: torch.Tensor, scale: float,
+                    head_dim: int) -> dict[str, torch.Tensor]:
+    """[R, N] proxy score variants; global columns stay NaN.
+
+    Args:
+        q_t: [N * TILE, D] fp32 tile-ordered queries, padding zeroed.
+        k_t: [N * TILE, D] fp32 tile-ordered keys.
+        q_mean: [n_video, D] per-tile mean query.
+        k_mean: [N, D] per-tile mean key.
+        counts: [N] fp32 real rows per tile, clamped to 1.
+        layout: Tile layout.
+        rows: [R] int64 sampled video query tiles.
+        scale: 1 / sqrt(head_dim).
+        head_dim: D.
+
+    Returns:
+        'proxy', 'proxy_logb', 'proxy_diag', 'proxy_full'.
+    """
+    n_tiles = layout.n_tiles
+    n_video = layout.n_video_tiles
+    device = q_t.device
+
+    def blank() -> torch.Tensor:
+        return torch.full((rows.numel(), n_tiles), float('nan'),
+                          device=device)
+
+    qm = q_mean.index_select(0, rows)                             # [R, D]
+    km = k_mean[:n_video]                                         # [V, D]
+    zeroth = (qm @ km.transpose(0, 1)) * scale
+    log_b = torch.log(counts[:n_video])[None, :]
+
+    # Second moments. The query side needs E[q q^T] over the tile, the key
+    # side the central covariance of the block.
+    qt = q_t.view(n_tiles, TILE, head_dim)
+    kt = k_t.view(n_tiles, TILE, head_dim)
+    q_sq = (qt.square().sum(1) / counts[:, None]).index_select(0, rows)
+    k_sq = kt.square().sum(1) / counts[:, None]
+    k_var = (k_sq - k_mean.square())[:n_video]                    # [V, D]
+    diag_term = 0.5 * scale * scale * (q_sq @ k_var.transpose(0, 1))
+
+    # Full term: <E[q q^T], Cov_j> is a rank D^2 bilinear, so it is one
+    # matmul over flattened outer products.
+    q_outer = torch.einsum('nbi,nbj->nij', qt, qt) / counts[:, None, None]
+    q_outer = q_outer.index_select(0, rows).reshape(rows.numel(), -1)
+    k_outer = torch.einsum('nbi,nbj->nij', kt, kt) / counts[:, None, None]
+    k_outer = k_outer - k_mean[:, :, None] * k_mean[:, None, :]
+    k_outer = k_outer[:n_video].reshape(n_video, -1)
+    full_term = 0.5 * scale * scale * (q_outer @ k_outer.transpose(0, 1))
+
+    out = {}
+    for name, video in (('proxy', zeroth),
+                        ('proxy_logb', zeroth + log_b),
+                        ('proxy_diag', zeroth + log_b + diag_term),
+                        ('proxy_full', zeroth + log_b + full_term)):
+        table = blank()
+        table[:, :n_video] = video
+        out[name] = table
+    return out
+
+
 @dataclasses.dataclass
 class HeadTables:
     """Block score tables of one (layer, head, step) over sampled rows.
@@ -133,7 +206,16 @@ class HeadTables:
             current distillation target).
         omega0: Omega_ij^(0), ideal importance under direct discard.
         omega1: Omega_ij^(1), ideal importance under Sol compensation.
-        proxy: s_tilde_ij, the mean-pooled proxy score Sol thresholds.
+        proxy: s_tilde_ij, the mean-pooled proxy score Sol thresholds,
+            which is also what Veda's predictor computes before training.
+        proxy_logb: `proxy` plus log of the block's real row count, the
+            zero-order estimate of the block's log mass.
+        proxy_diag: `proxy_logb` plus the diagonal second-order cumulant
+            term. One extra pooled feature per side, so the predictor's
+            n^2 bilinear stays at rank head_dim.
+        proxy_full: `proxy_logb` plus the full second-order term. Needs a
+            rank head_dim^2 bilinear, far too expensive to serve; it is
+            the ceiling of any second-order correction.
         mu: [R] row mean of `proxy` over selectable video tiles.
         sigma: [R] row standard deviation of `proxy`, same support.
         valid_rows: [R] int64 real query tokens in each sampled tile.
@@ -148,6 +230,9 @@ class HeadTables:
     omega0: torch.Tensor
     omega1: torch.Tensor
     proxy: torch.Tensor
+    proxy_logb: torch.Tensor
+    proxy_diag: torch.Tensor
+    proxy_full: torch.Tensor
     mu: torch.Tensor
     sigma: torch.Tensor
     valid_rows: torch.Tensor
@@ -162,7 +247,9 @@ class HeadTables:
         """The [R, N] table named by one of the H1 oracle scores."""
         table = {'A': self.attn_mass, 'Mx': self.max_prob,
                  'Omega0': self.omega0, 'Omega1': self.omega1,
-                 'proxy': self.proxy}.get(name)
+                 'proxy': self.proxy, 'proxy_logb': self.proxy_logb,
+                 'proxy_diag': self.proxy_diag,
+                 'proxy_full': self.proxy_full}.get(name)
         if table is None:
             raise ValueError(f'unknown score {name!r}')
         return table
@@ -284,17 +371,19 @@ def head_tables(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
         return grouped.amax(1) if index == 1 else grouped.sum(1)
 
     attn_mass, max_prob, omega0, omega1 = (rows_of(i) for i in range(4))
-    proxy = torch.full((rows.numel(), n_tiles), float('nan'), device=device)
-    proxy[:, :layout.n_video_tiles] = (
-        q_mean.index_select(0, rows) @ k_mean[:layout.n_video_tiles]
-        .transpose(0, 1)) * scale
+    variants = _proxy_variants(q_t, k_t, q_mean, k_mean, counts, layout,
+                               rows, scale, head_dim)
+    proxy = variants['proxy']
     support = layout.kv_ok[:layout.n_video_tiles]
     sel = proxy[:, :layout.n_video_tiles][:, support]
     mu = sel.mean(-1)
     sigma = sel.std(-1, unbiased=False)
     return HeadTables(
         rows=rows, attn_mass=attn_mass, max_prob=max_prob, omega0=omega0,
-        omega1=omega1, proxy=proxy, mu=mu, sigma=sigma,
+        omega1=omega1, proxy=proxy,
+        proxy_logb=variants['proxy_logb'],
+        proxy_diag=variants['proxy_diag'],
+        proxy_full=variants['proxy_full'], mu=mu, sigma=sigma,
         valid_rows=layout.valid_count.index_select(0, rows).long(),
         kv_ok=layout.kv_ok.clone(), n_video_tiles=layout.n_video_tiles)
 
@@ -308,6 +397,15 @@ def relative_errors(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
                     ) -> dict[tuple[str, int], float]:
     """Pass two: epsilon(M, c) of every mask, from one shared attention scan.
 
+    Sol's compensation factors into a guessed mass times the block's mean
+    value, `Nhat_uj = exp(q_u . Kbar_j / sqrt d) * Vhat_j`. So c = 2
+    replaces only the guess by the true mass `E_uj`, keeping the block-mean
+    direction. It costs exactly what c = 1 costs (one scalar per dropped
+    block) and is therefore the equal-cost ceiling on *any* predictor of
+    the correction weight, trained or not. Its denominator is exact, so
+    all of its remaining error is direction inside the dropped blocks,
+    which a per-block scalar cannot reach.
+
     Args:
         q: [S, H, D] packed queries.
         k: [S, H, D] packed keys.
@@ -318,14 +416,17 @@ def relative_errors(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
         head: Head index.
         whiten: [D, D] fp32 L from `whitening`.
         masks: name -> [R, N] bool keep mask over all key tiles.
-        compensate: Which c values to evaluate.
+        compensate: Which c values to evaluate: 0 discards, 1 is Sol's
+            zero-order compensation, 2 is its equal-cost ceiling.
 
     Returns:
         (mask name, c) -> relative Frobenius error in W_o space.
 
     Raises:
-        ValueError: If a mask has the wrong shape.
+        ValueError: If a mask has the wrong shape, or c is not 0, 1 or 2.
     """
+    if any(c not in (0, 1, 2) for c in compensate):
+        raise ValueError(f'compensate must be 0, 1 or 2: {compensate}')
     device = q.device
     head_dim = q.shape[-1]
     scale = 1.0 / math.sqrt(head_dim)
@@ -343,6 +444,9 @@ def relative_errors(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
     k_mean = (k_t.view(n_tiles, TILE, head_dim).sum(1) / counts[:, None])
     v_white = v_t @ whiten
     v_sum_white = v_white.view(n_tiles, TILE, head_dim).sum(1)
+    # c = 2 weights the same direction by the true mass, so it needs the
+    # block mean rather than the block sum.
+    v_mean_white = v_sum_white / counts[:, None]
 
     slots = _slots_of(rows)
     row_valid_all = layout.slot_valid.index_select(0, slots).to(torch.float32)
@@ -375,11 +479,18 @@ def relative_errors(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
             num = (p * keep_f.repeat_interleave(TILE, dim=1)) @ v_white
             den = (a * keep_f).sum(-1)
             drop = 1.0 - keep_f
-            num_hat = (p_hat * drop) @ v_sum_white
-            den_hat = (a_hat * drop).sum(-1)
+            # c = 1: guessed mass. c = 2: true mass, same direction.
+            extra = {
+                1: ((p_hat * drop) @ v_sum_white, (a_hat * drop).sum(-1)),
+                2: ((a * drop) @ v_mean_white, (a * drop).sum(-1)),
+            }
             for c in compensate:
-                o_sparse = ((num + c * num_hat)
-                            / (den + c * den_hat).clamp(min=tiny)[:, None])
+                if c == 0:
+                    num_c, den_c = num, den
+                else:
+                    num_x, den_x = extra[c]
+                    num_c, den_c = num + num_x, den + den_x
+                o_sparse = num_c / den_c.clamp(min=tiny)[:, None]
                 diff = (o_sparse - o_white).square().sum(-1) * rv
                 err[(name, c)] += diff.double().sum()
         del p, pb
@@ -599,6 +710,36 @@ def selection_masks(tables: HeadTables, density: float) -> dict[
             for name in ('A', 'Mx', 'Omega0', 'Omega1')}
 
 
+def scorer_masks(tables: HeadTables, density: float) -> dict[
+        str, torch.Tensor]:
+    """Per-row top-k under each servable score, at one density.
+
+    `proxy` is what Veda's predictor computes before training, so these
+    bracket what a better *feature set* could buy without changing the
+    kernel or the budget rule. `proxy_diag` costs one more pooled feature
+    per side; `proxy_full` is not servable and marks the ceiling of any
+    second-order correction.
+    """
+    n_video, kv_ok = tables.n_video_tiles, tables.kv_ok
+    budget = video_budget(density, tables.n_tiles, tables.n_tiles - n_video)
+    return {f'{name}_topk': fixed_topk_mask(tables.score(name), budget,
+                                            kv_ok, n_video, tables.rows)
+            for name in ('proxy', 'proxy_logb', 'proxy_diag', 'proxy_full')}
+
+
+def recall_against(mask: torch.Tensor, reference: torch.Tensor,
+                   n_video: int) -> float:
+    """Fraction of the reference's kept video tiles that `mask` also keeps.
+
+    The forced diagonal is not excluded here, unlike the training-time
+    recall: these masks have no forced diagonal, so there is nothing free
+    to remove.
+    """
+    hit = (mask[:, :n_video] & reference[:, :n_video]).sum().double()
+    total = reference[:, :n_video].sum().double().clamp(min=1)
+    return float(hit / total)
+
+
 def _normal_quantile(p: float) -> float:
     """Phi^{-1}(p) via the error function."""
     if not 0.0 < p < 1.0:
@@ -684,6 +825,8 @@ class Record:
         density: Overall keep fraction the rules were calibrated to.
         shape: Tile shape of this head, as a string.
         errors: 'mask|c' -> relative error in W_o space.
+        recall_vs_omega: 'mask' -> overlap with the ideal-importance set.
+        recall_vs_mass: 'mask' -> overlap with the block-mass set.
         kept_mean: 'mask' -> mean video key tiles kept per row.
         kept_max_over_mean: 'mask' -> load imbalance.
         spearman: z-score zone -> Spearman of proxy against Omega0.
@@ -705,6 +848,11 @@ class Record:
     skew: float
     excess_kurtosis: float
     dropped_mass_r1: float
+    # Added after the first runs; defaulted so their files still load.
+    recall_vs_omega: dict[str, float] = dataclasses.field(
+        default_factory=dict)
+    recall_vs_mass: dict[str, float] = dataclasses.field(
+        default_factory=dict)
 
     def to_json(self) -> dict:
         return dataclasses.asdict(self)
@@ -722,6 +870,9 @@ class AblationConfig:
         k_max: Upper clamp on R3's per-row count; None disables it.
         oracle: Which Omega table forms the oracle row of the 2x2.
         heads: Heads to measure; None means every head.
+        budget_rules: Include H2's variable-budget rules. Turn them off
+            once that question is settled: they are most of the pass-two
+            cost and none of the remaining signal.
     """
 
     densities: Sequence[float] = (0.05, 0.1, 0.2)
@@ -731,6 +882,7 @@ class AblationConfig:
     k_max: int | None = None
     oracle: str = 'Omega0'
     heads: Sequence[int] | None = None
+    budget_rules: bool = True
 
 
 def head_report(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
@@ -759,13 +911,22 @@ def head_report(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
     out = []
     for density in config.densities:
         masks = selection_masks(tables, density)
-        masks.update(allocation_masks(tables, density, config.alphas,
-                                      config.k_min, config.k_max,
-                                      config.oracle))
+        if config.budget_rules:
+            masks.update(allocation_masks(tables, density, config.alphas,
+                                          config.k_min, config.k_max,
+                                          config.oracle))
+        masks.update(scorer_masks(tables, density))
         errors = relative_errors(q, k, v, lse, layout, rows, head, whiten,
-                                 masks)
+                                 masks, compensate=(0, 1, 2))
+        n_video = tables.n_video_tiles
         out.append({
             'density': float(density),
+            'recall_vs_omega': {
+                name: recall_against(m, masks[config.oracle], n_video)
+                for name, m in masks.items()},
+            'recall_vs_mass': {
+                name: recall_against(m, masks['A'], n_video)
+                for name, m in masks.items()},
             'errors': {f'{name}|{c}': value
                        for (name, c), value in errors.items()},
             'kept_mean': {
@@ -779,8 +940,9 @@ def head_report(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
             'skew': float(moments['skew'].mean()),
             'excess_kurtosis': float(moments['excess_kurtosis'].mean()),
             # Per-token mean, so tiles with fewer real rows do not skew it.
+            # proxy_topk is R1_topk by another name and is always present.
             'dropped_mass_r1': float(
-                (dropped_mass(tables, masks['R1_topk'])
+                (dropped_mass(tables, masks['proxy_topk'])
                  / tables.valid_rows.clamp(min=1)).mean()),
         })
     return out
@@ -952,6 +1114,247 @@ def summarize(records: Sequence[Record], eta: float = 0.15,
     return out
 
 
+def scorer_report(records: Sequence[Record], density: float,
+                  oracle: str = 'Omega0',
+                  baseline: str = 'proxy_topk',
+                  compensate: int = 0) -> list[dict]:
+    """How far each servable score closes the gap to the oracle.
+
+    The plan's own metric for a scorer: the fraction of the distance
+    between the proxy and the oracle that it recovers,
+
+        (eps_baseline - eps_variant) / (eps_baseline - eps_oracle).
+
+    1.0 means it scores as well as knowing the answer; 0.0 means it adds
+    nothing over the untrained pooled score.
+
+    Args:
+        records: Rows from an ablation run.
+        density: Which density to report.
+        oracle: Mask name of the oracle, the far end of the gap.
+        baseline: Mask name of the near end.
+        compensate: Which c value to read.
+
+    Returns:
+        One dict per mask, sorted by median error.
+
+    Raises:
+        ValueError: If no record has that density, or the ends are absent.
+    """
+    rows = [r for r in records if r.density == density]
+    if not rows:
+        raise ValueError(f'no record at density {density}')
+    names = sorted({n.rsplit('|', 1)[0] for r in rows for n in r.errors})
+    key = lambda n: f'{n}|{compensate}'  # noqa: E731
+    for end in (oracle, baseline):
+        if key(end) not in rows[0].errors:
+            raise ValueError(f'{end!r} is missing at c={compensate}')
+    med = {n: _median([r.errors[key(n)] for r in rows if key(n) in r.errors])
+           for n in names}
+    span = med[baseline] - med[oracle]
+    out = []
+    for name in names:
+        recalls = [r.recall_vs_omega.get(name) for r in rows
+                   if name in r.recall_vs_omega]
+        mass = [r.recall_vs_mass.get(name) for r in rows
+                if name in r.recall_vs_mass]
+        out.append({
+            'mask': name,
+            'median_error': med[name],
+            'gap_closed': ((med[baseline] - med[name]) / span
+                           if abs(span) > 1e-30 else float('nan')),
+            'recall_vs_omega': _median(recalls) if recalls else float('nan'),
+            'recall_vs_mass': _median(mass) if mass else float('nan'),
+        })
+    out.sort(key=lambda row: row['median_error'])
+    return out
+
+
+# --- Static per-head budget allocation -----------------------------------
+#
+# H2 asked whether a row inside a head should get its own budget, and the
+# answer was no: the proxy cannot rank well enough to place the extra
+# blocks, and the load imbalance costs more than the error it saves.
+#
+# Lifting the same question to heads changes both objections. A per-head
+# budget is a static number calibrated offline, exactly like the tile plan
+# already is, so every row of a head keeps a uniform budget: no imbalance,
+# no runtime decision, no kernel change. And the allocator is not guessing
+# from a proxy, it is reading measured error curves.
+
+
+def error_curve(records: Sequence[Record], mask: str = 'proxy_topk',
+                compensate: int = 0) -> dict[tuple[int, int],
+                                             list[tuple[float, float]]]:
+    """(layer, head) -> sorted [(density, median error)] over clips/steps.
+
+    Args:
+        records: Rows from an ablation run over several densities.
+        mask: Which mask's error to read.
+        compensate: Which c value to read.
+
+    Returns:
+        One curve per head, with the median taken over clips and steps.
+
+    Raises:
+        ValueError: If no record carries that mask and c.
+    """
+    key = f'{mask}|{compensate}'
+    buckets: dict[tuple[int, int, float], list[float]] = {}
+    for record in records:
+        if key not in record.errors:
+            continue
+        slot = (record.layer, record.head, record.density)
+        buckets.setdefault(slot, []).append(record.errors[key])
+    if not buckets:
+        raise ValueError(f'no record carries {key!r}')
+    curves: dict[tuple[int, int], list[tuple[float, float]]] = {}
+    for (layer, head, density), values in buckets.items():
+        curves.setdefault((layer, head), []).append(
+            (density, _median(values)))
+    for curve in curves.values():
+        curve.sort()
+    return curves
+
+
+def _interpolate_log_log(curve: Sequence[tuple[float, float]],
+                         density: float) -> float:
+    """Median error at `density`, linear in log density and log error.
+
+    Relative error against a fixed budget behaves like a power law in the
+    keep ratio over this range, so interpolating the logs is both smoother
+    and monotone, which the allocator below relies on.
+    """
+    xs = [math.log(d) for d, _ in curve]
+    ys = [math.log(max(e, 1e-12)) for _, e in curve]
+    x = math.log(density)
+    if x <= xs[0]:
+        lo, hi = 0, 1
+    elif x >= xs[-1]:
+        lo, hi = len(xs) - 2, len(xs) - 1
+    else:
+        hi = next(i for i in range(1, len(xs)) if xs[i] >= x)
+        lo = hi - 1
+    span = xs[hi] - xs[lo]
+    t = 0.0 if span == 0 else (x - xs[lo]) / span
+    return math.exp(ys[lo] + t * (ys[hi] - ys[lo]))
+
+
+def allocate_budget(curves: dict[tuple[int, int],
+                                 list[tuple[float, float]]],
+                    mean_density: float, grid: Sequence[float] | None = None,
+                    tolerance: float = 1e-4) -> dict[tuple[int, int], float]:
+    """Per-head densities minimizing total error at a fixed mean density.
+
+    Lagrangian on a discrete grid: for a price `lam` on density every head
+    independently picks the grid point minimizing `error + lam * density`,
+    and `lam` is bisected until the mean lands on `mean_density`. With a
+    convex curve this is the exact optimum of the grid-restricted problem,
+    and the usual marginal-value condition holds: at the solution every
+    head's last block buys the same error reduction.
+
+    Args:
+        curves: From `error_curve`.
+        mean_density: The budget to spend, averaged over heads.
+        grid: Candidate densities; defaults to 48 log-spaced points inside
+            the measured range.
+        tolerance: Stop bisecting once the mean is this close below the
+            target.
+
+    Returns:
+        (layer, head) -> density. The mean never exceeds `mean_density`:
+        a budget that overspends is not a budget, and on a discrete grid
+        the exact target is usually not attainable. With thousands of
+        heads the shortfall is far below one grid step.
+
+    Raises:
+        ValueError: If there are no curves, or the target is outside grid.
+    """
+    if not curves:
+        raise ValueError('no error curves to allocate over')
+    if grid is None:
+        lo = min(d for c in curves.values() for d, _ in c)
+        hi = max(d for c in curves.values() for d, _ in c)
+        steps = 48
+        grid = [math.exp(math.log(lo) + (math.log(hi) - math.log(lo))
+                         * i / (steps - 1.0)) for i in range(steps)]
+        # Pin the ends: exp(log(x)) drifts, and a target equal to the
+        # measured minimum would then look out of range.
+        grid[0], grid[-1] = lo, hi
+    grid = sorted(grid)
+    if not grid[0] <= mean_density <= grid[-1]:
+        raise ValueError(f'mean density {mean_density} outside the grid '
+                         f'[{grid[0]:.4f}, {grid[-1]:.4f}]')
+    table = {head: [_interpolate_log_log(curve, d) for d in grid]
+             for head, curve in curves.items()}
+    # Summing n copies of an exact grid value drifts above it, so the
+    # feasibility test needs a relative slack rather than a bare <=.
+    ceiling = mean_density * (1.0 + 1e-9) + 1e-12
+
+    def pick(lam: float) -> dict[tuple[int, int], float]:
+        out = {}
+        for head, errs in table.items():
+            best = min(range(len(grid)), key=lambda i: errs[i] + lam * grid[i])
+            out[head] = grid[best]
+        return out
+
+    # A larger price buys less density, so the mean is monotone in lam.
+    low, high = 0.0, 1.0
+    best = None
+    while True:
+        chosen = pick(high)
+        if sum(chosen.values()) / len(table) <= ceiling:
+            best = chosen
+            break
+        high *= 4.0
+        if high > 1e12:
+            raise ValueError('no price drives the mean density down; the '
+                             'curves are probably not decreasing')
+    for _ in range(200):
+        mid = 0.5 * (low + high)
+        chosen = pick(mid)
+        achieved = sum(chosen.values()) / len(chosen)
+        if achieved <= ceiling:
+            best = chosen
+            high = mid
+            if mean_density - achieved <= tolerance:
+                break
+        else:
+            low = mid
+    return best
+
+
+def allocation_report(curves: dict[tuple[int, int],
+                                   list[tuple[float, float]]],
+                      mean_density: float) -> dict:
+    """What a static per-head budget buys over a uniform one.
+
+    Returns:
+        Total error under the uniform and the allocated budgets, the
+        relative saving, and the spread of the chosen densities.
+    """
+    uniform = sum(_interpolate_log_log(c, mean_density)
+                  for c in curves.values())
+    chosen = allocate_budget(curves, mean_density)
+    allocated = sum(_interpolate_log_log(curves[h], d)
+                    for h, d in chosen.items())
+    densities = sorted(chosen.values())
+    n = len(densities)
+    return {
+        'mean_density': mean_density,
+        'heads': n,
+        'uniform_total_error': uniform,
+        'allocated_total_error': allocated,
+        'relative_saving': (uniform - allocated) / max(uniform, 1e-30),
+        'achieved_mean_density': sum(densities) / n,
+        'density_p10': densities[int(0.10 * (n - 1))],
+        'density_median': densities[n // 2],
+        'density_p90': densities[int(0.90 * (n - 1))],
+        'density_min': densities[0],
+        'density_max': densities[-1],
+    }
+
+
 def save_records(path: str, records: Sequence[Record], meta: dict) -> None:
     """Atomically writes the rows and their summary next to the metadata."""
     payload = {'meta': meta,
@@ -964,10 +1367,17 @@ def save_records(path: str, records: Sequence[Record], meta: dict) -> None:
 
 
 def load_records(path: str) -> tuple[list[Record], dict]:
-    """Reads back what `save_records` wrote."""
+    """Reads back what `save_records` wrote.
+
+    Unknown keys are dropped and missing optional ones defaulted, so a
+    file written by an older or newer schema still loads.
+    """
     with open(path) as handle:
         payload = json.load(handle)
-    return [Record(**row) for row in payload['records']], payload['meta']
+    known = {f.name for f in dataclasses.fields(Record)}
+    records = [Record(**{k: v for k, v in row.items() if k in known})
+               for row in payload['records']]
+    return records, payload['meta']
 
 
 # --- Run driver (single process; the ablation is cheap) ------------------
@@ -1024,6 +1434,7 @@ class RunConfig:
     k_max: int | None = None
     oracle: str = 'Omega0'
     heads: list[int] | None = None
+    budget_rules: bool = True
     eta: float = 0.15
     g2_margin: float = 0.05
     seed: int = 0
@@ -1038,7 +1449,8 @@ class RunConfig:
             densities=tuple(self.densities), alphas=tuple(self.alphas),
             query_tiles=self.query_tiles, k_min=self.k_min,
             k_max=self.k_max, oracle=self.oracle,
-            heads=tuple(self.heads) if self.heads is not None else None)
+            heads=tuple(self.heads) if self.heads is not None else None,
+            budget_rules=self.budget_rules)
 
 
 def ablate_clip(model, cache, sample, geometry, schedule, tables,
