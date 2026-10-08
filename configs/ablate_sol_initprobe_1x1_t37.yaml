@@ -1,0 +1,27 @@
+# Predictor probe at the smallest geometry and a high sparsity, over every
+# cached clip of that length. Two jobs: compare the predictors in the
+# metrics stage-1 training already watches, and rank the clips by how hard
+# sparsity is on them (a low heat_ceiling means the teacher's attention is
+# not concentrated enough for the budget, so no predictor can do well).
+# 1:1@37 is 768x768, 124 frames, 21312 video tokens.
+run_name: sol_initprobe_1x1_t37
+checkpoint_root: weights/MiniMax-H3
+sample_cache: artifacts/samples/moviegen_holdout20
+geometries: ['1:1@37']
+variant: FL2VA
+tasks: [t2va]
+steps: [0, 3, 7]
+schedule: turbo
+num_steps: 8
+teacher_adapter: weights/turbo_lora/minimax_h3_turbo_v4_step600_ema.safetensors
+tile_shape: 4x4x8
+predictors:
+  - veda1_trained=weights/veda/Minimax-H3-T2VA-Veda-8NFE-600Step-Preview/minimax_h3_t2va_veda_8nfe_600step_preview_fp8.safetensors
+  - veda2_untrained=weights/veda/veda2_untrained.safetensors
+num_clips: 5
+densities: [0.05]
+query_tiles: 16
+out_dir: runs
+offload_blocks: 30
+prefetch: 1
+mlp_chunk_rows: 8192

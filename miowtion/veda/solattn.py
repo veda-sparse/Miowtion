@@ -1147,6 +1147,13 @@ class PredictorInitProbe:
                     max=pred.layers[layer].proj_q.shape[0] - 1)
                 full = pred.scores(layer, q_t, k_t, tile_layout, heads)
                 logits[name] = full.index_select(1, rows).contiguous()
+            # Spread of the scores over the video quadrant. Terms added
+            # to a *trained* base have to compete with it, so comparing
+            # this across variants is how a scale mismatch shows up.
+            spread = {}
+            for name, score in logits.items():
+                video = score[:, :, :tile_layout.n_video_tiles]
+                spread[name] = float(video.float().std())
             for target in self.targets:
                 heat = veda_heatmap.teacher_heat(q_t, k_t, lse_t,
                                                  tile_layout, rows,
@@ -1157,9 +1164,38 @@ class PredictorInitProbe:
                     self.rows.append({
                         'step': self.step, 'layer': layer_index,
                         'variant': name, 'target': target,
+                        'logit_std': spread[name],
                         **{key: float(value) for key, value
                            in stats.items()}})
         return out
+
+
+def init_probe_by_clip(rows: Sequence[dict],
+                       target: str = 'sum') -> list[dict]:
+    """Per-clip hardness and per-variant kept share, hardest first.
+
+    `heat_ceiling` is the share of block heat the *oracle* keeps at this
+    budget, so a low value means the teacher's attention is not
+    concentrated enough for the budget and no predictor can do well. That
+    is the measurable definition of a hard clip.
+    """
+    clips: dict[str, list[dict]] = {}
+    for row in rows:
+        if row.get('target') == target and 'clip' in row:
+            clips.setdefault(row['clip'], []).append(row)
+    out = []
+    for clip, group in clips.items():
+        kept = {}
+        for row in group:
+            kept.setdefault(row['variant'], []).append(row['heat_kept'])
+        out.append({
+            'clip': clip,
+            'heat_ceiling': _median([r['heat_ceiling'] for r in group]),
+            'heat_kept': {name: _median(values)
+                          for name, values in sorted(kept.items())},
+        })
+    out.sort(key=lambda row: row['heat_ceiling'])
+    return out
 
 
 def summarize_init_probe(rows: Sequence[dict]) -> list[dict]:
@@ -1181,7 +1217,7 @@ def summarize_init_probe(rows: Sequence[dict]) -> list[dict]:
         out.append({
             'target': target, 'variant': variant, 'layers': len(group),
             'recall': med('recall'), 'heat_kept': kept,
-            'heat_ceiling': ceiling,
+            'heat_ceiling': ceiling, 'logit_std': med('logit_std'),
             'kept_over_ceiling': kept / ceiling if ceiling else float('nan'),
         })
     return out
@@ -1550,9 +1586,9 @@ class RunConfig:
         teacher_adapter: Few-step LoRA merged into the teacher (turbo).
         plan: Tile plan json; None uses `tile_shape` for every head.
         tile_shape: Shape used when `plan` is None.
-        predictor: Released bundle to add to the init probe as a trained
-            veda1 variant. Its own plans are used for the geometry, so
-            the probe sees the tile shapes it was trained against.
+        predictors: Bundles to add to the init probe, each written
+            `name=path`. The first one's plans are used for the geometry,
+            so the probe sees the tile shapes they were trained against.
         densities / alphas / query_tiles / k_min / k_max / oracle / heads:
             See `AblationConfig`.
         eta: G1's required relative improvement.
@@ -1577,7 +1613,7 @@ class RunConfig:
     teacher_adapter: str | None = None
     plan: str | None = None
     tile_shape: str = '4x4x8'
-    predictor: str | None = None
+    predictors: list[str] = dataclasses.field(default_factory=list)
     densities: list[float] = dataclasses.field(
         default_factory=lambda: [0.05, 0.1, 0.2])
     alphas: list[float] = dataclasses.field(
@@ -1761,14 +1797,20 @@ def run_init_probe(config: RunConfig) -> None:
     out_dir = os.path.join(config.out_dir, config.run_name)
     os.makedirs(out_dir, exist_ok=True)
     variants = init_variants(model.config.head_dim, env.device)
-    trained = None
-    if config.predictor:
+    loaded = []
+    for spec in config.predictors:
         from miowtion.veda import bundle as veda_bundle  # pylint: disable=import-outside-toplevel
-        trained = veda_bundle.load(config.predictor, env.device)
-        variants['veda1_trained'] = trained.predictor
-        progress.log(f'loaded trained predictor {config.predictor} '
-                     f'(keep ratio {trained.keep_ratio}, plans '
-                     f'{sorted(trained.plans.plans)})')
+        if '=' not in spec:
+            raise ValueError(f'predictors entries are name=path: {spec!r}')
+        name, path = spec.split('=', 1)
+        bundle = veda_bundle.load(path, env.device)
+        variants[name] = bundle.predictor
+        loaded.append(bundle)
+        progress.log(
+            f'loaded {name} from {path} (keep ratio {bundle.keep_ratio}, '
+            f'second_order_rank {bundle.predictor.second_order_rank}, '
+            f'count_term {bundle.predictor.count_term})')
+    trained = loaded[0] if loaded else None
     for spec in config.geometries:
         geometry = data.parse_geometry(spec)
         samples = [s for s in cache.select('train', config.tasks)
@@ -1776,7 +1818,7 @@ def run_init_probe(config: RunConfig) -> None:
                    and s.latent_t in (None, geometry.latent_t)]
         if not samples:
             raise ValueError(f'no cached sample for {geometry.name}')
-        sample = samples[0]
+        samples = samples[:config.num_clips]
         if trained is not None:
             # The trained predictor was distilled against these shapes;
             # scoring it on any others would grade the wrong thing.
@@ -1787,52 +1829,56 @@ def run_init_probe(config: RunConfig) -> None:
                 model.config.num_layers, model.config.num_heads)
         veda_config = veda_attention.VedaConfig(
             target_budget=veda_mask.Budget(ratio=config.densities[0]))
-        traj = trajectory.Trajectory(model, cache, sample, geometry,
-                                     schedule, config.seed, env.device)
-        clip_tiling = veda_attention.ClipTiling(traj.layout, veda_config,
-                                                env.device)
-        progress.log(f'init probe {geometry.name}: clip {sample.id}, '
+        progress.log(f'init probe {geometry.name}: {len(samples)} clips, '
                      f'budget ratio {config.densities[0]}, steps '
                      f'{list(config.steps)}')
         rows: list[dict] = []
-        last = max(config.steps)
-        bar = progress.Progress(f'{geometry.name}: denoise steps', last + 1)
-        while not traj.done and traj.step <= last:
-            inputs = traj.inputs()
-            if traj.step in config.steps:
-                attention_fn = PredictorInitProbe(
-                    traj.layout, plan, clip_tiling, variants,
-                    config.query_tiles, config.seed, traj.step,
-                    dense_backend=config.dense_backend)
-            else:
-                attention_fn = h3_model.DenseAttention(
-                    traj.layout.used, config.dense_backend)
-            with torch.no_grad():
-                video_v, audio_v = model(
-                    traj.clip, inputs.video_rows, inputs.audio_rows,
-                    inputs.timestep, attention_fn,
-                    tables.get(inputs.timestep.timesteps))
-            if isinstance(attention_fn, PredictorInitProbe):
-                rows += attention_fn.rows
-            bar.update(f'step {traj.step}')
-            traj.advance(video_v, audio_v)
+        clips = progress.Progress(f'{geometry.name}: clips', len(samples))
+        for sample in samples:
+            traj = trajectory.Trajectory(model, cache, sample, geometry,
+                                         schedule, config.seed, env.device)
+            clip_tiling = veda_attention.ClipTiling(
+                traj.layout, veda_config, env.device)
+            last = max(config.steps)
+            while not traj.done and traj.step <= last:
+                inputs = traj.inputs()
+                if traj.step in config.steps:
+                    attention_fn = PredictorInitProbe(
+                        traj.layout, plan, clip_tiling, variants,
+                        config.query_tiles, config.seed, traj.step,
+                        dense_backend=config.dense_backend)
+                else:
+                    attention_fn = h3_model.DenseAttention(
+                        traj.layout.used, config.dense_backend)
+                with torch.no_grad():
+                    video_v, audio_v = model(
+                        traj.clip, inputs.video_rows, inputs.audio_rows,
+                        inputs.timestep, attention_fn,
+                        tables.get(inputs.timestep.timesteps))
+                if isinstance(attention_fn, PredictorInitProbe):
+                    rows += [{**row, 'clip': sample.id}
+                             for row in attention_fn.rows]
+                traj.advance(video_v, audio_v)
+            clips.update(f'{sample.id}: {len(rows)} rows')
         path = os.path.join(out_dir, f'{geometry.name}_init.json')
         summary = summarize_init_probe(rows)
         tmp = path + '.tmp'
         with open(tmp, 'w') as handle:
             json.dump({'meta': {'geometry': geometry.name,
-                                'clip': sample.id,
+                                'clips': [s.id for s in samples],
                                 'budget_ratio': config.densities[0],
                                 'steps': list(config.steps),
                                 'query_tiles': config.query_tiles,
                                 'tile_shape': config.tile_shape,
-                                'predictor': config.predictor},
-                       'rows': rows, 'summary': summary}, handle, indent=1)
+                                'predictors': list(config.predictors)},
+                       'rows': rows, 'summary': summary,
+                       'by_clip': init_probe_by_clip(rows)}, handle,
+                      indent=1)
         os.replace(tmp, path)
         progress.log(f'saved {path} ({len(rows)} rows)')
         for row in summary:
             progress.log(
-                f"  target {row['target']:4s} {row['variant']:6s}: "
+                f"  target {row['target']:4s} {row['variant']:14s}: "
                 f"recall {row['recall']:.4f}  heat_kept {row['heat_kept']:.4f}"
-                f"  ceiling {row['heat_ceiling']:.4f}  "
-                f"kept/ceiling {row['kept_over_ceiling']:.4f}")
+                f"  kept/ceiling {row['kept_over_ceiling']:.4f}  "
+                f"logit_std {row['logit_std']:.4f}")

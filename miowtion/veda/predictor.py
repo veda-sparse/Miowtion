@@ -31,6 +31,14 @@ the predictor is bit-for-bit what it was. Set it to head_dim and
 `init_exact_second_order_()` makes an *untrained* predictor equal the full
 diagonal estimate of log mass rather than the zero-order one.
 
+`count_term` supplies `log B_j`, which is free: a per-key-tile constant
+read straight off the layout, added with one learned gain per head that
+starts at the exact coefficient of 1. Without it the score ranks a key
+tile holding 32 real keys level with one holding 128, even though the
+former carries a quarter of the mass. That blindness is self-consistent
+under a block-*maximum* target, which barely moves with the row count,
+and becomes a systematic bias the moment the target is mass.
+
 The predictor is a side branch: pooling runs on detached activations under
 no_grad, and gradients never reach the trunk.
 """
@@ -149,11 +157,12 @@ class LayerPredictor(nn.Module):
     """Projections of one layer: proj_q, proj_k [num_heads, 3D, D].
 
     With `second_order_rank > 0` it also holds so_q, so_k
-    [num_heads, D, rank] for the low-rank second-cumulant head.
+    [num_heads, D, rank] for the low-rank second-cumulant head, and with
+    `count_term` a gain [num_heads] on log B_j.
     """
 
     def __init__(self, num_heads: int, head_dim: int,
-                 second_order_rank: int = 0):
+                 second_order_rank: int = 0, count_term: bool = False):
         super().__init__()
         if not 0 <= second_order_rank <= head_dim:
             raise ValueError(f'second_order_rank {second_order_rank} must be '
@@ -173,6 +182,10 @@ class LayerPredictor(nn.Module):
                                                  second_order_rank))
             nn.init.normal_(self.so_q, std=INIT_STD)
             nn.init.normal_(self.so_k, std=INIT_STD)
+        if count_term:
+            # Starts at the exact coefficient, so an untrained predictor
+            # already scores log B_j correctly.
+            self.count_gain = nn.Parameter(torch.ones(num_heads))
 
     @torch.no_grad()
     def init_exact_second_order_(self) -> None:
@@ -202,7 +215,8 @@ class LayerPredictor(nn.Module):
 
     def forward(self, feats_q: torch.Tensor, feats_k: torch.Tensor,
                 heads: torch.Tensor, sq_q: torch.Tensor | None = None,
-                var_k: torch.Tensor | None = None) -> torch.Tensor:
+                var_k: torch.Tensor | None = None,
+                log_count: torch.Tensor | None = None) -> torch.Tensor:
         """Block logits [H', n_q, n_k] fp32.
 
         Args:
@@ -212,11 +226,17 @@ class LayerPredictor(nn.Module):
             sq_q: [H', n_q, D] pooled E[q^2]; required iff the second-order
                 head is enabled.
             var_k: [H', n_k, D] pooled Var(k); likewise.
+            log_count: [n_k] fp32 log of every key tile's real row count;
+                required iff `count_term` is on.
 
         Raises:
-            ValueError: If the second-order features are missing or given
-                when the head is disabled.
+            ValueError: If a feature is missing, or given when its term is
+                disabled.
         """
+        has_count = log_count is not None
+        if hasattr(self, 'count_gain') != has_count:
+            raise ValueError('log_count and count_term must be set '
+                             'together')
         q_hat = self.embed(feats_q, heads, self.proj_q)
         k_hat = self.embed(feats_k, heads, self.proj_k)
         logits = torch.bmm(q_hat, k_hat.transpose(1, 2)) / math.sqrt(
@@ -225,6 +245,9 @@ class LayerPredictor(nn.Module):
         if bool(self.second_order_rank) != has_second:
             raise ValueError('second-order features and second_order_rank '
                              'must be set together')
+        if has_count:
+            gain = self.count_gain.index_select(0, heads).float()
+            logits = logits + gain[:, None, None] * log_count[None, None, :]
         if not self.second_order_rank:
             return logits
         u = torch.bmm(sq_q, self.so_q.index_select(0, heads).float())
@@ -242,11 +265,13 @@ class TileScorePredictor(nn.Module):
     """
 
     def __init__(self, num_layers: int, num_heads: int, head_dim: int,
-                 second_order_rank: int = 0):
+                 second_order_rank: int = 0, count_term: bool = False):
         super().__init__()
         self.second_order_rank = second_order_rank
+        self.count_term = count_term
         self.layers = nn.ModuleList(
-            LayerPredictor(num_heads, head_dim, second_order_rank)
+            LayerPredictor(num_heads, head_dim, second_order_rank,
+                           count_term)
             for _ in range(num_layers))
 
     @torch.no_grad()
@@ -271,9 +296,11 @@ class TileScorePredictor(nn.Module):
         """
         feats_q = pool_tiles(q_tiles, layout)
         feats_k = pool_tiles(k_tiles, layout)
-        if not self.second_order_rank:
-            return self.layers[layer](feats_q, feats_k, heads)
-        return self.layers[layer](
-            feats_q, feats_k, heads,
-            sq_q=pool_tiles(q_tiles, layout, SECOND_RAW),
-            var_k=pool_tiles(k_tiles, layout, SECOND_CENTRAL))
+        extra = {}
+        if self.count_term:
+            extra['log_count'] = torch.log(
+                layout.valid_count.clamp(min=1).to(torch.float32))
+        if self.second_order_rank:
+            extra['sq_q'] = pool_tiles(q_tiles, layout, SECOND_RAW)
+            extra['var_k'] = pool_tiles(k_tiles, layout, SECOND_CENTRAL)
+        return self.layers[layer](feats_q, feats_k, heads, **extra)

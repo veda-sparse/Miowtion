@@ -114,7 +114,8 @@ def save(path: str, weights: dict[str, torch.Tensor],
          plans: veda_plan.PlanTable, *, num_layers: int, num_heads: int,
          head_dim: int, keep_ratio: float, source: str,
          source_weights: str, step: int,
-         dtype: torch.dtype = torch.bfloat16) -> None:
+         dtype: torch.dtype = torch.bfloat16,
+         second_order_rank: int = 0, count_term: bool = False) -> None:
     """Writes a bundle.
 
     Args:
@@ -130,6 +131,10 @@ def save(path: str, weights: dict[str, torch.Tensor],
         source_weights: 'live' or 'ema' (which of the two was exported).
         step: Training update the checkpoint was written at.
         dtype: Storage dtype; must be one of `DTYPES`.
+        second_order_rank: Rank of the predictor's second-cumulant head
+            (see veda.predictor). Recorded so `load` rebuilds the same
+            shape; 0 is the plain predictor.
+        count_term: Whether the predictor scores log B_j. Likewise.
 
     Raises:
         ValueError: If `weights` is empty, mixes prefixed and bare keys, or
@@ -166,6 +171,8 @@ def save(path: str, weights: dict[str, torch.Tensor],
         'source': source,
         'source_weights': source_weights,
         'step': str(step),
+        'second_order_rank': str(second_order_rank),
+        'count_term': '1' if count_term else '0',
         'plans': json.dumps({name: p.to_json()
                              for name, p in sorted(plans.plans.items())}),
     }
@@ -206,9 +213,13 @@ def load(path: str, device: torch.device | str = 'cpu') -> Bundle:
     stored = metadata.get('dtype', _LEGACY_DTYPE)
     if stored not in DTYPES:
         raise ValueError(f'{path}: unknown storage dtype {stored!r}')
-    model = veda_predictor.TileScorePredictor(int(metadata['num_layers']),
-                                              int(metadata['num_heads']),
-                                              int(metadata['head_dim']))
+    # Absent in bundles written before the second-order head existed,
+    # which is exactly the plain predictor those keys describe.
+    model = veda_predictor.TileScorePredictor(
+        int(metadata['num_layers']), int(metadata['num_heads']),
+        int(metadata['head_dim']),
+        second_order_rank=int(metadata.get('second_order_rank', 0)),
+        count_term=metadata.get('count_term', '0') == '1')
     resident = DTYPES[stored]
     if stored == 'float8_e4m3fn':
         # The parameters come back in bf16: `LayerPredictor.embed` reads

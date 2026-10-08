@@ -1078,3 +1078,20 @@ def test_init_probe_scores_a_multi_layer_variant_too():
     assert {r['variant'] for r in probe.rows} == {'veda1', 'veda2',
                                                   'trained'}
     assert {r['layer'] for r in probe.rows} == set(range(cfg.num_layers))
+
+
+def test_init_probe_by_clip_ranks_hardest_first():
+    def row(clip, variant, ceiling, kept):
+        return {'clip': clip, 'variant': variant, 'target': 'sum',
+                'heat_ceiling': ceiling, 'heat_kept': kept,
+                'recall': 0.5, 'step': 0, 'layer': 0}
+    rows = [row('easy', 'a', 0.9, 0.8), row('easy', 'b', 0.9, 0.85),
+            row('hard', 'a', 0.4, 0.3), row('hard', 'b', 0.4, 0.35),
+            # A different target must be ignored.
+            row('hard', 'a', 0.1, 0.05)]
+    rows[-1]['target'] = 'max'
+    out = solattn.init_probe_by_clip(rows)
+    assert [r['clip'] for r in out] == ['hard', 'easy']
+    assert out[0]['heat_ceiling'] == pytest.approx(0.4)
+    assert out[0]['heat_kept'] == {'a': 0.3, 'b': 0.35}
+    assert solattn.init_probe_by_clip(rows, target='max')[0]['clip'] == 'hard'

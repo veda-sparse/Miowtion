@@ -1,0 +1,23 @@
+# Dense vs Veda1 (released step600) at 5% keep, 1:1@37, every cached clip of
+# that length. Small canvas and high sparsity on purpose: 768x768, 124
+# frames, 21312 video tokens, and at 5% even the oracle keeps only 50-56%
+# of the teacher's block mass (measured, see runs/sol_initprobe_1x1_t37).
+# The companion config swaps in the Veda2 predictor on the same seed.
+root: weights/MiniMax-H3
+variant: FL2VA
+schedule: turbo
+num_steps: 8
+adapter: weights/turbo_lora/minimax_h3_turbo_v4_step600_ema.safetensors
+sample_cache: artifacts/samples/moviegen_holdout20
+sample_id: [holdout5s_0002, holdout5s_0003, holdout5s_0004, holdout5s_0001,
+            holdout5s_0000]
+geometry: ['1:1@37']
+seed: 0
+attention: [dense, veda]
+predictor: weights/veda/Minimax-H3-T2VA-Veda-8NFE-600Step-Preview/minimax_h3_t2va_veda_8nfe_600step_preview_fp8.safetensors
+keep_ratio: 0.05
+offload_blocks: 30
+prefetch: 1
+mlp_chunk_rows: 8192
+decode_dtype: bf16
+out_dir: artifacts/veda2_compare/veda1_sparse05

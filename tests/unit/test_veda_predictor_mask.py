@@ -320,3 +320,61 @@ def test_variance_feature_survives_a_tight_tile():
         torch.testing.assert_close(central[:, j],
                                    rows.var(0, unbiased=False),
                                    rtol=1e-4, atol=1e-7)
+
+
+def test_count_term_adds_exactly_log_b_at_init():
+    """A per-key-tile constant with a gain that starts at 1."""
+    dim = 16
+    lay = _layout()
+    plain = veda_predictor.TileScorePredictor(2, 4, dim)
+    counted = veda_predictor.TileScorePredictor(2, 4, dim, count_term=True)
+    with torch.no_grad():
+        for src, dst in zip(plain.layers, counted.layers):
+            dst.proj_q.copy_(src.proj_q)
+            dst.proj_k.copy_(src.proj_k)
+    q = torch.randn(lay.seq_len, 4, dim).to(torch.bfloat16)
+    k = torch.randn(lay.seq_len, 4, dim).to(torch.bfloat16)
+    heads = torch.tensor([0, 2])
+    qt, kt = (tiling.gather_tiles(t, lay, heads) for t in (q, k))
+    delta = (counted.scores(0, qt, kt, lay, heads)
+             - plain.scores(0, qt, kt, lay, heads))
+    want = torch.log(lay.valid_count.clamp(min=1).float())
+    torch.testing.assert_close(delta, want.expand_as(delta), rtol=1e-5,
+                               atol=1e-5)
+
+
+def test_count_term_ranks_a_fuller_key_tile_higher():
+    """The behaviour it exists for: a padded tile carries less mass."""
+    lay = _layout()
+    partial = int(lay.partial_tiles[0]) if lay.partial_tiles.numel() else None
+    assert partial is not None, 'this layout should have a partial tile'
+    full = next(j for j in range(lay.n_tiles)
+                if bool(lay.full_tile[j]) and bool(lay.kv_ok[j]))
+    dim = 16
+    pred = veda_predictor.TileScorePredictor(1, 2, dim, count_term=True)
+    with torch.no_grad():
+        pred.layers[0].proj_q.zero_()
+        pred.layers[0].proj_k.zero_()
+    # Give every key row the same vector, so the pooled means tie and only
+    # the row count can separate the two tiles.
+    q = torch.randn(lay.seq_len, 2, dim).to(torch.bfloat16)
+    k = torch.ones(lay.seq_len, 2, dim).to(torch.bfloat16)
+    heads = torch.tensor([0])
+    qt, kt = (tiling.gather_tiles(t, lay, heads) for t in (q, k))
+    logits = pred.scores(0, qt, kt, lay, heads)[0]
+    assert int(lay.valid_count[full]) > int(lay.valid_count[partial])
+    assert torch.all(logits[:, full] > logits[:, partial])
+
+
+def test_count_term_parameter_count_and_pairing():
+    pred = veda_predictor.TileScorePredictor(2, 4, 16, count_term=True)
+    base = 2 * 2 * 4 * 3 * 16 * 16
+    assert sum(p.numel() for p in pred.parameters()) == base + 2 * 4
+    layer = veda_predictor.LayerPredictor(4, 16, count_term=True)
+    feats = torch.zeros(1, 3, 48)
+    with pytest.raises(ValueError, match='count_term must be set'):
+        layer(feats, feats, torch.tensor([0]))
+    plain = veda_predictor.LayerPredictor(4, 16)
+    with pytest.raises(ValueError, match='count_term must be set'):
+        plain(feats, feats, torch.tensor([0]),
+              log_count=torch.zeros(3))
