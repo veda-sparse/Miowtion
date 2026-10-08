@@ -66,8 +66,14 @@ python scripts/prepare_official_r2va_demo.py \
 python scripts/encode_samples.py --root weights/MiniMax-H3 \
   --manifest artifacts/examples/minimax_h3_ref2va/manifests/prompts.jsonl \
   --out artifacts/samples/demo
-python scripts/generate.py --config configs/infer_r2va_preview.yaml
+python scripts/generate.py --config configs/infer_r2va_preview.yaml \
+  --attention dense veda
 ```
+
+The preset uses `offload_blocks: 0` for GPUs with at least 64 GiB, where all
+DiT blocks fit on the GPU. On a 24 GiB card, override it with
+`--offload-blocks 40` or `--offload-blocks 50`; host offload can be
+substantially slower when checkpoint files are on a shared mount.
 
 The inference preset uses Ref2VA, Turbo 8 steps, a 16:9 output at latent_t 37,
 and the published R2VA predictor path. Download the backbone, Turbo LoRA and
@@ -127,3 +133,17 @@ short-reference allocation and random draw order are retained unchanged.
 Audio 1 in the official PE is the video soundtrack, not the external voice
 file. Treating the only downloaded MP3 as Audio 1 swaps reference roles.
 The example preparation explicitly creates all three labelled inputs.
+
+## Validation record
+
+2026-10-08, baseline `509a56d` with the release path and preset updates:
+
+- The Hugging Face repository, its `config.json`, and the inference preset
+  agree on `minimax_h3_r2va_veda_preview_fp8.safetensors` under
+  `weights/veda/h3-r2va-preview/`. The actual generation parser accepts the
+  preset and the documented 24 GiB offload override.
+- CPU unit tests: 288 passed, 12 skipped in 64.49 s, with CUDA hidden and
+  `OMP_NUM_THREADS=1 MKL_NUM_THREADS=1` for reproducible CPU execution.
+- GPU tests on RTX PRO 6000 Blackwell: 14 passed, 9 skipped in 23.16 s,
+  including resident versus streamed block equivalence. This validates
+  the test fixtures; full-backbone R2VA generation was not rerun.

@@ -117,15 +117,21 @@ references. Download it and prepare the official H3 example (requires
 ffmpeg and ffprobe; its prompt is already PE-expanded):
 
 ```bash
-hf download Veda-Sparse/Minimax-H3-R2VA-Veda-8NFE-600Step-Preview \
-  --local-dir weights/veda/h3-r2va-8nfe-600
+hf download Veda-Sparse/Minimax-H3-R2VA-Veda-Preview \
+  --local-dir weights/veda/h3-r2va-preview
 python scripts/prepare_official_r2va_demo.py \
   --out artifacts/examples/minimax_h3_ref2va
 python scripts/encode_samples.py --root weights/MiniMax-H3 \
   --manifest artifacts/examples/minimax_h3_ref2va/manifests/prompts.jsonl \
   --out artifacts/samples/demo
-python scripts/generate.py --config configs/infer_r2va_preview.yaml
+python scripts/generate.py --config configs/infer_r2va_preview.yaml \
+  --attention dense veda
 ```
+
+The preset keeps the DiT blocks resident on a >=64 GiB GPU
+(`offload_blocks: 0`). On a 24 GiB card, override it with
+`--offload-blocks 40` or `--offload-blocks 50`; host offload can be
+substantially slower when checkpoint files are on a shared mount.
 
 The preview independently keeps up to 32 visual reference tiles and
 32 current-video tiles per query tile and head. Text and audio stay fully
