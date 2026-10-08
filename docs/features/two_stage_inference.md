@@ -59,6 +59,47 @@
 **对 Veda 的含义**：依赖 position_ids 推网格的代码必须接受非零起点；按头/按块的缓存键里要带上
 `seq_len`，否则不同块会互相命中。
 
+## 实际收集到的工作流设置
+
+下面是**下载到的真实工作流**（不是节点默认值）。token 网格 = latent / 2（`PackedLayout` 把
+h、w 向上取到 DiT 的 2x2 patch），与打分器 config 里的 `latent_grid` 同一单位。
+
+| 来源 | 阶段 | 像素 | latent | token 网格 | 相对训练网格 |
+|---|---|---|---|---|---|
+| T2VA 训练几何（参照） | — | 1344x768 | 48x84 | 24x42 | 1.00x |
+| selflift（用户日志，精确值） | 低 | 448x256 | 16x28 | 8x14 | **0.33x** |
+| selflift | 高 | 864x480 | 30x54 | 15x27 | **0.63x** |
+| YCNodes 例子（16:9 @ 0.7 MP） | 低 | 1152x640 | 40x72 | 20x36 | 0.85x |
+| YCNodes 例子（升 1.4 倍） | 高 | 1600x896 | 56x100 | 28x50 | 1.18x |
+
+**纵横比对得上，尺度对不上**：四个真实阶段里有三个落在训练网格的 0.33–0.85 倍。方案表按
+aspect 选最近邻是选对了，但 tile 形状是**按 token 计**的，所以同一个 8x4x4 在 0.33x 的网格上
+覆盖的画面比例是训练时的 3 倍。双采的难点在尺度，不在纵横比——这一点和原先的猜测相反。
+
+### 社区最常见的一套参数（javawock7618 的 INT8 工作流，4 个都一样）
+
+- 第一段：`BasicScheduler simple, 4 步, denoise 1.0` → `SamplerCustomAdvanced`（`euler`）
+- 中间：`MinimaxH3LatentUpscaler3D`，`scale by multiplier` **2 倍**（也见 1.5 倍、
+  1.4 倍，以及直接给 `target dimensions 1280x704`），align 32
+- 第二段：`BasicScheduler simple, 3~4 步, denoise 0.4`，或固定
+  `ManualSigmas '0.9035, 0.6316, 0.3158, 0.0000'`
+- 全程 `MiniMaxH3SigmaShift [12, 3]`；起始分辨率由 `ResolutionSelector` 给到
+  **0.2 / 0.4 / 0.7 MP**，都远低于训练用的约 1.03 MP
+
+即：**第二段是一次低 denoise（0.4）的短精修**，不是从头再采一遍。
+
+### 这不止一个实现
+
+同一套思路至少有四个节点在做，接口各不相同，不能只按 selflift 适配：
+`MiniMaxH3TimelineSelfLiftSampler`（上游的 "MiniMax H3 Two-Stage Sampler"）、
+`SelfLiftAvatarH3Sampler`（本文读的这个 fork）、
+`MinimaxH3LatentUpscaler3DRefineHandoff`（内部自己跑一次采样）、
+`VRGDG_MiniMaxH3LearnedLatentUpscale`。升采样器本身也有多个分支
+（`xmarre/...-Plus`、`LBH-123-AI/...` 原版）。
+
+上游 README 的经验法则：**高分辨率段占总步数的约 25%**（8 步时低分辨率段 6 步），
+与用户实测截图里的 `transition_step=6` 一致。
+
 ## 两个节点包的实际参数
 
 ### selflift-Avatar（`SelfLiftAvatarH3Sampler`）
@@ -135,9 +176,17 @@
 - 2026-10-08，读 `slmonker/selflift-Avatar` 与 `yichengup/ComfyUI-YCNodes-MiniMax-H3`
   的源码（各自 depth-1 clone 的当前 main）与 ComfyUI v0.38.2 的 `comfy/samplers.py`、
   `comfy/model_base.py`、`comfy/ldm/minimax/model.py` 得出；未在 GPU 上实跑这两个工作流。
+- 2026-10-08，参数表取自实际下载的 5 个工作流：`javawock7618/comfy-MiniMax-H3-workflows`
+  的 Bridge / FR / I2V / R2V 四个，以及 YCNodes 仓库自带的 tiled second sampling 例子。
+  selflift 那两行是用户实跑的日志（`[selflift-Avatar plan]`），是其中唯一的实测值。
 
 ## 待办
 
-- 在真实双采工作流上实测：两段各自选到的方案、保留比例、画质，确认最近邻方案在
-  第二段（通常是 1.4–2 倍的非训练网格）上是否够用。
-- 若不够用：考虑按第二段的网格现搜一张方案表，或在方案表里补几个"升分辨率后常见"的几何。
+- **按尺度补方案表**：真实工作流落在训练网格的 0.33–1.18 倍，而现有 12 种几何只覆盖
+  1.0 倍附近。先给 `latent_t_ladder` 之外补一组"低分辨率段"几何（约 0.3x、0.6x、0.85x 的
+  16:9 / 9:16 / 4:3 / 1:1），按 `tile_search.md` 的流程搜方案，再并进 bundle。
+  这比按节点去适配更通用——四个实现产生的几何是同一批。
+- 搜之前先量一下值不值：在 0.33x 的网格上，用 1.0x 搜出来的方案相对 oracle 的
+  rel-MSE 比专门搜的差多少。差得不多就只补文档，不补方案。
+- 推理侧：`select` 的 cost 现在只看 aspect → 时长 → 补齐，不看尺度。补了多尺度方案之后
+  要把尺度距离加进 cost，否则选不到新搜的那些。
