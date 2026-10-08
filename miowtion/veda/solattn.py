@@ -1038,6 +1038,150 @@ class AblationScorer:
         return out
 
 
+# --- Predictor initialization probe --------------------------------------
+#
+# The ablation above scores block-score *tables*. This probe scores actual
+# predictor modules, in the metrics the stage-1 training loop already
+# watches (recall, heat_kept), so a claim about the predictor's starting
+# point can be checked without training anything.
+#
+# At initialization every projection is N(0, 1e-4), so the parameters are
+# effectively layer-independent and one LayerPredictor stands in for all
+# of them. That is why this costs one teacher rollout rather than a
+# 275M-parameter model per variant.
+
+
+def init_variants(head_dim: int,
+                  device: torch.device | str = 'cpu') -> dict[str, 'object']:
+    """The predictor initializations Veda2 compares, one layer each.
+
+    Args:
+        head_dim: Head dimension of the model under probe.
+        device: Where to put them; must match the activations, since the
+            per-head index_select happens on the device.
+
+    Returns:
+        'veda1' is today's predictor, whose untrained score is mean-pooled
+        QK, the zero-order term of log block mass. 'veda2' adds the
+        low-rank second-order head at full rank with the exact warm start,
+        so its untrained score is the complete diagonal estimate.
+    """
+    from miowtion.veda import predictor as veda_predictor  # pylint: disable=import-outside-toplevel
+    out = {}
+    for name, rank in (('veda1', 0), ('veda2', head_dim)):
+        torch.manual_seed(0)
+        pred = veda_predictor.TileScorePredictor(1, _PROBE_HEADS, head_dim,
+                                                 second_order_rank=rank)
+        if rank:
+            pred.init_exact_second_order_()
+        out[name] = pred.to(device)
+    return out
+
+
+# The probe's stand-in predictor needs at least as many heads as the model.
+_PROBE_HEADS = 128
+
+
+class PredictorInitProbe:
+    """AttentionFn scoring predictor initializations against the teacher.
+
+    Only the layers being probed should use this function; the trajectory
+    itself stays on the dense teacher.
+    """
+
+    def __init__(self, layout, plan, clip, variants: dict,
+                 query_tiles: int, seed: int, step: int,
+                 targets: Sequence[str] = ('max', 'sum'),
+                 dense_backend: str = 'auto'):
+        """
+        Args:
+            layout: Packed layout of the clip.
+            plan: `veda.plan.TilePlan` giving each head's tile shape.
+            clip: `veda.attention.ClipTiling` of this clip.
+            variants: From `init_variants`.
+            query_tiles: Video query tiles supervised per layer.
+            seed: Query-tile sampling seed.
+            step: Denoising step, recorded with every row.
+            targets: Teacher heat reductions to score against.
+            dense_backend: Backend of the dense attention.
+        """
+        self.layout = layout
+        self.plan = plan
+        self.clip = clip
+        self.variants = variants
+        self.query_tiles = query_tiles
+        self.seed = seed
+        self.step = step
+        self.targets = tuple(targets)
+        self.dense_backend = dense_backend
+        self.rows: list[dict] = []
+
+    @torch.no_grad()
+    def __call__(self, q, k, v, layer_index):
+        from miowtion.veda import heatmap as veda_heatmap  # pylint: disable=import-outside-toplevel
+        out, lse = h3_attention.dense_attention(
+            q, k, v, self.layout.used, return_lse=True,
+            backend=self.dense_backend)
+        for group in self.plan.head_groups(layer_index, self.clip.device):
+            tile_layout = self.clip.get(group.shape)
+            blocks = self.clip.blocks(tile_layout)
+            gen = torch.Generator().manual_seed(self.seed * 1000
+                                                + layer_index)
+            count = min(self.query_tiles, tile_layout.n_video_tiles)
+            rows = torch.randperm(tile_layout.n_video_tiles,
+                                  generator=gen)[:count]
+            rows = rows.sort().values.to(q.device)
+            q_t, k_t = (tiling.gather_tiles(t, tile_layout, group.heads)
+                        for t in (q, k))
+            lse_t = lse.index_select(0, tile_layout.gather_index)
+            lse_t = lse_t.index_select(1, group.heads).contiguous()
+            if tile_layout.pad_slots.numel():
+                lse_t.index_fill_(0, tile_layout.pad_slots, 0.0)
+            logits = {}
+            for name, pred in self.variants.items():
+                full = pred.scores(0, q_t, k_t, tile_layout,
+                                   group.heads.clamp(max=_PROBE_HEADS - 1))
+                logits[name] = full.index_select(1, rows).contiguous()
+            for target in self.targets:
+                heat = veda_heatmap.teacher_heat(q_t, k_t, lse_t,
+                                                 tile_layout, rows,
+                                                 reduce=target)
+                for name, score in logits.items():
+                    stats = veda_heatmap.mask_diagnostics(
+                        score, heat, tile_layout, blocks, rows)
+                    self.rows.append({
+                        'step': self.step, 'layer': layer_index,
+                        'variant': name, 'target': target,
+                        **{key: float(value) for key, value
+                           in stats.items()}})
+        return out
+
+
+def summarize_init_probe(rows: Sequence[dict]) -> list[dict]:
+    """Median recall / heat_kept per (teacher target, variant).
+
+    `heat_ceiling` is the oracle's own share at this budget, so
+    `heat_kept / heat_ceiling` is the part a predictor could still win.
+    """
+    buckets: dict[tuple[str, str], list[dict]] = {}
+    for row in rows:
+        buckets.setdefault((row['target'], row['variant']), []).append(row)
+    out = []
+    for (target, variant), group in sorted(buckets.items()):
+        def med(field: str) -> float:
+            values = [g[field] for g in group
+                      if not math.isnan(g.get(field, float('nan')))]
+            return _median(values) if values else float('nan')
+        kept, ceiling = med('heat_kept'), med('heat_ceiling')
+        out.append({
+            'target': target, 'variant': variant, 'layers': len(group),
+            'recall': med('recall'), 'heat_kept': kept,
+            'heat_ceiling': ceiling,
+            'kept_over_ceiling': kept / ceiling if ceiling else float('nan'),
+        })
+    return out
+
+
 # --- Aggregation and the two gates (section 6) ---------------------------
 
 
@@ -1575,3 +1719,97 @@ def run_ablation(config: RunConfig) -> None:
                 f"({row['g1_pass_fraction']:.0%} of heads), G2 "
                 f"{'pass' if row['g2_pass'] else 'FAIL'} "
                 f"(oracle gap {row['g2_oracle_gap']:+.1%})")
+
+def run_init_probe(config: RunConfig) -> None:
+    """Scores predictor initializations on one clip per geometry.
+
+    Raises:
+        ValueError: If launched with more than one rank, or a geometry has
+            no cached sample.
+    """
+    from miowtion.h3 import model as h3_model  # pylint: disable=import-outside-toplevel
+    from miowtion.train import data  # pylint: disable=import-outside-toplevel
+    from miowtion.train import parallel  # pylint: disable=import-outside-toplevel
+    from miowtion.train import teacher  # pylint: disable=import-outside-toplevel
+    from miowtion.train import trajectory  # pylint: disable=import-outside-toplevel
+
+    env = parallel.init_distributed()
+    if env.world_size != 1:
+        raise ValueError('run the init probe with one rank, not '
+                         f'{env.world_size}')
+    teacher_ = teacher.build_teacher(
+        config.checkpoint_root, config.variant, config.schedule,
+        config.num_steps, config.teacher_adapter, env,
+        visual_conditions=config.variant == 'Ref2VA'
+        or 'fl2va' in config.tasks,
+        audio_references=config.variant == 'Ref2VA',
+        offload_blocks=config.offload_blocks, prefetch=config.prefetch,
+        mlp_chunk_rows=config.mlp_chunk_rows)
+    model, schedule, tables = (teacher_.model, teacher_.schedule,
+                               teacher_.tables)
+    model.dense_backend = config.dense_backend
+    cache = data.SampleCache(config.sample_cache)
+    out_dir = os.path.join(config.out_dir, config.run_name)
+    os.makedirs(out_dir, exist_ok=True)
+    variants = init_variants(model.config.head_dim, env.device)
+    for spec in config.geometries:
+        geometry = data.parse_geometry(spec)
+        samples = [s for s in cache.select('train', config.tasks)
+                   if s.aspect in (None, geometry.aspect)
+                   and s.latent_t in (None, geometry.latent_t)]
+        if not samples:
+            raise ValueError(f'no cached sample for {geometry.name}')
+        sample = samples[0]
+        plan = veda_plan.TilePlan.uniform(
+            geometry, tiling.TileShape.parse(config.tile_shape),
+            model.config.num_layers, model.config.num_heads)
+        veda_config = veda_attention.VedaConfig(
+            target_budget=veda_mask.Budget(ratio=config.densities[0]))
+        traj = trajectory.Trajectory(model, cache, sample, geometry,
+                                     schedule, config.seed, env.device)
+        clip_tiling = veda_attention.ClipTiling(traj.layout, veda_config,
+                                                env.device)
+        progress.log(f'init probe {geometry.name}: clip {sample.id}, '
+                     f'budget ratio {config.densities[0]}, steps '
+                     f'{list(config.steps)}')
+        rows: list[dict] = []
+        last = max(config.steps)
+        bar = progress.Progress(f'{geometry.name}: denoise steps', last + 1)
+        while not traj.done and traj.step <= last:
+            inputs = traj.inputs()
+            if traj.step in config.steps:
+                attention_fn = PredictorInitProbe(
+                    traj.layout, plan, clip_tiling, variants,
+                    config.query_tiles, config.seed, traj.step,
+                    dense_backend=config.dense_backend)
+            else:
+                attention_fn = h3_model.DenseAttention(
+                    traj.layout.used, config.dense_backend)
+            with torch.no_grad():
+                video_v, audio_v = model(
+                    traj.clip, inputs.video_rows, inputs.audio_rows,
+                    inputs.timestep, attention_fn,
+                    tables.get(inputs.timestep.timesteps))
+            if isinstance(attention_fn, PredictorInitProbe):
+                rows += attention_fn.rows
+            bar.update(f'step {traj.step}')
+            traj.advance(video_v, audio_v)
+        path = os.path.join(out_dir, f'{geometry.name}_init.json')
+        summary = summarize_init_probe(rows)
+        tmp = path + '.tmp'
+        with open(tmp, 'w') as handle:
+            json.dump({'meta': {'geometry': geometry.name,
+                                'clip': sample.id,
+                                'budget_ratio': config.densities[0],
+                                'steps': list(config.steps),
+                                'query_tiles': config.query_tiles,
+                                'tile_shape': config.tile_shape},
+                       'rows': rows, 'summary': summary}, handle, indent=1)
+        os.replace(tmp, path)
+        progress.log(f'saved {path} ({len(rows)} rows)')
+        for row in summary:
+            progress.log(
+                f"  target {row['target']:4s} {row['variant']:6s}: "
+                f"recall {row['recall']:.4f}  heat_kept {row['heat_kept']:.4f}"
+                f"  ceiling {row['heat_ceiling']:.4f}  "
+                f"kept/ceiling {row['kept_over_ceiling']:.4f}")

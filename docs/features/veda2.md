@@ -70,6 +70,39 @@ log E_ij = log B_j + Qbar_i . Kbar_j / sqrt(D) + Qbar2_i^T Cov_j Qbar2_i / (2D) 
 可以把系数学到 0，这个下行基本应该消失——这也是选「可学习低秩头」而不是「硬编码公式」
 的理由。
 
+### 2.1 训练循环自己的指标：初始化就能看出差距
+
+上面的 ε 是本文档自己的度量。再用 stage1 训练循环**已经在看**的指标验一遍
+（`heatmap.mask_diagnostics` 的 `recall` / `heat_kept`），不训练，只比初始化：
+16:9@37、ρ=0.1、一条 clip × 步 {0,2,5,7} × 50 层 = 800 行。
+
+| 教师目标 | 打分器初始化 | recall | heat_kept | 天花板 | kept/天花板 |
+|---|---|---|---|---|---|
+| `max`（现状） | veda1 | 0.4901 | 0.4559 | 0.6205 | 0.7347 |
+| `max` | **veda2** | **0.5185** | **0.4722** | 0.6205 | **0.7610** |
+| `sum`（质量） | veda1 | 0.6318 | 0.5953 | 0.6895 | 0.8634 |
+| `sum`（质量） | **veda2** | **0.6711** | **0.6132** | 0.6895 | **0.8894** |
+
+`veda1` 是今天的打分器（`second_order_rank=0`），`veda2` 是全秩低秩头加
+`init_exact_second_order_()`。两者**共享同一套基础投影**（单测用 `torch.equal` 钉死），
+唯一区别就是二阶头，所以同一行目标内部的对比是严格可比的。
+
+- **二阶头让 recall 涨 2.8~3.9 个点**（+5.8% / +6.2% 相对），`kept/天花板` 从 0.8634 到
+  0.8894，也就是把剩余差距的 **19%** 补掉了。做个参照：仓库里 stage1 的训练日志上
+  recall 从 0.477 训到 0.508、真实运行到 step 20 是 0.5650。**二阶头白送的 3.9 个点，
+  和训练一段时间拿到的量级相当。**
+- **跨目标的两行不能直接比**：`heat_kept` 在 `max` 目标下是"保住的块峰值热量占比"，在
+  `sum` 目标下是"保住的块质量占比"，是两种加权。预测出来的掩码两行是同一个（logits 一样），
+  变的只有 oracle 和加权方式。
+- 不过有一件事值得记：同一个掩码保住了 **59.5% 的质量**，却只保住 **45.6% 的峰值热量**，
+  而质量的天花板（0.6895）也比峰值的（0.6205）高。**打分器本来就和质量对得更齐**，这和
+  §1 的结构论证一致（它的初始化就是在估计质量），也说明用块内最大值做蒸馏目标是在把它
+  往离自己自然位置更远的地方推。
+
+这一轮**没有训练**，所以它证明的是初始化更好，不是训练后更好。但两个缺失项是结构性的
+（行数和方差都不在特征里），训练过的 veda1 也补不出来，所以收益应该大体存活。真正的训练
+对比是 §7 的待办 1 和 2。
+
 ## 3. 设计与不变量
 
 ### 3.1 低秩二阶头（`miowtion/veda/predictor.py`）
@@ -168,7 +201,11 @@ H2 问过「同一个头里每行要不要各自的预算」，答案是不要�
   - `scorer_masks()` / `recall_against()` / `scorer_report()`
   - `error_curve()` / `allocate_budget()` / `allocation_report()`
 - `scripts/ablate_sol.py --summarize`：打印打分器对比表与每头预算报告
-- `configs/ablate_sol_veda2_t37.yaml`
+- `scripts/ablate_sol.py --init-probe`：`PredictorInitProbe` /
+  `init_variants()` / `summarize_init_probe()`，用训练循环自己的 recall /
+  heat_kept 比较打分器初始化。初始化时各层参数同分布，所以一个 `LayerPredictor`
+  就能代表全部 50 层，整轮只要一次教师 rollout
+- `configs/ablate_sol_veda2_t37.yaml`、`configs/ablate_sol_initprobe_t37.yaml`
 
 ## 5. 为什么零阶补偿不进 Veda2
 
@@ -263,6 +300,7 @@ attend 到」。给一个方向错误的向量配上更大更准的权重，只�
 |---|---|---|---|
 | 2026-10-08 | CPU（macOS） | 本次提交 | `pytest tests/unit` 462 passed |
 | 2026-10-08 | 1×RTX PRO 6000 Blackwell（sm_120，未装 flash-attn-4） | 本次提交 | 16:9@37 真实权重 134400 行 / 约 40 min；§2 / §3.4 / §5 的全部数字 |
+| 2026-10-09 | 同上 | 本次提交 | 初始化探针 800 行 / 1m45s（`--init-probe`）：§2.1 的 recall / heat_kept |
 
 ε 是数值量，按 AGENTS.md 1.5 与参考实现对拍（见 [sol_ablation](sol_ablation.md) §测试）。
 本 feature 不生成视频，不涉及 1.5.1 的人工可视化确认；**端到端画质要等待办 1 和 2 落地、

@@ -100,6 +100,10 @@ def main():
     parser.add_argument('--config')
     parser.add_argument('--summarize', help='re-print a saved run instead '
                         'of measuring')
+    parser.add_argument('--init-probe', action='store_true',
+                        help="score predictor initializations in the "
+                        "training loop's own metrics instead of running "
+                        'the ablation')
     parser.add_argument('--geometries', nargs='+', default=None,
                         help="measure these specs instead of the config's")
     parser.add_argument('--eta', type=float, default=0.15)
@@ -118,7 +122,11 @@ def main():
         raise ValueError(f'unknown config keys {sorted(unknown)}')
     if args.geometries:
         raw['geometries'] = args.geometries
-    solattn.run_ablation(solattn.RunConfig(**raw))
+    config = solattn.RunConfig(**raw)
+    if args.init_probe:
+        solattn.run_init_probe(config)
+    else:
+        solattn.run_ablation(config)
 
 
 if __name__ == '__main__':

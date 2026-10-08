@@ -959,3 +959,79 @@ def test_scorer_report_measures_the_gap_closed():
         solattn.scorer_report([rec], 0.99)
     with pytest.raises(ValueError, match='is missing'):
         solattn.scorer_report([rec], 0.1, oracle='nope')
+
+
+# --- predictor initialization probe --------------------------------------
+
+
+def test_init_variants_differ_only_in_the_second_order_head():
+    variants = solattn.init_variants(16)
+    assert sorted(variants) == ['veda1', 'veda2']
+    assert variants['veda1'].second_order_rank == 0
+    assert variants['veda2'].second_order_rank == 16
+    names = {n for n, _ in variants['veda2'].named_parameters()}
+    assert any(n.endswith('so_q') for n in names)
+    # The shared base projections are drawn from the same seed, so the two
+    # differ only by the head under test.
+    a = dict(variants['veda1'].named_parameters())
+    b = dict(variants['veda2'].named_parameters())
+    for name, param in a.items():
+        assert torch.equal(param, b[name]), name
+
+
+def test_init_probe_scores_both_variants_on_a_tiny_forward():
+    from miowtion.h3 import config as h3_config
+    from miowtion.h3 import layout as h3_layout
+    from miowtion.h3 import model as h3_model
+    from miowtion.h3 import noise
+    from miowtion.h3 import schedule as h3_schedule
+    from miowtion.veda import plan as veda_plan
+
+    cfg = h3_config.H3Config.tiny()
+    torch.manual_seed(0)
+    model = h3_model.H3DiT(cfg)
+    for param in model.parameters():
+        with torch.no_grad():
+            param.normal_(0.0, 0.02)
+    geo = geometry.Geometry('16:9', 256, 128, 22, 7, 8, 16, 37)
+    lay = h3_layout.pack(torch.ones(12, dtype=torch.long), geo)
+    shape = tiling.least_padding_shape(geo.video_grid)
+    plan = veda_plan.TilePlan.uniform(geo, shape, cfg.num_layers,
+                                      cfg.num_heads)
+    clip_tiling = veda_attention.ClipTiling(
+        lay, veda_attention.VedaConfig(
+            target_budget=veda_mask.Budget(ratio=0.9)), torch.device('cpu'))
+    probe = solattn.PredictorInitProbe(
+        lay, plan, clip_tiling, solattn.init_variants(cfg.head_dim),
+        query_tiles=2, seed=0, step=3, dense_backend='math')
+    text = model.refine_text(torch.randn(12, cfg.text_dim))
+    clip = model.clip_inputs(lay, text, torch.device('cpu'))
+    video, audio = noise.initial_noise(geo, 0)
+    state = h3_schedule.build_timestep_state(lay, 0.3, 0.1)
+    with torch.no_grad():
+        model(clip, video, audio, state, probe)
+    assert len(probe.rows) == cfg.num_layers * 2 * 2  # variants x targets
+    assert {r['variant'] for r in probe.rows} == {'veda1', 'veda2'}
+    assert {r['target'] for r in probe.rows} == {'max', 'sum'}
+    summary = solattn.summarize_init_probe(probe.rows)
+    assert len(summary) == 4
+    for row in summary:
+        assert 0.0 <= row['heat_kept'] <= 1.0 + 1e-6
+        assert row['heat_kept'] <= row['heat_ceiling'] + 1e-6
+        assert row['layers'] == cfg.num_layers
+
+
+def test_init_probe_summary_handles_an_all_nan_recall():
+    rows = [{'step': 0, 'layer': 0, 'variant': 'veda1', 'target': 'max',
+             'recall': float('nan'), 'heat_kept': 0.5,
+             'heat_ceiling': 0.9}]
+    summary = solattn.summarize_init_probe(rows)
+    assert math.isnan(summary[0]['recall'])
+    assert summary[0]['kept_over_ceiling'] == pytest.approx(0.5 / 0.9)
+
+
+def test_init_variants_land_on_the_requested_device():
+    variants = solattn.init_variants(16, device='cpu')
+    for pred in variants.values():
+        for param in pred.parameters():
+            assert param.device.type == 'cpu'
