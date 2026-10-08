@@ -1139,8 +1139,13 @@ class PredictorInitProbe:
                 lse_t.index_fill_(0, tile_layout.pad_slots, 0.0)
             logits = {}
             for name, pred in self.variants.items():
-                full = pred.scores(0, q_t, k_t, tile_layout,
-                                   group.heads.clamp(max=_PROBE_HEADS - 1))
+                # A one-layer stand-in answers for every layer; a trained
+                # bundle has all of them. Same for the head axis: the
+                # stand-in is built wide so any real head indexes into it.
+                layer = min(layer_index, len(pred.layers) - 1)
+                heads = group.heads.clamp(
+                    max=pred.layers[layer].proj_q.shape[0] - 1)
+                full = pred.scores(layer, q_t, k_t, tile_layout, heads)
                 logits[name] = full.index_select(1, rows).contiguous()
             for target in self.targets:
                 heat = veda_heatmap.teacher_heat(q_t, k_t, lse_t,
@@ -1545,6 +1550,9 @@ class RunConfig:
         teacher_adapter: Few-step LoRA merged into the teacher (turbo).
         plan: Tile plan json; None uses `tile_shape` for every head.
         tile_shape: Shape used when `plan` is None.
+        predictor: Released bundle to add to the init probe as a trained
+            veda1 variant. Its own plans are used for the geometry, so
+            the probe sees the tile shapes it was trained against.
         densities / alphas / query_tiles / k_min / k_max / oracle / heads:
             See `AblationConfig`.
         eta: G1's required relative improvement.
@@ -1569,6 +1577,7 @@ class RunConfig:
     teacher_adapter: str | None = None
     plan: str | None = None
     tile_shape: str = '4x4x8'
+    predictor: str | None = None
     densities: list[float] = dataclasses.field(
         default_factory=lambda: [0.05, 0.1, 0.2])
     alphas: list[float] = dataclasses.field(
@@ -1752,6 +1761,14 @@ def run_init_probe(config: RunConfig) -> None:
     out_dir = os.path.join(config.out_dir, config.run_name)
     os.makedirs(out_dir, exist_ok=True)
     variants = init_variants(model.config.head_dim, env.device)
+    trained = None
+    if config.predictor:
+        from miowtion.veda import bundle as veda_bundle  # pylint: disable=import-outside-toplevel
+        trained = veda_bundle.load(config.predictor, env.device)
+        variants['veda1_trained'] = trained.predictor
+        progress.log(f'loaded trained predictor {config.predictor} '
+                     f'(keep ratio {trained.keep_ratio}, plans '
+                     f'{sorted(trained.plans.plans)})')
     for spec in config.geometries:
         geometry = data.parse_geometry(spec)
         samples = [s for s in cache.select('train', config.tasks)
@@ -1760,9 +1777,14 @@ def run_init_probe(config: RunConfig) -> None:
         if not samples:
             raise ValueError(f'no cached sample for {geometry.name}')
         sample = samples[0]
-        plan = veda_plan.TilePlan.uniform(
-            geometry, tiling.TileShape.parse(config.tile_shape),
-            model.config.num_layers, model.config.num_heads)
+        if trained is not None:
+            # The trained predictor was distilled against these shapes;
+            # scoring it on any others would grade the wrong thing.
+            plan = trained.plans.select(geometry)
+        else:
+            plan = veda_plan.TilePlan.uniform(
+                geometry, tiling.TileShape.parse(config.tile_shape),
+                model.config.num_layers, model.config.num_heads)
         veda_config = veda_attention.VedaConfig(
             target_budget=veda_mask.Budget(ratio=config.densities[0]))
         traj = trajectory.Trajectory(model, cache, sample, geometry,
@@ -1803,7 +1825,8 @@ def run_init_probe(config: RunConfig) -> None:
                                 'budget_ratio': config.densities[0],
                                 'steps': list(config.steps),
                                 'query_tiles': config.query_tiles,
-                                'tile_shape': config.tile_shape},
+                                'tile_shape': config.tile_shape,
+                                'predictor': config.predictor},
                        'rows': rows, 'summary': summary}, handle, indent=1)
         os.replace(tmp, path)
         progress.log(f'saved {path} ({len(rows)} rows)')

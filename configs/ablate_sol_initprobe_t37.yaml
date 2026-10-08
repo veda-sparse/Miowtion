@@ -13,6 +13,7 @@ schedule: turbo
 num_steps: 8
 teacher_adapter: weights/turbo_lora/minimax_h3_turbo_v4_step600_ema.safetensors
 tile_shape: 4x4x8
+predictor: weights/veda/Minimax-H3-T2VA-Veda-8NFE-600Step-Preview/minimax_h3_t2va_veda_8nfe_600step_preview_fp8.safetensors
 densities: [0.1]
 query_tiles: 16
 out_dir: runs
