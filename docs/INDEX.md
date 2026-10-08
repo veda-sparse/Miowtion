@@ -21,6 +21,7 @@
 | [features/quant_scoring.md](features/quant_scoring.md) | 低精度块打分：fp8 / nvfp4 / mx 的 fake quant（含 smooth-K）与 top-k 选择误差探针；打分器 bundle 的 bf16 / fp8 存储精度对比 | CPU 测试通过；GPU 实测进行中 |
 | [features/visual_check.md](features/visual_check.md) | 可视化对比：1×N 带标题拼接、逐帧差值热力图、PSNR / SSIM，供人工确认无法位级对齐的路径 | CPU 测试通过 |
 | [benchmark/performance.md](benchmark/performance.md) | 实测性能：T2VA 推理（各长度的注意力 / step 加速拆解、文本编码、VAE 解码）与训练，稳态 step time、各 stage 耗时、端到端、diffusion MFU；`--random-weights` 在没有权重的机器上量 step | 1×4090 已测；1×RTX PRO 6000 随机权重已测；多卡与 R2VA 待测 |
+| [features/r2va.md](features/r2va.md) | Ref2VA reference encoding, independent visual tile budgets, and the released predictor | CPU/GPU regression tested |
 | [dependencies.md](dependencies.md) | 外部依赖、锁定版本、依赖的内部接口 | 当前 |
 | [pitfalls.md](pitfalls.md) | 踩坑总表 | 持续更新 |
 

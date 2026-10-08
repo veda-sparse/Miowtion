@@ -161,6 +161,11 @@ class SampleCache:
         tags = self._text.get_slice('tags')[start:stop].to(torch.long)
         return hidden, tags
 
+    def tags(self, sample: Sample) -> torch.Tensor:
+        """Loads only a sample's int64 text tags for cheap preflight."""
+        start, stop = sample.text
+        return self._text.get_slice('tags')[start:stop].to(torch.long)
+
     def conditions(self, sample: Sample
                    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Clean condition rows (video [Nc, 96] fp32, audio [Na, 32] fp32)."""
@@ -273,6 +278,171 @@ class SampleCacheWriter:
             os.replace(os.path.join(tmp, name),
                        os.path.join(self.directory, name))
         os.rmdir(tmp)
+
+
+def merge_sample_caches(
+        directories: Sequence[str], output_directory: str,
+        sample_order: Sequence[str] | None = None) -> None:
+    """Merges independently encoded caches into one cache.
+
+    Sharded encoding must never let workers append to the same safetensors
+    file. Each worker finalizes a complete cache, then this function rewrites
+    spans while combining those caches into the training cache.
+
+    Args:
+        directories: Input cache directories.
+        output_directory: Destination cache directory.
+        sample_order: Optional exact output order. When provided, its IDs must
+            match the union of input sample IDs.
+
+    Raises:
+        ValueError: If inputs contain duplicate IDs or disagree with
+            ``sample_order``.
+    """
+    caches = [SampleCache(directory) for directory in directories]
+    entries = {}
+    for cache in caches:
+        for sample in cache.samples:
+            if sample.id in entries:
+                raise ValueError(f'duplicate sample ID {sample.id!r}')
+            entries[sample.id] = (cache, sample)
+
+    if sample_order is None:
+        ordered_ids = list(entries)
+    else:
+        ordered_ids = list(sample_order)
+        if len(set(ordered_ids)) != len(ordered_ids):
+            raise ValueError('sample_order contains duplicate IDs')
+        missing = set(ordered_ids) - set(entries)
+        extra = set(entries) - set(ordered_ids)
+        if missing or extra:
+            raise ValueError(
+                f'cache/order IDs disagree: missing={sorted(missing)}, '
+                f'extra={sorted(extra)}')
+
+    writer = SampleCacheWriter(output_directory)
+    for sample_id in ordered_ids:
+        cache, sample = entries[sample_id]
+        hidden, tags = cache.text(sample)
+        cond_video, cond_audio = cache.conditions(sample)
+        writer.add(
+            sample.id, sample.task, sample.split, hidden, tags,
+            keyframes=sample.keyframes, references=sample.references,
+            aspect=sample.aspect, latent_t=sample.latent_t,
+            cond_video=cond_video, cond_audio=cond_audio)
+    writer.finalize()
+
+
+def shard_jsonl_manifest(
+        manifest: str, output_directory: str, num_shards: int,
+) -> list[str]:
+    """Writes deterministic round-robin JSONL shards.
+
+    Round-robin assignment balances manifests grouped by source or modality
+    better than contiguous slicing.
+
+    Args:
+        manifest: Source JSONL path.
+        output_directory: Directory for ``shard_NNN.jsonl`` files.
+        num_shards: Positive number of shards.
+
+    Returns:
+        Written shard paths in shard-index order.
+
+    Raises:
+        ValueError: If ``num_shards`` is invalid or the manifest is empty.
+    """
+    if num_shards <= 0:
+        raise ValueError(f'num_shards must be positive, got {num_shards}')
+    with open(manifest) as f:
+        lines = [line for line in f if line.strip()]
+    if not lines:
+        raise ValueError(f'empty manifest: {manifest}')
+    os.makedirs(output_directory, exist_ok=True)
+    paths = [os.path.join(output_directory, f'shard_{i:03d}.jsonl')
+             for i in range(num_shards)]
+    handles = [open(path, 'w') for path in paths]
+    try:
+        for index, line in enumerate(lines):
+            handles[index % num_shards].write(line)
+    finally:
+        for handle in handles:
+            handle.close()
+    return paths
+
+
+def validate_training_cache(
+        directory: str, expected_ids: Sequence[str], split: str,
+        tasks: Sequence[str], geometry_specs: Sequence[str],
+) -> dict[str, int]:
+    """Validates cache membership and every condition/layout row count.
+
+    This runs before loading the 33B teacher so corrupt or partially merged
+    caches fail cheaply. A sample is checked on one compatible geometry;
+    reference row counts do not depend on the target canvas.
+
+    Args:
+        directory: Encoded sample cache.
+        expected_ids: Exact sample IDs in expected order.
+        split: Required split.
+        tasks: Allowed tasks.
+        geometry_specs: Training geometries.
+
+    Returns:
+        Summary with sample count and maximum packed sequence length.
+
+    Raises:
+        ValueError: On duplicate/missing IDs, incompatible geometry, or a
+            condition span that disagrees with its packed layout.
+    """
+    from miowtion.h3 import layout as h3_layout  # Avoid module-level cycle.
+
+    cache = SampleCache(directory)
+    ids = [sample.id for sample in cache.samples]
+    expected_ids = list(expected_ids)
+    if len(set(ids)) != len(ids):
+        raise ValueError('cache contains duplicate sample IDs')
+    if ids != expected_ids:
+        missing = sorted(set(expected_ids) - set(ids))
+        extra = sorted(set(ids) - set(expected_ids))
+        raise ValueError(
+            f'cache IDs/order disagree: missing={missing[:5]}, '
+            f'extra={extra[:5]}')
+    selected = cache.select(split, tasks)
+    if len(selected) != len(expected_ids):
+        raise ValueError(
+            f'expected {len(expected_ids)} {split} {list(tasks)} samples, '
+            f'got {len(selected)}')
+
+    geometries = [parse_geometry(spec) for spec in geometry_specs]
+    max_sequence = 0
+    for sample in selected:
+        compatible = [geometry for geometry in geometries
+                      if sample.aspect in (None, geometry.aspect)
+                      and sample.latent_t in (None, geometry.latent_t)]
+        if not compatible:
+            raise ValueError(
+                f'{sample.id}: no compatible training geometry')
+        tags = cache.tags(sample)
+        if tags.numel() != sample.text_len:
+            raise ValueError(
+                f'{sample.id}: text span has {tags.numel()} rows, expected '
+                f'{sample.text_len}')
+        packed = h3_layout.pack(
+            tags, compatible[0], sample.keyframes, sample.references)
+        cond_video, cond_audio = cache.conditions(sample)
+        expected_video = int((~packed.update_mask).sum())
+        expected_audio = int((~packed.audio_update_mask).sum())
+        if cond_video.shape != (expected_video, 96):
+            raise ValueError(
+                f'{sample.id}: condition video shape {tuple(cond_video.shape)}'
+                f', expected {(expected_video, 96)}')
+        if cond_audio.shape != (expected_audio, 32):
+            raise ValueError(
+                f'{sample.id}: condition audio shape {tuple(cond_audio.shape)}'
+                f', expected {(expected_audio, 32)}')
+        max_sequence = max(max_sequence, packed.used)
+    return {'samples': len(selected), 'max_sequence': max_sequence}
 
 
 def parse_geometry(spec: str) -> h3_geometry.Geometry:

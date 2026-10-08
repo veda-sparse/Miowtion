@@ -1,0 +1,42 @@
+# First full Ref2VA predictor training run on the curated 1k set.
+# Prompts target 5.17 seconds, so only latent_t=37 geometries are sampled.
+run_name: stage1_r2va_fixed32_8gpu
+checkpoint_root: weights/MiniMax-H3
+sample_cache: artifacts/samples/r2va_h3_1k_v1
+geometries: ['1:1@37', '4:3@37', '16:9@37', '9:16@37']
+geometry_sampling: uniform
+variant: Ref2VA
+tasks: [ref2va]
+plan_dir: artifacts/init/veda_8nfe_step600_plans
+schedule: turbo
+num_steps: 8
+teacher_adapter: weights/turbo_lora/minimax_h3_turbo_v4_step600_ema.safetensors
+init_from: runs/stage1_scratch_muon_8gpu/ckpt/step_0000600
+
+# Reference and current visual key blocks receive independent fixed budgets.
+tile_conditions: true
+keep_tiles: 32
+ref_keep_tiles: 32
+teacher_q_tiles: 1.0
+recall_every: 1
+
+accum: 1
+steps: 600
+optimizer: muon
+lr: 1.0e-3
+muon_momentum: 0.95
+muon_rms: 0.2
+warmup: 20
+lr_decay: cosine
+lr_min_ratio: 0.1
+# 40 * accum is divisible by the 8 denoising steps, so every resumable
+# checkpoint lands exactly between trajectories.
+save_every: 40
+keep_optimizer: 1
+out_dir: runs
+offload_blocks: 0
+prefetch: 1
+mlp_chunk_rows: 8192
+veda_collect_mib: 2048
+offload_optimizer: false
+monitor_updates: true

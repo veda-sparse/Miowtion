@@ -51,9 +51,17 @@ def main():
         loaded = veda_bundle.load(args.bundle)
     weights = {_PREFIX + name: value
                for name, value in loaded.predictor.state_dict().items()}
-    provenance = {'imported_from': os.path.basename(args.bundle),
-                  'bundle_dtype': metadata.get('dtype'),
-                  'keep_ratio': loaded.keep_ratio}
+    provenance = {
+        'imported_from': os.path.basename(args.bundle),
+        'bundle_dtype': metadata.get('dtype'),
+        'keep_ratio': loaded.target_budget.ratio,
+        'keep_tiles': loaded.target_budget.tiles,
+        'ref_keep_ratio': (loaded.ref_budget.ratio
+                           if loaded.ref_budget else None),
+        'ref_keep_tiles': (loaded.ref_budget.tiles
+                           if loaded.ref_budget else None),
+        'tile_conditions': loaded.tile_conditions,
+    }
     for key in ('training_step', 'schedule', 'num_steps', 'variant',
                 'teacher_adapter'):
         if key in metadata:
@@ -68,8 +76,8 @@ def main():
         f'parameters (stored fp32 from {metadata.get("dtype")}); '
         f'{args.out_plan_dir}: {len(loaded.plans.plans)} plans '
         f'({", ".join(sorted(loaded.plans.plans))})')
-    progress.log(f'keep_ratio {loaded.keep_ratio}, provenance '
-                 f'{json.dumps(provenance)}')
+    progress.log(f'target budget {loaded.target_budget}, ref budget '
+                 f'{loaded.ref_budget}, provenance {json.dumps(provenance)}')
     # A bundle pairs weights with the plans they were trained against, and
     # a mispairing is silent (the predictor still scores, for a tiling it
     # never saw), so say it where the operator will see it.
