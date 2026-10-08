@@ -122,7 +122,7 @@ def _chunk_heads(tile_layout: tiling.TileLayout, collect_bytes: int) -> int:
 
 
 def _fused(x: torch.Tensor) -> bool:
-    return x.is_cuda and tile_gather_triton.available()
+    return tile_gather_triton.supports(x)
 
 
 def _gather(x: torch.Tensor, tile_layout: tiling.TileLayout,
@@ -313,13 +313,15 @@ class SparseStudent:
             RuntimeError: If FA4 is unavailable and the reference kernel is
                 not explicitly allowed.
         """
-        if not fa4.available() and not allow_reference_kernel:
+        # Ask about the device the clip is actually on: a CUDA machine
+        # answers True for a CPU clip otherwise, and the kernel then dies.
+        if not fa4.available(clip.device) and not allow_reference_kernel:
             raise RuntimeError('SparseStudent needs the FA4 block-sparse '
                                'kernel; refusing to fall back silently')
         self.clip = clip
         self.plan = plan
         self.predictor = predictor
-        self.use_fa4 = fa4.available()
+        self.use_fa4 = fa4.available(clip.device)
         self.calls = {'sparse': 0, 'dense': 0}
 
     def __call__(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,

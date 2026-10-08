@@ -51,6 +51,17 @@ def _triton():
     return triton, tl
 
 
+def supports(q: torch.Tensor) -> bool:
+    """The kernel is installed *and* can take these tensors.
+
+    Same reason as tile_gather_triton.supports: `available()` says
+    nothing about the tensor, and `teacher_heat` raises on a head_dim it
+    does not implement.
+    """
+    return (q.is_cuda and available() and q.shape[-1] in (64, 128)
+            and q.stride(-1) == 1)
+
+
 def available() -> bool:
     return torch.cuda.is_available() and _triton() is not None
 

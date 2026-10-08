@@ -38,6 +38,18 @@ def available() -> bool:
     return torch.cuda.is_available() and _triton() is not None
 
 
+def supports(x: torch.Tensor) -> bool:
+    """The kernels are installed *and* can take this tensor.
+
+    `available()` alone is not enough to route a call here: on a CUDA
+    machine a CPU tensor, or a head_dim the kernels do not implement,
+    reaches `_check` and raises. Callers that have a fallback should ask
+    this instead.
+    """
+    return (x.is_cuda and available() and x.shape[-1] in (64, 128)
+            and x.stride(-1) == 1)
+
+
 @functools.cache
 def _kernels():
     triton, tl = _triton()

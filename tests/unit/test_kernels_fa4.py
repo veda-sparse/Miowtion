@@ -83,3 +83,31 @@ def test_module_import_is_serialized_across_threads(monkeypatch):
     for thread in threads:
         thread.join()
     assert state['peak'] == 1
+
+
+def test_available_is_false_for_a_non_cuda_device():
+    """A CUDA machine must not claim the kernel for a CPU tensor.
+
+    `SparseStudent` asks this before choosing between FA4 and the
+    reference kernel. When it ignored the device, a CPU clip on a CUDA box
+    picked FA4 and died inside the kernel on 'Expected a cuda device'.
+    """
+    from miowtion.kernels import fa4
+    assert fa4.available(torch.device('cpu')) is False
+    assert fa4.dense_available(torch.device('cpu')) is False
+
+
+def test_tile_kernel_support_accounts_for_the_tensor():
+    """`available()` says nothing about head_dim or device; `supports` does.
+
+    On a CUDA machine the tiny test configs used to route a head_dim of 16
+    into the Triton tile kernels, which raise. The predicate the callers
+    use has to answer for the tensor they would pass.
+    """
+    from miowtion.kernels import block_heat_triton, tile_gather_triton
+    cpu = torch.zeros(4, 2, 128)
+    assert tile_gather_triton.supports(cpu) is False
+    assert block_heat_triton.supports(cpu) is False
+    small = torch.zeros(4, 2, 16)
+    assert tile_gather_triton.supports(small) is False
+    assert block_heat_triton.supports(small) is False

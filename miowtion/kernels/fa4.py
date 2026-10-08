@@ -113,8 +113,16 @@ def dense_available(device: torch.device) -> bool:
 
 
 def available(device: torch.device | None = None) -> bool:
-    """FA4 is importable and implements block sparsity on `device`."""
+    """FA4 is importable and implements block sparsity on `device`.
+
+    A non-CUDA `device` is False, not an error. Callers decide whether to
+    take the kernel from the device their tensors are actually on, and on
+    a CUDA machine a CPU path used to get True here and then die inside
+    the kernel on `Expected a cuda device`.
+    """
     if not torch.cuda.is_available() or _modules() is None:
+        return False
+    if device is not None and torch.device(device).type != 'cuda':
         return False
     major = torch.cuda.get_device_capability(device)[0]
     if major in PATCHED_MAJOR_ARCHS:
