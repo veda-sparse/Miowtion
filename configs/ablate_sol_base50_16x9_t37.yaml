@@ -1,0 +1,23 @@
+# Sol-Attn ablation on the 49-step base teacher: early / two middle / late
+# steps, so the step dependence of both hypotheses is visible without the
+# few-step LoRA in the way.
+run_name: sol_ablation_base50_t37
+checkpoint_root: weights/MiniMax-H3
+sample_cache: artifacts/samples/moviegen_holdout20
+geometries: ['16:9@37']
+variant: FL2VA
+tasks: [t2va]
+num_clips: 2
+steps: [0, 12, 25, 40]
+schedule: base
+num_steps: 49
+# Set `plan: plans/<geometry>.json` once a plan is adopted.
+tile_shape: 4x4x8
+densities: [0.05, 0.1, 0.2]
+alphas: [0.5, 1.0, 2.0]
+query_tiles: 6
+oracle: Omega0
+out_dir: runs
+offload_blocks: 30
+prefetch: 1
+mlp_chunk_rows: 8192

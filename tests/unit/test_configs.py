@@ -4,8 +4,8 @@ A run that dies on a typo'd or dropped key an hour in costs more than the
 whole test suite, and twice already a config has been launched with a key
 the loader silently did not know. So: every `infer_*.yaml` has to parse
 into scripts/generate.py's parser and leave nothing required unset,
-every `search_*.yaml` into a SearchConfig, and every other one into a
-TrainConfig.
+every `search_*.yaml` into a SearchConfig, every `ablate_*.yaml` into a
+solattn.RunConfig, and every other one into a TrainConfig.
 """
 
 import dataclasses
@@ -17,6 +17,7 @@ import pytest
 
 from miowtion.train import trainer
 from miowtion.veda import search
+from miowtion.veda import solattn
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__))))
@@ -39,7 +40,9 @@ def test_there_are_configs():
 def test_config_parses(path):
     name = os.path.basename(path)
     if name.startswith('search_'):
-        _check_search(path)
+        _check_dataclass(path, search.SearchConfig)
+    elif name.startswith('ablate_'):
+        _check_dataclass(path, solattn.RunConfig)
     elif name.startswith('infer_'):
         generate = _load_script('generate.py')
         args = generate.parse_args(['--config', path])
@@ -55,12 +58,12 @@ def test_config_parses(path):
         assert config.run_name, 'a run needs a name'
 
 
-def _check_search(path: str) -> None:
-    """scripts/search_tiles.py keeps its own config type."""
+def _check_dataclass(path: str, config_type) -> None:
+    """search_tiles.py and ablate_sol.py keep their own config types."""
     import yaml  # pylint: disable=import-outside-toplevel
     with open(path) as f:
         raw = yaml.safe_load(f)
     unknown = sorted(set(raw) - {f.name for f in
-                                 dataclasses.fields(search.SearchConfig)})
+                                 dataclasses.fields(config_type)})
     assert not unknown, f'unknown config keys {unknown}'
-    assert search.SearchConfig(**raw).run_name
+    assert config_type(**raw).run_name

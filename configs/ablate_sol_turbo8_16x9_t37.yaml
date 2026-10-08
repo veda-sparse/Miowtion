@@ -1,0 +1,26 @@
+# Sol-Attn ablation (H1 selection target, H2 variable budget) on the 8-step
+# Turbo teacher. Single process: the output projection must be unsharded.
+# 2 clips x 4 steps x 50 layers x 56 heads x 3 densities; query_tiles is the
+# cost knob, because Omega needs [queries, tiles, head_dim] per query tile.
+run_name: sol_ablation_turbo8_t37
+checkpoint_root: weights/MiniMax-H3
+sample_cache: artifacts/samples/moviegen_holdout20
+geometries: ['16:9@37']
+variant: FL2VA
+tasks: [t2va]
+num_clips: 2
+steps: [0, 2, 5, 7]
+schedule: turbo
+num_steps: 8
+teacher_adapter: weights/turbo_lora/minimax_h3_turbo_v4_step600_ema.safetensors
+# No adopted plan for this geometry yet; one shape for every head. Set
+# `plan: plans/<geometry>.json` instead once a plan is in plans/.
+tile_shape: 4x4x8
+densities: [0.05, 0.1, 0.2]
+alphas: [0.5, 1.0, 2.0]
+query_tiles: 6
+oracle: Omega0
+out_dir: runs
+offload_blocks: 30
+prefetch: 1
+mlp_chunk_rows: 8192
