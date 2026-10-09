@@ -1,0 +1,50 @@
+# Veda2 stage 1, run (1): the question that is still unanswered.
+#
+# Three attempts failed for reasons that had nothing to do with whether
+# training helps: forward KL flattened, a warm start from Veda1 began 12
+# points behind, and reverse KL ran the logits away. This isolates the
+# question by removing every degree of freedom that caused those.
+#
+# The second-cumulant head is held at its warm start. Its contribution is
+# quadratic in so_q and so_k, so a step size tuned for the base
+# projections runs it away: measured, the logit spread grew 6x in 48
+# updates. Frozen, the only thing training can move is the base
+# projections -- exactly the parameterisation Veda1 is known to train.
+#
+# The objective is the oracle top-k BCE alone. It states what the kernel
+# reads, and it is usable now that it centres each row: the second-order
+# term is a sum of non-negative products, i.e. a large positive offset,
+# and before centring that offset *was* the loss (537, grad_norm 7522
+# against a clip of 1.0).
+run_name: stage1_veda2_frozen_t37
+checkpoint_root: weights/MiniMax-H3
+sample_cache: artifacts/samples/moviegen_video_bench
+geometries: ['1:1@37', '4:3@37', '16:9@37', '9:16@37']
+geometry_sampling: cycle
+variant: FL2VA
+tasks: [t2va]
+plan_dir: plans/released
+schedule: turbo
+num_steps: 8
+teacher_adapter: weights/turbo_lora/minimax_h3_turbo_v4_step600_ema.safetensors
+keep_ratio: 0.1
+teacher_q_tiles: 1.0
+second_order_rank: 128
+count_term: true
+freeze_second_order: true
+heat_reduce: sum
+kl_weight: 0.0
+topk_weight: 1.0
+# Stop rather than spend five hours proving it again.
+abort_window: 8
+abort_patience: 10
+accum: 4
+steps: 400
+lr: 1.0e-3
+warmup: 20
+save_every: 25
+keep_optimizer: 1
+out_dir: runs
+offload_blocks: 30
+prefetch: 1
+mlp_chunk_rows: 8192

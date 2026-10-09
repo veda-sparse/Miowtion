@@ -89,3 +89,65 @@ def check_gradient_stop(model: nn.Module,
     if leaked:
         raise RuntimeError(f'gradient reached frozen parameters: '
                            f'{leaked[:5]} ({len(leaked)})')
+
+
+class EarlyAbort:
+    """Stops a run that is not improving, instead of paying for the rest.
+
+    A Veda2 stage-1 run degraded monotonically for 59 updates before
+    anyone looked: recall 0.73 -> 0.64, the watched share 0.919 -> 0.882,
+    and the loss itself rising. An hour of GPU went into a result that was
+    visible by update 20.
+
+    The comparison is between trailing means, not single updates, because
+    the metric is not comparable across the cycled geometries: each one has
+    its own ceiling, so consecutive updates differ by more than any
+    plausible improvement. A window of twice the geometry count sees each
+    geometry about twice.
+
+    Attributes:
+        window: Updates per trailing mean.
+        patience: Updates without a new best trailing mean before aborting.
+        metric: Record field to watch; larger is better.
+    """
+
+    def __init__(self, window: int = 8, patience: int = 10,
+                 metric: str = 'kept_over_ceiling'):
+        if window < 1:
+            raise ValueError(f'window must be >= 1: {window}')
+        if patience < 1:
+            raise ValueError(f'patience must be >= 1: {patience}')
+        self.window = window
+        self.patience = patience
+        self.metric = metric
+        self._history: list[float] = []
+        self._best: float | None = None
+        self._best_at = 0
+
+    def update(self, record: dict) -> str | None:
+        """Feeds one update's record.
+
+        Args:
+            record: The per-update log record.
+
+        Returns:
+            A reason to stop, or None to carry on. The reason is phrased
+            for a human reading the log, with the numbers in it.
+        """
+        value = record.get(self.metric)
+        if value is None:
+            return None
+        self._history.append(float(value))
+        if len(self._history) < self.window:
+            return None
+        trailing = sum(self._history[-self.window:]) / self.window
+        step = len(self._history)
+        if self._best is None or trailing > self._best:
+            self._best, self._best_at = trailing, step
+            return None
+        if step - self._best_at >= self.patience:
+            return (f'{self.metric} has not improved for '
+                    f'{step - self._best_at} updates: trailing mean over '
+                    f'{self.window} is {trailing:.4f} against a best of '
+                    f'{self._best:.4f} at update {self._best_at}')
+        return None

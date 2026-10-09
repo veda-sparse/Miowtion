@@ -329,10 +329,13 @@ def test_oracle_bce_is_zero_when_logits_match_the_oracle():
     oracle = veda_mask.select_video_blocks(heat, lay, blocks, rows)
     target = torch.zeros(*oracle.index.shape[:2], n_video, dtype=torch.bool)
     target.scatter_(2, oracle.index, oracle.keep)
-    # Large logits of the right sign: BCE -> 0 on both classes.
+    # Large logits of the right sign: BCE -> 0 on both classes. Row
+    # centring shifts +-30 by the row mean, and with ~10% positives that
+    # mean is near -24, so the negatives end up at -6 rather than -30 and
+    # their sigmoid is no longer exactly saturated. Still ~2e-6.
     confident = torch.where(target, 30.0, -30.0)
     loss = heatmap.oracle_bce(confident, heat, lay, blocks, rows)
-    assert loss.item() < 1e-6
+    assert loss.item() < 1e-5
     # The opposite assignment is the worst case, and an indifferent
     # predictor sits at ln 2 whatever the keep ratio (the term is balanced).
     assert heatmap.oracle_bce(-confident, heat, lay, blocks, rows).item() > 10
@@ -579,3 +582,37 @@ def test_veda_config_carries_the_kl_direction():
     assert veda_attention.VedaConfig().kl_direction == 'forward'
     assert veda_attention.VedaConfig(
         kl_direction='reverse').kl_direction == 'reverse'
+
+
+def test_oracle_bce_is_invariant_to_a_per_row_offset():
+    """The kernel reads a within-row ordering, so the loss must too.
+
+    The second-order score term is a sum of non-negative products, i.e. a
+    large positive offset. Before centring, that offset *was* the loss.
+    """
+    lay, blocks, rows, heat = _tiny_oracle_case()
+    logits = torch.randn(heat.shape)
+    base = heatmap.oracle_bce(logits, heat, lay, blocks, rows)
+    for offset in (5.0, 500.0):
+        shifted = logits + offset
+        moved = heatmap.oracle_bce(shifted, heat, lay, blocks, rows)
+        assert float(moved) == pytest.approx(float(base), rel=1e-4), offset
+    # A per-row offset, not just a global one.
+    per_row = logits + torch.arange(
+        logits.shape[1], dtype=logits.dtype)[None, :, None] * 100.0
+    moved = heatmap.oracle_bce(per_row, heat, lay, blocks, rows)
+    assert float(moved) == pytest.approx(float(base), rel=1e-4)
+
+
+def test_oracle_bce_still_separates_a_good_mask_from_a_bad_one():
+    """Centring must not make the loss blind to the ordering."""
+    lay, blocks, rows, heat = _tiny_oracle_case()
+    n_video = lay.n_video_tiles
+    oracle = veda_mask.select_video_blocks(heat, lay, blocks, rows)
+    target = torch.zeros(*oracle.index.shape[:2], n_video, dtype=torch.bool)
+    target.scatter_(2, oracle.index, oracle.keep)
+    good = torch.zeros(heat.shape)
+    good[:, :, :n_video] = target.float() * 6.0 - 3.0
+    bad = -good
+    assert float(heatmap.oracle_bce(good, heat, lay, blocks, rows)) < \
+        float(heatmap.oracle_bce(bad, heat, lay, blocks, rows))

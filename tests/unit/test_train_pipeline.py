@@ -582,3 +582,67 @@ def test_progress_line_shows_the_normalized_metric():
     # Missing keys are skipped rather than crashing a long run's logging.
     assert 'recall' not in train_trainer.Trainer._progress_line(
         None, {'kl': 1.0})
+
+
+def test_early_abort_stops_a_degrading_run():
+    """The case it exists for: monotone decline, caught in ~20 updates."""
+    from miowtion.train import monitor
+    abort = monitor.EarlyAbort(window=4, patience=6)
+    reasons = []
+    for i in range(30):
+        value = 0.93 - 0.004 * i            # the measured decline
+        reasons.append(abort.update({'kept_over_ceiling': value}))
+    stopped = [i for i, r in enumerate(reasons) if r]
+    assert stopped, 'a monotone decline must be caught'
+    assert stopped[0] < 15, f'caught too late at update {stopped[0]}'
+    assert 'has not improved' in reasons[stopped[0]]
+    assert 'best of' in reasons[stopped[0]]
+
+
+def test_early_abort_tolerates_geometry_noise():
+    """Cycled geometries swing the metric more than progress does."""
+    from miowtion.train import monitor
+    abort = monitor.EarlyAbort(window=8, patience=10)
+    # Four geometries with their own levels, all improving slowly.
+    levels = [0.91, 0.93, 0.88, 0.90]
+    for i in range(60):
+        value = levels[i % 4] + 0.0005 * i
+        assert abort.update({'kept_over_ceiling': value}) is None, i
+
+
+def test_early_abort_waits_for_a_full_window_and_ignores_gaps():
+    from miowtion.train import monitor
+    abort = monitor.EarlyAbort(window=5, patience=3)
+    for _ in range(4):
+        assert abort.update({'kept_over_ceiling': 0.9}) is None
+    # A record without the metric is skipped, not treated as a decline.
+    assert abort.update({'kl': 1.0}) is None
+    with pytest.raises(ValueError, match='window must be'):
+        monitor.EarlyAbort(window=0)
+    with pytest.raises(ValueError, match='patience must be'):
+        monitor.EarlyAbort(patience=0)
+
+
+def test_kl_weight_zero_leaves_the_bce_alone():
+    """It weights the KL, not the whole loss.
+
+    When the trainer's gradient scale carried kl_weight, setting it to 0
+    silently zeroed the BCE too, so 'BCE only' was inexpressible.
+    """
+    from miowtion.veda import attention as veda_attention
+    assert veda_attention.VedaConfig().kl_weight == 1.0
+    assert veda_attention.VedaConfig(kl_weight=0.0).kl_weight == 0.0
+    config = _lr_config(kl_weight=0.0, topk_weight=1.0)
+    config.validate()
+
+
+def test_freeze_second_order_removes_only_that_head():
+    from miowtion.veda import predictor as veda_predictor
+    pred = veda_predictor.TileScorePredictor(2, 2, 16,
+                                             second_order_rank=4,
+                                             count_term=True)
+    names = [f'predictor.{n}' for n, _ in pred.named_parameters()]
+    kept = [n for n in names if not n.endswith(('so_q', 'so_k'))]
+    assert len(names) - len(kept) == 4           # two layers x so_q, so_k
+    assert any(n.endswith('count_gain') for n in kept)
+    assert any(n.endswith('proj_q') for n in kept)

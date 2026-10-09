@@ -220,6 +220,17 @@ def oracle_bce(logits: torch.Tensor, heat: torch.Tensor,
         positive = target & valid
         negative = ~target & valid
     scores = logits[:, :, :n_video].float()
+    # Centre each row before the sigmoid. The kernel reads a within-row
+    # ordering, so the loss has to be invariant to a per-row offset for the
+    # same reason the top-k is. Without this the BCE reads absolute logit
+    # magnitude, and the second-order score term is a sum of non-negative
+    # products, i.e. a large positive offset: measured, it put the loss at
+    # 537 with a gradient of +-1 per element, so grad_norm hit 7522 against
+    # a clip of 1.0 and every update was scaled to nothing.
+    counted = valid.to(scores.dtype)
+    rows = counted.sum(-1, keepdim=True).clamp(min=1.0)
+    centre = (scores * counted).sum(-1, keepdim=True) / rows
+    scores = scores - centre
     terms = F.binary_cross_entropy_with_logits(
         scores, target.to(scores.dtype), reduction='none')
     n_pos = positive.sum().clamp(min=1)

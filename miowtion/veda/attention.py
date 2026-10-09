@@ -47,6 +47,10 @@ class VedaConfig:
             between geometries.
         recall_every: Compute the mask diagnostics on every n-th layer.
         dense_layers: Layers that stay dense in the sparse student.
+        kl_weight: Weight on the seer KL. 0.0 leaves the oracle top-k BCE
+            as the only objective, which is the one that matches what the
+            kernel reads; it used to be impossible to express because the
+            trainer's scale multiplied both terms at once.
         kl_direction: 'forward' for KL(teacher || student), which is
             mass-covering and flattens, or 'reverse' for
             KL(student || teacher), which is mode-seeking and is what a
@@ -64,6 +68,7 @@ class VedaConfig:
     """
 
     heat_reduce: str = 'max'
+    kl_weight: float = 1.0
     kl_direction: str = 'forward'
     target_budget: veda_mask.Budget = veda_mask.Budget(ratio=0.1)
     ref_budget: veda_mask.Budget | None = None
@@ -345,7 +350,7 @@ class TeacherCollector:
                         feats_q[:, rows], feats_k, heads, **extra)
                     kl = heatmap.seer_kl(logits, heat, tile_layout,
                                          self.clip.config.kl_direction)
-                    loss = kl
+                    loss = self.clip.config.kl_weight * kl
                     if self.topk_weight:
                         bce = heatmap.oracle_bce(
                             logits, heat, tile_layout,
@@ -359,8 +364,14 @@ class TeacherCollector:
                 layer_kl = term if layer_kl is None else layer_kl + term
                 # A collapsing predictor scores every key tile alike; the
                 # spread of its logits is the cheapest way to see it.
+                # Video columns only. Global key tiles are always kept
+                # and never ranked, and their second-order term sits at a
+                # wildly different level, so including them made this read
+                # 192 where the spread that actually decides anything is
+                # about 4.
                 self.stats.logit_std.append(
-                    logits.detach().std(dim=-1).mean())
+                    logits.detach()[:, :, :tile_layout.n_video_tiles]
+                    .std(dim=-1).mean())
                 # Diagnostics are cheap: they work on the /128 tile grid,
                 # where a top-k costs ~1e-6 of the heat that produced it.
                 if layer_index % self.clip.config.recall_every == 0:

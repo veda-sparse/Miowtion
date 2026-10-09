@@ -92,6 +92,21 @@ class TrainConfig:
     # second_order_rank is below head_dim: only full rank has a closed-form
     # warm start. None at full rank uses that closed form.
     second_order_moments: str | None = None
+    # Hold the second-cumulant head at its warm start and train only the
+    # base projections. The head is a bilinear in so_q and so_k, so its
+    # contribution is quadratic in the parameters and a step size tuned
+    # for the base projections runs it away: measured, logit spread grew
+    # 6x in 48 updates. Freezing it isolates the question that has not
+    # been answered yet -- whether training the base against the right
+    # target and features moves the predictor towards the oracle.
+    freeze_second_order: bool = False
+    # Stop a run that is not improving instead of paying for the rest. 0
+    # disables it. See train.monitor.EarlyAbort: the comparison is between
+    # trailing means, because the watched metric is not comparable across
+    # the cycled geometries.
+    abort_window: int = 8
+    abort_patience: int = 0
+    abort_metric: str = 'kept_over_ceiling'
     # 'max' distils against the block's peak probability (Veda1), 'sum'
     # against its attention mass. Mass is what determines the output
     # error, and it is also what the predictor's own initialization
@@ -296,6 +311,7 @@ class Trainer:
             target_budget=target_budget,
             ref_budget=ref_budget,
             heat_reduce=config.heat_reduce,
+            kl_weight=config.kl_weight,
             kl_direction=config.kl_direction,
             tile_conditions=config.tile_conditions,
             teacher_q_tiles=config.teacher_q_tiles,
@@ -304,6 +320,16 @@ class Trainer:
 
         self.trainable = [(f'predictor.{n}', p)
                           for n, p in self.predictor.named_parameters()]
+        if config.freeze_second_order:
+            held = [n for n, p in self.predictor.named_parameters()
+                    if n.endswith(('so_q', 'so_k'))]
+            for name, param in self.predictor.named_parameters():
+                if name.endswith(('so_q', 'so_k')):
+                    param.requires_grad_(False)
+            self.trainable = [(n, p) for n, p in self.trainable
+                              if not n.endswith(('so_q', 'so_k'))]
+            progress.log(f'second-order head frozen: {len(held)} tensors '
+                         'held at the warm start')
         if config.stage == 2:
             self.trainable += lora.lora_parameters(self.model)
             self.trainable += [
@@ -520,8 +546,9 @@ class Trainer:
         inputs = traj.inputs()
         table = self.tables.get(inputs.timestep.timesteps)
         num_layers = self.model.config.num_layers
-        kl_scale = (self.config.kl_weight
-                    / (num_layers * self.config.accum))
+        # Pure normalization. The KL's own weight lives in VedaConfig, so
+        # that kl_weight 0 means 'BCE only' rather than 'no loss at all'.
+        kl_scale = 1.0 / (num_layers * self.config.accum)
         collector = veda_attention.TeacherCollector(
             self.clip_tiling, self.plan, self.predictor, self.noise_gen,
             grad_scale=kl_scale, dense_backend=self.config.dense_backend,
@@ -557,6 +584,10 @@ class Trainer:
     def train(self) -> None:
         config = self.config
         self._updates = progress.Progress('updates', config.steps - self.step)
+        abort = (monitor_lib.EarlyAbort(config.abort_window,
+                                    config.abort_patience,
+                                    config.abort_metric)
+                 if config.abort_patience else None)
         while self.step < config.steps:
             start = time.time()
             stats = {name: [] for name in
@@ -594,6 +625,14 @@ class Trainer:
             self.step += 1
             self._log_step(stats, norms, time.time() - start, diagnostics)
             self._updates.update(self._progress_line(self._last_record))
+            if abort is not None:
+                reason = abort.update(self._last_record)
+                if reason:
+                    self._log({'event': 'aborted', 'step': self.step,
+                               'reason': reason})
+                    progress.log(f'aborting at update {self.step}: {reason}')
+                    self._save()
+                    return
             if self.step % config.save_every == 0 or self.step == config.steps:
                 self._save()
         self.ckpt.wait()
