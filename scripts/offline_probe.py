@@ -87,14 +87,22 @@ class ProbeConfig:
 class _Probe:
     """Dense attention that also records what a router would have done."""
 
-    def __init__(self, clip, plan, predictor, step, out):
+    def __init__(self, clip, plan, predictor, step, out, grid=None):
         self.clip = clip
         self.plan = plan
         self.predictor = predictor
         self.step = step
         self.out = out
-        # layer -> the selected (head, row, tile) set, for P2-3.
+        # Latent grid (t, h, w) of the video span, so the tile order's
+        # time-block stride can be recovered.
+        self.grid = grid
+        # layer -> the selected (head, row, tile) set, for P2-3 and churn.
         self.selection = {}
+        # t-blocks per spatial column, needed to tell which adjacent query
+        # tiles are temporally adjacent rather than a column apart.
+        self.t_blocks = {}
+        # Full-row selection of one layer per step, for the churn metric.
+        self.full_selection = {}
 
     def __call__(self, q, k, v, layer_index):
         from miowtion.h3 import attention as h3_attention
@@ -159,6 +167,26 @@ class _Probe:
                 entry['predictor_spearman'] = solattn.rank_correlation(
                     logits[:, rows], truth)
 
+            # Mask churn: the quantity PSNR structurally cannot provide
+            # (a per-frame metric cannot see a selection that jitters
+            # between temporally adjacent tiles). Needs every query tile,
+            # not the subsample, so it runs on one layer per step.
+            if layer_index == 0:
+                all_rows = torch.arange(tile_layout.n_video_tiles,
+                                        device=q.device)
+                full = self.predictor.layers[layer_index](
+                    feats_q, feats_k, heads,
+                    **veda_attention._extra_features(
+                        self.predictor, tile_layout, sq_q, var_k))
+                sel_all = veda_mask.select_video_blocks(
+                    full[:, :, :tile_layout.n_video_tiles], tile_layout,
+                    blocks, all_rows)
+                dense_all = torch.zeros(
+                    *sel_all.index.shape[:2], tile_layout.n_video_tiles,
+                    dtype=torch.bool, device=q.device)
+                dense_all.scatter_(2, sel_all.index, sel_all.keep)
+                self.full_selection[str(group.shape)] = dense_all.cpu()
+
             # P2-3: the predicted set, so adjacent layers can be compared.
             sel = veda_mask.select_video_blocks(
                 logits[:, rows, :tile_layout.n_video_tiles], tile_layout,
@@ -168,6 +196,9 @@ class _Probe:
                                     dtype=torch.bool, device=q.device)
             dense_sel.scatter_(2, sel.index, sel.keep)
             self.selection[(layer_index, str(group.shape))] = dense_sel.cpu()
+            if self.grid is not None:
+                padded = group.shape.padded_grid(self.grid)
+                self.t_blocks[str(group.shape)] = padded[0] // group.shape.t
 
 
 def main():
@@ -186,7 +217,7 @@ def main():
     loaded = veda_bundle.load(cfg.predictor)
     predictor = loaded.predictor.to(env.device).eval()
     cache = data.SampleCache(cfg.sample_cache)
-    rows, overlaps = [], []
+    rows, overlaps, churn = [], [], []
     for sample_id in cfg.sample_id:
         sample = cache.sample(sample_id)
         for geometry in cfg.geometry:
@@ -201,14 +232,33 @@ def main():
                                              env.device)
             steps = progress.Progress(f'probe {sample_id} {geometry}',
                                       tch.schedule.num_steps, every=1)
+            previous_selection = {}
             while not traj.done:
                 inputs = traj.inputs()
-                probe = _Probe(clip, plan, predictor, inputs.step, rows)
+                probe = _Probe(clip, plan, predictor, inputs.step, rows,
+                               grid=geo.video_grid)
                 with torch.no_grad():
                     vv, av = tch.model(
                         traj.clip, inputs.video_rows, inputs.audio_rows,
                         inputs.timestep, probe,
                         tch.tables.get(inputs.timestep.timesteps))
+                # Mask churn, and its step-to-step twin.
+                for shape, sel in probe.full_selection.items():
+                    tb = probe.t_blocks.get(shape)
+                    if tb:
+                        got = solattn.mask_churn(sel, tb)
+                        churn.append({'sample': sample_id,
+                                      'geometry': geometry,
+                                      'step': inputs.step, 'shape': shape,
+                                      'spatial_overlap': got['overlap'],
+                                      'pairs': got['pairs']})
+                    if shape in previous_selection:
+                        prev = previous_selection[shape]
+                        if prev.shape == sel.shape:
+                            churn[-1]['step_overlap'] = solattn.step_churn(
+                                prev, sel)['overlap']
+                    previous_selection[shape] = sel
+
                 # P2-3: overlap of the selected sets of adjacent layers.
                 keys = sorted(probe.selection, key=lambda x: (x[1], x[0]))
                 by_shape = collections.defaultdict(list)
@@ -231,7 +281,7 @@ def main():
     json.dump({'config': dataclasses.asdict(cfg), 'per_call': rows, 'layer_overlap': overlaps},
               open(args.out, 'w'), indent=1)
     progress.log(f'wrote {args.out}: {len(rows)} calls, '
-                 f'{len(overlaps)} layer pairs')
+                 f'{len(overlaps)} layer pairs, {len(churn)} churn rows')
 
 
 if __name__ == '__main__':

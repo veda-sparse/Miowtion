@@ -1307,3 +1307,54 @@ def test_subtile_log_mass_grows_with_m_and_rejects_bad_m():
 
     with pytest.raises(ValueError, match='must divide 128'):
         solattn.subtile_log_mass(q, k, lay, 3)
+
+
+def test_mask_churn_sees_what_psnr_cannot():
+    """The metric that measures the artefact human review actually saw.
+
+    Flicker is temporal: a selection that is consistently off scores the
+    same PSNR as one that jitters by the same amount between adjacent
+    frames, because PSNR and SSIM are per-frame. So churn needs its own
+    statistic. Tile order is (h-block, w-block, t-block) outer to inner,
+    which makes query tiles i and i+1 temporally adjacent except where
+    the spatial column changes -- and those pairs must be skipped rather
+    than counted as churn.
+    """
+    static = torch.zeros(2, 12, 40, dtype=torch.bool)
+    static[:, :, :4] = True
+    got = solattn.mask_churn(static, t_blocks=4)
+    assert got['overlap'] == pytest.approx(1.0)
+    # 12 rows, 11 adjacent pairs, 2 of which cross a column boundary.
+    assert got['pairs'] == 9
+
+    g = torch.Generator().manual_seed(0)
+    churny = torch.zeros(2, 12, 40, dtype=torch.bool)
+    for head in range(2):
+        for row in range(12):
+            churny[head, row, torch.randperm(40, generator=g)[:4]] = True
+    assert solattn.mask_churn(churny, t_blocks=4)['overlap'] < 0.3
+
+    # A selection that moves only across column boundaries must still
+    # read as perfectly stable, which is the whole point of the skip.
+    banded = torch.zeros(2, 12, 40, dtype=torch.bool)
+    for row in range(12):
+        banded[:, row, (row // 4) * 4:(row // 4) * 4 + 4] = True
+    assert solattn.mask_churn(banded, t_blocks=4)['overlap'] == \
+        pytest.approx(1.0)
+
+    with pytest.raises(ValueError, match='t_blocks must be'):
+        solattn.mask_churn(static, t_blocks=0)
+    with pytest.raises(ValueError, match=r'\[H, R, n_tiles\]'):
+        solattn.mask_churn(static[0], t_blocks=4)
+
+
+def test_step_churn_requires_matching_shapes():
+    a = torch.zeros(2, 4, 8, dtype=torch.bool)
+    a[:, :, :2] = True
+    assert solattn.step_churn(a, a)['overlap'] == pytest.approx(1.0)
+    b = a.clone()
+    b[:, :, :2] = False
+    b[:, :, 2:4] = True
+    assert solattn.step_churn(a, b)['overlap'] == pytest.approx(0.0)
+    with pytest.raises(ValueError, match='shape mismatch'):
+        solattn.step_churn(a, a[:, :2])

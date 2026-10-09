@@ -2243,3 +2243,81 @@ def rank_correlation(a: torch.Tensor, b: torch.Tensor) -> float:
     rb = rb - rb.mean()
     denom = ra.norm() * rb.norm()
     return float((ra * rb).sum() / denom) if float(denom) else float('nan')
+
+
+def mask_churn(selection: torch.Tensor, t_blocks: int) -> dict[str, float]:
+    """How much a router's choice moves between adjacent query tiles.
+
+    The metric that PSNR structurally cannot provide. A block-maximum
+    score is an extreme-value statistic determined by a single token
+    pair, so a small perturbation between adjacent frames can change the
+    selected set; the mass is a sum over the whole block pair and cannot.
+    That difference is temporal, and PSNR and SSIM are per-frame -- an
+    output that is consistently off scores the same as one that jitters
+    by the same amount. Human review saw the jitter; this measures it.
+
+    Tile order is (h-block, w-block, t-block) outer to inner
+    (tiling.span_tiles), so query tiles i and i + 1 are temporally
+    adjacent exactly when i is not the last t-block of its spatial
+    column. Pairs that straddle a column boundary are skipped rather
+    than counted as churn, which would otherwise inflate the metric by
+    one pair in every `t_blocks`.
+
+    Args:
+        selection: [H, R, n_tiles] bool, the kept set per (head, query
+            tile). R must index query tiles in the layout's own order.
+        t_blocks: Tile blocks along the time axis, i.e. the stride at
+            which the spatial column changes.
+
+    Returns:
+        overlap: Mean share of a query tile's kept set that the next
+            temporally adjacent query tile also keeps. 1.0 is a selection
+            that never moves; a lower value is a selection that churns.
+        pairs: Adjacent pairs the mean is over.
+
+    Raises:
+        ValueError: If t_blocks is not positive, or selection is not 3-D.
+    """
+    if selection.ndim != 3:
+        raise ValueError('selection must be [H, R, n_tiles], got '
+                         f'{tuple(selection.shape)}')
+    if t_blocks <= 0:
+        raise ValueError(f't_blocks must be > 0, got {t_blocks}')
+    rows = selection.shape[1]
+    index = torch.arange(rows - 1, device=selection.device)
+    # Drop the pair that crosses into the next spatial column.
+    same_column = ((index % t_blocks) != (t_blocks - 1))
+    index = index[same_column]
+    if index.numel() == 0:
+        return {'overlap': float('nan'), 'pairs': 0}
+    a = selection[:, index]
+    b = selection[:, index + 1]
+    kept = a.sum(-1).clamp(min=1)
+    overlap = ((a & b).sum(-1).float() / kept).mean()
+    return {'overlap': float(overlap), 'pairs': int(index.numel())}
+
+
+def step_churn(previous: torch.Tensor,
+               current: torch.Tensor) -> dict[str, float]:
+    """Overlap of the kept sets of the same query tiles across two steps.
+
+    The other half of the churn story: a selection that is stable within
+    a frame can still be re-drawn at every denoising step, and the
+    artefact looks the same.
+
+    Args:
+        previous: [H, R, n_tiles] bool from the earlier step.
+        current: Same shape, from the later step.
+
+    Returns:
+        overlap: Mean share of the earlier kept set the later one keeps.
+
+    Raises:
+        ValueError: If the two shapes differ.
+    """
+    if previous.shape != current.shape:
+        raise ValueError(f'shape mismatch: {tuple(previous.shape)} vs '
+                         f'{tuple(current.shape)}')
+    kept = previous.sum(-1).clamp(min=1)
+    return {'overlap': float(((previous & current).sum(-1).float()
+                              / kept).mean())}
