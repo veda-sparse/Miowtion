@@ -1221,3 +1221,29 @@ def test_count_term_leverage_is_zero_without_padding():
     with pytest.raises(ValueError, match='base_spread must be positive'):
         solattn.count_term_leverage((8, 8, 16), tiling.TileShape(4, 4, 8),
                                     base_spread=0.0)
+
+
+def test_count_term_vanishes_when_every_tile_is_full():
+    """P2-5, as an identity rather than an experiment.
+
+    log B_j is a per-key-tile constant, so it can only reorder a row's
+    top-k in proportion to how much those constants differ. When the
+    grid divides the tile shape on every axis there is no padding, every
+    tile holds 128 rows, and the term is identically zero -- which makes
+    its value a property of the layout and not of the method. Two of the
+    twelve released plans (1x1@72 and 4x3@72) are in that regime for
+    *every* shape they use, because latent_t 72 is divisible by the tile
+    time extents 2, 4 and 8 while 37 and 102 are not.
+    """
+    grid = (72, 24, 24)                      # divides 8x8x2 exactly
+    got = solattn.count_term_leverage(grid, tiling.TileShape(8, 8, 2))
+    assert got['padding'] == pytest.approx(0.0, abs=1e-12)
+    assert got['min_rows'] == 128
+    assert got['log_count_std'] == pytest.approx(0.0, abs=1e-6)
+    assert got['leverage'] == pytest.approx(0.0, abs=1e-6)
+
+    # And a grid that does not divide leaves real spread for it to use.
+    ragged = solattn.count_term_leverage((37, 24, 42),
+                                         tiling.TileShape(4, 4, 8))
+    assert ragged['min_rows'] < 128
+    assert ragged['log_count_std'] > 0.5
