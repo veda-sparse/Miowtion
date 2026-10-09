@@ -1,0 +1,30 @@
+# P0-5: which oracle should a router approach?
+#
+# Masks blocks by the teacher's own statistic instead of a predictor's
+# estimate of it, so the three arms differ by exactly the terms of the
+# cumulant expansion: mass is the derived optimum, max is what the
+# released scorer was distilled against, mean is mass with log B_j taken
+# back out. Veda showed that approaching an oracle is what matters; this
+# says which one, at the level of the video.
+#
+# Costs dense + sparse per layer, because the heat is defined through the
+# teacher's normalisation. Six clips rather than twelve for that reason.
+root: weights/MiniMax-H3
+variant: FL2VA
+schedule: turbo
+num_steps: 8
+adapter: weights/turbo_lora/minimax_h3_turbo_v4_step600_ema.safetensors
+sample_cache: artifacts/samples/demo12
+seed: 0
+offload_blocks: 30
+prefetch: 1
+mlp_chunk_rows: 8192
+decode_dtype: bf16
+plan_dir: plans/released
+sample_id: [
+  demo00_01M4GA5P, demo02_01M4G57X, demo03_01M4G3N3, demo04_01M4G1FK,
+  demo05_01M4G148, demo06_01M4G02G]
+geometry: ['16:9@37']
+attention: [oracle_mass, oracle_max, oracle_mean]
+keep_ratio: 0.1
+out_dir: artifacts/demo12_oracle/sparse10

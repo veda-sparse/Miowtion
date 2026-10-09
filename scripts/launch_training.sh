@@ -17,6 +17,9 @@
 #   MAX_DROP   fall below the starting value that counts as divergence
 #   STALL      seconds of log silence that counts as hung
 #   NPROC      processes for torchrun (default 1)
+#   PORT       torchrun rendezvous port (default 29500). A run that was
+#              killed can leave the port listening for a while, and
+#              torchrun then dies with EADDRINUSE instead of waiting.
 #   PY         interpreter (default .venv/bin/python)
 set -u -o pipefail
 
@@ -28,6 +31,7 @@ config=$1; tag=$2; shift 2
 
 PY=${PY:-.venv/bin/python}
 NPROC=${NPROC:-1}
+PORT=${PORT:-29500}
 METRIC=${METRIC:-kept_over_ceiling}
 PATIENCE=${PATIENCE:-0}
 MAX_DROP=${MAX_DROP:-0.12}
@@ -45,6 +49,7 @@ for f in "$train_log" "$watch_log"; do
 done
 
 nohup "$PY" -m torch.distributed.run --nproc_per_node="$NPROC" \
+  --master_port "$PORT" \
   scripts/train.py --config "$config" "$@" > "$train_log" 2>&1 &
 train_pid=$!
 
@@ -53,6 +58,6 @@ nohup "$PY" scripts/watch_training.py --log "$train_log" \
   --stall "$STALL" --kill > "$watch_log" 2>&1 &
 watch_pid=$!
 
-echo "train pid $train_pid -> $train_log"
+echo "train pid $train_pid -> $train_log (port $PORT)"
 echo "watch pid $watch_pid -> $watch_log (metric $METRIC, patience"\
      "$PATIENCE, max_drop $MAX_DROP, stall ${STALL}s)"

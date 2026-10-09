@@ -1247,3 +1247,63 @@ def test_count_term_vanishes_when_every_tile_is_full():
                                          tiling.TileShape(4, 4, 8))
     assert ragged['min_rows'] < 128
     assert ragged['log_count_std'] > 0.5
+
+
+def test_subtile_log_mass_reduces_to_the_present_model_at_m_one():
+    """P2-1's control: m = 1 must be the zeroth-order term exactly.
+
+    The sub-tile readout is only interesting if m = 1 recovers what the
+    router already computes, because then every gain at m > 1 is
+    attributable to the partition rather than to a different
+    parameterisation. At m = 1 the log-sum-exp has a single term and
+    collapses to log B_i + log B_j + qbar_i . kbar_j / sqrt(D).
+    """
+    torch.manual_seed(0)
+    _, lay = _layout()
+    n, dim, heads = lay.n_tiles, 16, 2
+    q = torch.randn(n * 128, heads, dim)
+    k = torch.randn(n * 128, heads, dim)
+
+    got = solattn.subtile_log_mass(q, k, lay, 1)
+
+    valid = lay.slot_valid.view(n, 128).float()
+    counts = valid.sum(-1)
+    pooled_q = ((q.view(n, 128, heads, dim) * valid[..., None, None]).sum(1)
+                / counts[:, None, None].clamp(min=1.0))
+    pooled_k = ((k.view(n, 128, heads, dim) * valid[..., None, None]).sum(1)
+                / counts[:, None, None].clamp(min=1.0))
+    want = (torch.einsum('ihd,jhd->hij', pooled_q, pooled_k) * dim ** -0.5
+            + torch.log(counts.clamp(min=1e-6))[None, :, None]
+            + torch.log(counts.clamp(min=1e-6))[None, None, :])
+    live = counts > 0
+    both = live[:, None] & live[None, :]
+    assert torch.allclose(got[:, both], want[:, both], atol=1e-4)
+
+
+def test_subtile_log_mass_grows_with_m_and_rejects_bad_m():
+    """A finer partition cannot lose mass: the readout is non-decreasing.
+
+    log sum over a finer partition of the same score matrix is >= the
+    coarser one, because the coarse term is a Jensen lower bound on the
+    fine sum. That makes m a monotone knob towards the true block mass.
+    """
+    torch.manual_seed(1)
+    _, lay = _layout()
+    heads, dim = 2, 16
+    # Within-tile structure, so a finer partition has something to find.
+    base = torch.randn(lay.n_tiles, 1, heads, dim)
+    jitter = torch.randn(lay.n_tiles, 128, heads, dim) * 1.5
+    q = (base + jitter).reshape(-1, heads, dim)
+    k = (base + jitter.flip(1)).reshape(-1, heads, dim)
+
+    one = solattn.subtile_log_mass(q, k, lay, 1)
+    two = solattn.subtile_log_mass(q, k, lay, 2)
+    four = solattn.subtile_log_mass(q, k, lay, 4)
+    live = lay.slot_valid.view(lay.n_tiles, 128).float().sum(-1) > 0
+    both = live[:, None] & live[None, :]
+    assert (two[:, both] >= one[:, both] - 1e-4).all()
+    assert (four[:, both] >= two[:, both] - 1e-4).all()
+    assert float((four[:, both] - one[:, both]).mean()) > 0.01
+
+    with pytest.raises(ValueError, match='must divide 128'):
+        solattn.subtile_log_mass(q, k, lay, 3)

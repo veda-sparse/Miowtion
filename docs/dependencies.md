@@ -50,3 +50,19 @@ fastvideo-kernel（d995516）、SageAttention（d1a57a5）、SpargeAttn（ae5b62
 视频输入需要 ffmpeg，官方示例准备还需要 ffprobe。音轨提取为 32 kHz 双声道，
 并在 JSONL 中显式列为 audio reference。示例请求固定到 MiniMax-H3 submodule
 的 `d21241f0a4b3acbb34c97dae47fa417b7065e438`，解析 JSON 数据而不执行上游 shell。
+
+## Sol-Attn（比较基线，`miowtion/kernels/sol.py`）
+
+| | |
+|---|---|
+| 用途 | 作为第四条注意力路径（`--attention sol`）做**画质对比**，不作为我们的方案 |
+| 来源 | `NVlabs/Sana`，分支 `sol-engine`，子目录 `techniques/sparse_backends` |
+| 锁定 SHA | `670482d8a857d578ac8a2ea89b052d0fb47badba`（2026-09-29） |
+| 许可证 | Sana 主干 **Apache-2.0**；`sol_attn/THIRD_PARTY_NOTICES.md` 声明内含 FlashAttention（**BSD-3-Clause**）与 cuDNN Frontend block-sparse 参考（**Apache-2.0**）。三者都与 MIT 兼容 |
+| 我们依赖的内部接口 | `sol_attn.sol_attn(q, k, v, tau, thresh_type)`（公开 API）；以及 `sol_attn.triton_ref.preprocess.prepare` **仅用于密度标定**（见下） |
+
+**安装必须加 `--no-deps`**：上游要求 torch 2.10 / triton 3.6，而我们是 torch 2.8 / triton 3.4，让 pip 去满足它会把 vendored FA4 所钉的 torch 换掉。实测在我们的版本下它的 **CuTe SM120** 后端照样编译成功（`interface._compiled` 的 key 是 `(12, 0)`），**不是** Triton 回退路径——这一点必须说明，因为上游文档指出 Triton 参考路径「correct but not representative of published speedups」。
+
+**为什么要调用它的 `prepare`**：`tau` 是阈值不是预算。上游的路由规则是逐 (query block, head) 算 `mean + tau * std`，当一个 key block 的 proxy 分数在该 query block 上的均值超过它就精确计算（`triton_ref/fwd.py`：`exact = (sum(scores, 0) / q_len > route_threshold)`）。所以要和固定预算的 router 在同一稀疏度上比，必须**标定 tau 并报告实际达到的密度**。`sol.density()` 调用上游自己的 `prepare` 取 block summary 和阈值，只重写最后那一步比较，这样判定来自上游而不是我们的近似。
+
+**不允许的做法**：假定 tau 对应某个密度。`MIOWTION_SOL_DENSITY=1` 让每次生成都记录实际路由比例，`scripts/generate.py` 会把均值与区间打进日志。

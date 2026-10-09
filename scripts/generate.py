@@ -33,6 +33,7 @@ import torch
 from miowtion.infer import config as infer_config
 from miowtion.infer import decode
 from miowtion.infer import pipeline
+from miowtion.kernels import sol as sol_kernel
 from miowtion.train import data
 from miowtion.train import parallel
 from miowtion.train import teacher
@@ -110,6 +111,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--tile-conditions', action=argparse.BooleanOptionalAction,
                         default=None, help='tile visual references and apply '
                         'their independent budget')
+    parser.add_argument('--sol-tau', type=float, default=1.0,
+                        help="threshold coefficient of --attention sol. "
+                        'Larger routes fewer key blocks exactly. It is '
+                        'NOT a budget, so matching a fixed-budget router '
+                        'at the same sparsity needs calibration: set '
+                        'MIOWTION_SOL_DENSITY=1 and the run reports the '
+                        'routed fraction it actually reached')
     parser.add_argument('--dense-steps', type=int, nargs='*', default=[],
                         help='denoising steps that stay dense in veda runs')
     parser.add_argument('--offload-blocks', type=int, default=40)
@@ -325,10 +333,27 @@ def _denoise_all(args, env, cache, jobs, devices, assigned) -> list[dict]:
                 modes[mode] = pipeline.generate(
                     model, tch.schedule, tables, cache, sample, geometry,
                     args.seed, device, mode, plan, rank_predictor,
-                    veda_config, args.dense_steps)
+                    veda_config, args.dense_steps, args.sol_tau)
+                extra = ''
+                if mode == 'sol' and len(sol_kernel.DENSITY_CURVE) > 1:
+                    parts = []
+                    for cand in sorted(sol_kernel.DENSITY_CURVE):
+                        d = sol_kernel.DENSITY_CURVE[cand]
+                        parts.append(f'tau {cand:g}: {sum(d) / len(d):.4f}')
+                    progress.log(f'[{device}] {sample.id} sol density '
+                                 f'curve over {len(d)} calls -- '
+                                 + ', '.join(parts))
+                    sol_kernel.DENSITY_CURVE.clear()
+                if mode == 'sol' and sol_kernel.DENSITY_LOG:
+                    log = sol_kernel.DENSITY_LOG
+                    extra = (f', sol density {sum(log) / len(log):.4f} '
+                             f'[{min(log):.4f}, {max(log):.4f}] over '
+                             f'{len(log)} calls at tau {args.sol_tau}')
+                    sol_kernel.DENSITY_LOG.clear()
                 progress.log(f'[{device}] {sample.id} {mode}: denoised in '
                              f'{modes[mode].seconds:.1f} s, attention '
-                             f'{sum(modes[mode].attention_seconds):.1f} s')
+                             f'{sum(modes[mode].attention_seconds):.1f} s'
+                             f'{extra}')
                 torch.save(dataclasses.asdict(modes[mode]), saved)
             results[index] = modes
 

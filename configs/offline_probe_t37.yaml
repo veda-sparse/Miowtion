@@ -1,0 +1,26 @@
+# Every remaining GPU-dependent offline measurement of the experiment
+# plan, driven from one teacher load (scripts/offline_probe.py).
+#
+# Covers P1-3 (routing metrics decomposed by denoising step, by layer and
+# by tile shape) and P2-3 (overlap of the selected sets between adjacent
+# layers, which is the dimension DeepSeek's CSA2 exploits with its
+# Reuse mode and which we do not exploit at all).
+#
+# Costs one dense forward per step, so it is an analysis run and nothing
+# here generates video. Query tiles and heads are subsampled (every 7th
+# row, 8 heads a group) to bound the cost; the quantities are means over
+# (layer, head, row) so the subsample only widens the interval.
+root: weights/MiniMax-H3
+variant: FL2VA
+schedule: turbo
+num_steps: 8
+adapter: weights/turbo_lora/minimax_h3_turbo_v4_step600_ema.safetensors
+sample_cache: artifacts/samples/demo12
+sample_id: [demo00_01M4GA5P, demo03_01M4G3N3]
+geometry: ['16:9@37']
+predictor: weights/veda/veda2_r16.safetensors
+seed: 0
+keep_ratio: 0.05
+offload_blocks: 30
+prefetch: 1
+mlp_chunk_rows: 8192

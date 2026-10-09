@@ -2179,3 +2179,67 @@ def run_second_moments(config: RunConfig) -> None:
                     'clips': [s.id for s in samples],
                     'steps': list(config.steps)}, path)
         progress.log(f'saved {path} ({tuple(c_u.shape)})')
+
+
+def subtile_log_mass(q_tiles, k_tiles, tile_layout, m: int):
+    """Block scores from a log-sum-exp over m x m sub-block pairs (P2-1).
+
+    The cumulant expansion truncates, and in the peaked regime the block
+    mass tends to a maximum that no finite truncation reaches. Splitting a
+    tile into m sub-blocks along the row axis and reading out
+
+        log sum_{a,b} B_ia B_jb exp(qbar_ia . kbar_jb / sqrt(D))
+
+    is exact at m = 1 -- it is then log B_i + log B_j + the zeroth-order
+    term -- and approaches the true block mass from below as m grows,
+    because it is the same log-sum-exp over a coarser partition of the
+    same score matrix. Memory traffic does not grow: the tile is already
+    resident, only the m^2 scoring grows.
+
+    Args:
+        q_tiles: [n_tiles * 128, H', D] tile-ordered queries.
+        k_tiles: [n_tiles * 128, H', D] tile-ordered keys.
+        tile_layout: Tile layout, for the per-slot validity.
+        m: Sub-blocks per tile along the row axis; 128 must divide by it.
+
+    Returns:
+        [H', n_tiles, n_tiles] fp32 scores.
+
+    Raises:
+        ValueError: If m does not divide 128.
+    """
+    if 128 % m:
+        raise ValueError(f'm must divide 128, got {m}')
+    n_tiles = tile_layout.n_tiles
+    per = 128 // m
+    heads, dim = q_tiles.shape[1], q_tiles.shape[2]
+    valid = tile_layout.slot_valid.view(n_tiles, m, per).float()
+    counts = valid.sum(-1)                              # [n_tiles, m]
+    # Masked sub-block means; an empty sub-block gets zero weight below.
+    def pool(x):
+        x = x.view(n_tiles, m, per, heads, dim).float()
+        w = valid[..., None, None]
+        return (x * w).sum(2) / counts[..., None, None].clamp(min=1.0)
+    qs, ks = pool(q_tiles), pool(k_tiles)               # [n_tiles, m, H, D]
+    scale = dim ** -0.5
+    # [H, n_tiles, m, n_tiles, m]
+    inner = torch.einsum('iahd,jbhd->hiajb', qs, ks) * scale
+    log_i = torch.log(counts.clamp(min=1e-6))[None, :, :, None, None]
+    log_j = torch.log(counts.clamp(min=1e-6))[None, None, None, :, :]
+    terms = inner + log_i + log_j
+    empty = (counts <= 0)
+    terms = terms.masked_fill(empty[None, :, :, None, None], float('-inf'))
+    terms = terms.masked_fill(empty[None, None, None, :, :], float('-inf'))
+    flat = terms.permute(0, 1, 3, 2, 4).reshape(heads, n_tiles, n_tiles,
+                                                m * m)
+    return torch.logsumexp(flat, dim=-1)
+
+
+def rank_correlation(a: torch.Tensor, b: torch.Tensor) -> float:
+    """Rank correlation of two flattened score tensors."""
+    ra = a.flatten().argsort().argsort().float()
+    rb = b.flatten().argsort().argsort().float()
+    ra = ra - ra.mean()
+    rb = rb - rb.mean()
+    denom = ra.norm() * rb.norm()
+    return float((ra * rb).sum() / denom) if float(denom) else float('nan')

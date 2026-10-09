@@ -31,6 +31,7 @@ from miowtion.h3 import config as h3_config
 from miowtion.h3 import layout as h3_layout
 from miowtion.h3 import schedule as h3_schedule
 from miowtion.kernels import elementwise_triton
+from miowtion.kernels import sol
 
 _BF16 = torch.bfloat16
 _FP32 = torch.float32
@@ -55,6 +56,29 @@ class DenseAttention:
         del layer_index
         return h3_attention.dense_attention(q, k, v, self.used,
                                             backend=self.backend)[0]
+
+
+class SolAttention:
+    """Sol-Attn in place of the dense teacher, for comparison runs.
+
+    Same call signature as DenseAttention so the denoiser does not have
+    to know which one it holds. Unlike a Veda router this takes no
+    budget: `tau` is a threshold and the density it produces is a
+    property of the clip, so a run that wants to match a fixed-budget
+    router has to calibrate tau and report the density it reached (see
+    miowtion.kernels.sol).
+    """
+
+    def __init__(self, used: int, tau: float = 1.0,
+                 thresh_type: str = 'exact'):
+        self.used = used
+        self.tau = tau
+        self.thresh_type = thresh_type
+
+    def __call__(self, q, k, v, layer_index):
+        del layer_index
+        return sol.attention(q, k, v, self.used, tau=self.tau,
+                             thresh_type=self.thresh_type)
 
 
 def _fused(*tensors: torch.Tensor) -> bool:

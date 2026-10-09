@@ -24,6 +24,14 @@ gpu = [
   "triton>=3.3",
   "flash-attn-4 @ git+https://github.com/Dao-AILab/flash-attention@d15f1531a460ba456f41b01a774f33ab2db8febf#subdirectory=flash_attn/cute",
 ]
+# Sol-Attn as a comparison baseline (miowtion/kernels/sol.py). Install
+# with --no-deps: upstream asks for torch 2.10 / triton 3.6, and letting
+# pip satisfy that would replace the torch the vendored FA4 build is
+# pinned against. On torch 2.8 / triton 3.4 its CuTe SM120 backend still
+# compiles and is what the comparison numbers use.
+sol = [
+  "sol-attn @ git+https://github.com/NVlabs/Sana@670482d8a857d578ac8a2ea89b052d0fb47badba#subdirectory=techniques/sparse_backends",
+]
 # Apple silicon inference with NVMe offloading (miowtion/mlx).
 mlx = ["mlx>=0.32"]
 # Offline prompt encoding (Qwen3-VL text tower, the release's VAEs).

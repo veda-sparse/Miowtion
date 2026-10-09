@@ -5,7 +5,8 @@ whole test suite, and twice already a config has been launched with a key
 the loader silently did not know. So: every `infer_*.yaml` has to parse
 into scripts/generate.py's parser and leave nothing required unset,
 every `search_*.yaml` into a SearchConfig, every `ablate_*.yaml` into a
-solattn.RunConfig, and every other one into a TrainConfig.
+solattn.RunConfig, every `offline_*.yaml` into a ProbeConfig, and every
+other one into a TrainConfig.
 """
 
 import dataclasses
@@ -43,6 +44,11 @@ def test_config_parses(path):
         _check_dataclass(path, search.SearchConfig)
     elif name.startswith('ablate_'):
         _check_dataclass(path, solattn.RunConfig)
+    elif name.startswith('offline_'):
+        probe = _load_script('offline_probe.py')
+        config = probe.ProbeConfig.from_yaml(path)
+        assert config.sample_id and config.geometry, \
+            'a probe needs samples and a geometry'
     elif name.startswith('infer_'):
         generate = _load_script('generate.py')
         args = generate.parse_args(['--config', path])
