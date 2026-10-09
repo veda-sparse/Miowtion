@@ -1152,3 +1152,35 @@ def test_second_moment_probe_collects_psd_moments_per_head():
     pred.init_low_rank_second_order_(c_u, c_v)
     assert torch.isfinite(pred.layers[0].so_q).all()
     assert float(pred.layers[0].so_q.abs().max()) > 0.0
+
+
+def test_logit_term_report_separates_the_offset_from_the_spread():
+    """The diagnostic that would have saved the scale investigation.
+
+    The second-order term is a sum of non-negative products, so it is a
+    large positive offset with modest variation. A standard deviation is
+    blind to that offset; the report has to show both.
+    """
+    from miowtion.veda import predictor as veda_predictor
+    dim = 32
+    lay, tl = _layout()
+    g = torch.Generator().manual_seed(9)
+    q = torch.randn(lay.seq_len, 1, dim, generator=g).to(torch.bfloat16)
+    k = torch.randn(lay.seq_len, 1, dim, generator=g).to(torch.bfloat16)
+    pred = veda_predictor.TileScorePredictor(1, 1, dim,
+                                             second_order_rank=dim,
+                                             count_term=True)
+    pred.init_exact_second_order_()
+    heads = torch.tensor([0])
+    q_t, k_t = (tiling.gather_tiles(t, tl, heads) for t in (q, k))
+    out = solattn.logit_term_report(pred, q_t, k_t, tl, heads)
+    assert sorted(out) == ['base', 'count', 'features', 'second_order',
+                           'total']
+    # The term is non-negative by construction, so its mean is positive
+    # and far above its own spread -- the whole point of the report.
+    second = out['second_order']
+    assert second['mean'] > 0.0
+    assert second['mean'] > second['video']
+    # And the count term is a per-column constant: no spread across rows.
+    assert out['count']['row_all'] > 0.0
+    assert out['features']['sq_q_mean'] > 0.0

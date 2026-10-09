@@ -1883,6 +1883,88 @@ def run_init_probe(config: RunConfig) -> None:
                 f"  kept/ceiling {row['kept_over_ceiling']:.4f}  "
                 f"logit_std {row['logit_std']:.4f}")
 
+@torch.no_grad()
+def logit_term_report(predictor, q_t: torch.Tensor, k_t: torch.Tensor,
+                      tile_layout: tiling.TileLayout,
+                      heads: torch.Tensor) -> dict:
+    """Magnitude of each logit term, separately.
+
+    Three numbers looked contradictory for the same predictor: this
+    module's probe reported a spread of 3.9, the trainer 192, and the
+    oracle BCE 537. They were all right, and reading them as one quantity
+    was the mistake. The second-order term is a sum of non-negative
+    products, so it is a large positive *offset* carrying modest
+    variation: a standard deviation over video columns is blind to the
+    offset, a per-row spread including global key tiles sees their very
+    different level, and a loss on absolute logits sees the offset itself.
+
+    Splitting the logits into their terms is what makes that visible, so
+    it is worth having the next time a scale looks wrong.
+
+    Args:
+        predictor: A TileScorePredictor with the Veda2 terms enabled.
+        q_t: [N, H', D] tile-ordered queries.
+        k_t: [N, H', D] tile-ordered keys.
+        tile_layout: Their layout.
+        heads: [H'] global head indices.
+
+    Returns:
+        Per term: the spread over video columns, over all columns, the
+        mean per-row spread, and the largest absolute value. Plus the
+        feature magnitudes behind the second-order term, split into video
+        and global key tiles.
+    """
+    from miowtion.veda import predictor as veda_predictor  # pylint: disable=import-outside-toplevel
+
+    n_video = tile_layout.n_video_tiles
+    layer = predictor.layers[0]
+    dim = layer.head_dim
+
+    def spread(x: torch.Tensor) -> dict:
+        return {'video': float(x[:, :, :n_video].float().std()),
+                'all': float(x.float().std()),
+                'row_all': float(x.float().std(dim=-1).mean()),
+                'mean': float(x.float().mean()),
+                'absmax': float(x.float().abs().max())}
+
+    feats_q = veda_predictor.pool_tiles(q_t, tile_layout)
+    feats_k = veda_predictor.pool_tiles(k_t, tile_layout)
+    q_hat = layer.embed(feats_q, heads, layer.proj_q)
+    k_hat = layer.embed(feats_k, heads, layer.proj_k)
+    terms = {'base': torch.bmm(q_hat, k_hat.transpose(1, 2))
+             / math.sqrt(dim)}
+    rows = terms['base'].shape[1]
+
+    if predictor.count_term:
+        gain = layer.count_gain.index_select(0, heads).float()
+        log_count = torch.log(
+            tile_layout.valid_count.clamp(min=1).to(torch.float32))
+        terms['count'] = (gain[:, None, None]
+                          * log_count[None, None, :]).expand(
+                              heads.numel(), rows, -1)
+    features = {}
+    if predictor.second_order_rank:
+        sq_q = veda_predictor.pool_tiles(q_t, tile_layout,
+                                         veda_predictor.SECOND_RAW)
+        var_k = veda_predictor.pool_tiles(k_t, tile_layout,
+                                          veda_predictor.SECOND_CENTRAL)
+        u = torch.bmm(sq_q, layer.so_q.index_select(0, heads).float())
+        w = torch.bmm(var_k, layer.so_k.index_select(0, heads).float())
+        terms['second_order'] = torch.bmm(u, w.transpose(1, 2))
+        features = {
+            'sq_q_mean': float(sq_q.mean()),
+            'var_k_video_mean': float(var_k[:, :n_video].mean()),
+            'var_k_global_mean': float(var_k[:, n_video:].mean())
+            if var_k.shape[1] > n_video else float('nan'),
+        }
+
+    out = {name: spread(value) for name, value in terms.items()}
+    out['total'] = spread(sum(terms.values()))
+    if features:
+        out['features'] = features
+    return out
+
+
 # --- Second-moment calibration for the low-rank head --------------------
 #
 # `predictor.init_low_rank_second_order_` needs E[sq_q^T sq_q] and
