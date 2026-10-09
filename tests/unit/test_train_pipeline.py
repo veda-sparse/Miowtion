@@ -690,3 +690,33 @@ def test_patience_zero_lets_a_long_flat_run_continue():
               0.9210, 0.9150, 0.9173, 0.9112, 0.9119, 0.9197, 0.9224]
     for v in values * 4:
         assert abort.update({'kept_over_ceiling': v}) is None
+
+
+def test_transport_weight_requires_a_mass_target():
+    """The transport value of a block set is a sum, never a maximum.
+
+    Under the optimal-transport reading the attainable value of a
+    selection S is log sum_{v in S} exp(s_uv), so the distillation
+    target has to be the summed block mass. Pairing the loss with the
+    block maximum would optimise a quantity that is not the decision's
+    value, silently, so the config refuses it.
+    """
+    with pytest.raises(ValueError, match='transport_weight needs'):
+        _lr_config(transport_weight=1.0, heat_reduce='max').validate()
+    with pytest.raises(ValueError, match='transport_weight must be'):
+        _lr_config(transport_weight=-1.0, heat_reduce='sum').validate()
+    _lr_config(transport_weight=1.0, kl_weight=0.0, topk_weight=0.0,
+               heat_reduce='sum').validate()
+
+
+def test_transport_config_on_disk_is_loadable():
+    config = trainer_lib.TrainConfig.from_yaml(
+        'configs/stage1_veda2_transport_t37.yaml')
+    config.validate()
+    assert config.transport_weight == 1.0
+    # The other two objectives have to be off: the point of the run is
+    # that they each answer to a gauge the kernel cannot see.
+    assert config.kl_weight == 0.0
+    assert config.topk_weight == 0.0
+    assert config.heat_reduce == 'sum'
+    assert config.freeze_second_order is True

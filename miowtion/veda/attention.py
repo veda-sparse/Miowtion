@@ -47,6 +47,12 @@ class VedaConfig:
             between geometries.
         recall_every: Compute the mask diagnostics on every n-th layer.
         dense_layers: Layers that stay dense in the sparse student.
+        transport_weight: Weight on the retained-transport-mass loss
+            (heatmap.transport_loss). It is the only one of the three
+            that is invariant to the per-row affine maps a top-k read-out
+            is invariant to, so it is the one whose gradient cannot be
+            spent on directions the kernel cannot see, and the only one
+            whose optimum is the metric the run is judged on.
         kl_weight: Weight on the seer KL. 0.0 leaves the oracle top-k BCE
             as the only objective, which is the one that matches what the
             kernel reads; it used to be impossible to express because the
@@ -68,6 +74,7 @@ class VedaConfig:
     """
 
     heat_reduce: str = 'max'
+    transport_weight: float = 0.0
     kl_weight: float = 1.0
     kl_direction: str = 'forward'
     target_budget: veda_mask.Budget = veda_mask.Budget(ratio=0.1)
@@ -236,7 +243,8 @@ def _gather_lse(lse: torch.Tensor, tile_layout: tiling.TileLayout,
 
 
 # Diagnostic fields of LayerStats, in the order resolve() transfers them.
-_STAT_FIELDS = ('kl', 'topk_bce', 'logit_std', 'recall', 'heat_kept',
+_STAT_FIELDS = ('kl', 'topk_bce', 'transport', 'logit_std', 'recall',
+                'heat_kept',
                 'heat_ceiling')
 
 
@@ -254,6 +262,7 @@ class LayerStats:
 
     kl: list[torch.Tensor] = dataclasses.field(default_factory=list)
     topk_bce: list[torch.Tensor] = dataclasses.field(default_factory=list)
+    transport: list[torch.Tensor] = dataclasses.field(default_factory=list)
     logit_std: list[torch.Tensor] = dataclasses.field(default_factory=list)
     recall: list[torch.Tensor] = dataclasses.field(default_factory=list)
     heat_kept: list[torch.Tensor] = dataclasses.field(default_factory=list)
@@ -351,6 +360,13 @@ class TeacherCollector:
                     kl = heatmap.seer_kl(logits, heat, tile_layout,
                                          self.clip.config.kl_direction)
                     loss = self.clip.config.kl_weight * kl
+                    if self.clip.config.transport_weight:
+                        transport = heatmap.transport_loss(
+                            logits, heat, tile_layout,
+                            self.clip.blocks(tile_layout), rows)
+                        loss = loss + (self.clip.config.transport_weight
+                                       * transport)
+                        self.stats.transport.append(transport.detach())
                     if self.topk_weight:
                         bce = heatmap.oracle_bce(
                             logits, heat, tile_layout,

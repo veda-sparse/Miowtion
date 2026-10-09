@@ -116,6 +116,11 @@ def teacher_heat(q: torch.Tensor, k: torch.Tensor, lse: torch.Tensor,
 # which is still strongly zero-forcing but finite.
 _REVERSE_FLOOR = 1e-6
 
+# Stand-in for -inf when sorting standardised scores: -inf would make the
+# masked columns' gradient NaN if they were ever read, and the scores are
+# standardised, so nothing real comes anywhere near this.
+_LARGE = 1e4
+
 
 def seer_kl(logits: torch.Tensor, heat: torch.Tensor,
             layout: tiling.TileLayout,
@@ -172,6 +177,157 @@ def seer_kl(logits: torch.Tensor, heat: torch.Tensor,
         terms = torch.where(col_ok, logp.exp() * (logp - log_target), 0.0)
     per_row = terms.sum(-1)  # [H', R]
     per_head = (per_row * row_ok).sum(-1) / row_ok.sum(-1).clamp(min=1)
+    return per_head.mean()
+
+
+# Width of the soft top-k boundary, in units of the row-standardised
+# score. The score is standardised, so this is comparable across heads and
+# geometries. 0.15 makes the band about 0.035 * n_tiles wide at the 10%
+# quantile of a standard normal (pdf 0.175 at z = 1.28), i.e. roughly a
+# dozen blocks out of 360 -- wide enough for a gradient, narrow enough
+# that it is a gradient about the decision.
+_TRANSPORT_TAU = 0.15
+
+
+def transport_loss(logits: torch.Tensor, heat: torch.Tensor,
+                   layout: tiling.TileLayout,
+                   blocks: list[veda_mask.ColumnBlock],
+                   q_tiles: torch.Tensor,
+                   temperature: float = _TRANSPORT_TAU) -> torch.Tensor:
+    """Negative retained transport mass, relative to the attainable mass.
+
+    Read attention as one-sided entropic optimal transport (arXiv
+    2508.08369): per query row, the forward pass solves
+
+        max_p <p, s> + H(p)   over the simplex,   giving p = softmax(s),
+
+    so p_uv is the mass transported from query u to key v. Block sparsity
+    is a *support constraint* on that plan, and the constrained optimum is
+
+        F(S) = log sum_{v in S} exp(s_uv) = log E_u(S),
+
+    the log-partition function over the kept keys. So
+
+        argmax_{|S| = k} F(S)  =  top-k by block attention mass,
+
+    exactly, with no approximation, and the value left on the table is
+    -log(1 - r_u) in the dropped mass fraction r_u. That is why mass is
+    the right distillation target and why `heat_kept` is the right metric:
+    they are the EOT objective itself, not proxies for it.
+
+    This loss is that objective, relaxed only in the selection. A hard
+    top-k is not differentiable, so the k-hot indicator is replaced by a
+    sigmoid about the row's own k-th largest score,
+
+        z_u = (s_u - mean_u) / std_u,    theta_u = k_u-th largest z_u,
+        pi_u = sigmoid((z_u - theta_u) / tau),
+        L_u  = - <pi_u, a_u> / <oracle_u, a_u>,
+
+    where a_u is the teacher's block mass and `oracle_u` is the hard top-k
+    by a_u at the same budget. Three properties follow, and all three are
+    what the four earlier objectives lacked:
+
+    * As tau -> 0 this is *exactly* `-heat_kept / heat_ceiling`, the metric
+      the run is judged on. The loss and the metric are one object, so they
+      cannot move in opposite directions -- which is what happened to the
+      forward KL (KL 134 -> 48 while recall 0.714 -> 0.654) and to the
+      centred BCE (loss up on three of four geometries).
+    * It is exactly invariant to a per-row positive affine map of the
+      scores, which is the full gauge a top-k read-out is blind to.
+      Standardising removes the offset and the scale; theta is a function
+      of z, so the sigmoid's argument is invariant too. The gradient in
+      both gauge directions is therefore zero, not merely small.
+    * Its gradient is concentrated at the rank-k boundary, because that is
+      where sigmoid' peaks. A softmax policy over the whole row was the
+      first thing tried here and is the wrong relaxation: measured on
+      standardised scores at n = 360, it spreads over 220 blocks and puts
+      only 39% of its weight inside the budget, so most of the gradient
+      asks about ranks the kernel never reads.
+
+    The forced diagonal is excluded, from the policy and from the ceiling
+    both. It is a kernel rule rather than a predictor decision, so it is
+    free to get right and would only dilute the loss -- the same reason
+    `oracle_bce` and `mask_diagnostics` drop it.
+
+    Args:
+        logits: [H', R, n_tiles] fp32 student block logits (with grad).
+        heat: [H', R, n_tiles] fp32 teacher heat; must be the *mass*
+            reduction, since the derivation is about transported mass.
+        layout: Tile layout (empty key tiles are excluded).
+        blocks: Column blocks from column_blocks(), which carry the budget.
+        q_tiles: [R] int64 video query tile ids.
+        temperature: Width of the soft boundary in standardised score
+            units. Must be > 0.
+
+    Returns:
+        Scalar loss, averaged over rows then heads. -1 is the oracle
+        selection and 0 is a selection holding no mass at all. The policy
+        is rescaled to spend exactly the per-row budget, so a flat
+        predictor cannot score below -1 by keeping everything a little;
+        finite temperature still leaves an O(tau) slack, so values a shade
+        below -1 are possible and are not a bug.
+
+    Raises:
+        ValueError: If temperature is not positive.
+    """
+    if temperature <= 0:
+        raise ValueError(f'temperature must be > 0: {temperature}')
+    n_video = layout.n_video_tiles
+    with torch.no_grad():
+        oracle = veda_mask.select_video_blocks(heat, layout, blocks, q_tiles)
+        chosen = torch.zeros(*oracle.index.shape[:2], n_video,
+                             dtype=torch.bool, device=logits.device)
+        chosen.scatter_(2, oracle.index, oracle.keep)
+        diag = F.one_hot(q_tiles, n_video).bool()[None]
+        valid = layout.kv_ok[None, None, :n_video] & ~diag
+        chosen = chosen & valid
+        mass = heat[:, :, :n_video].float().masked_fill(~valid, 0.0)
+        mass = mass.clamp(min=0.0)
+        # The attainable mass at this budget, which is what makes the loss
+        # read as a fraction and makes -1 mean 'the oracle's own choice'.
+        ceiling = (mass * chosen).sum(-1, keepdim=True)
+        budget = chosen.sum(-1)  # [H', R], varies per row by layout rule
+        row_ok = (ceiling[..., 0] > 0) & (budget > 0)
+
+    scores = logits[:, :, :n_video].float()
+    # Row-standardise over the valid columns only. This is the gauge
+    # projection: its backward removes the constant and the radial
+    # component of the gradient, so no update can be spent on them.
+    counted = valid.to(scores.dtype)
+    rows = counted.sum(-1, keepdim=True).clamp(min=1.0)
+    centre = (scores * counted).sum(-1, keepdim=True) / rows
+    centred = (scores - centre) * counted
+    var = (centred.square() * counted).sum(-1, keepdim=True) / rows
+    z = centred / var.clamp(min=1e-12).sqrt()
+
+    # The row's own decision boundary, detached: it is where the top-k
+    # cut falls, not a quantity to optimise. Placed *midway* between the
+    # k-th and (k+1)-th largest score, not on the k-th: sitting on it
+    # would give the marginal column sigmoid(0) = 0.5 and break the
+    # tau -> 0 limit, which is the whole point of the loss. The budget
+    # varies per row, so this is a sort and a gather rather than a topk,
+    # and invalid columns are pushed below every real one.
+    with torch.no_grad():
+        ranked, _ = torch.sort(z.masked_fill(~valid, -_LARGE), dim=-1,
+                               descending=True)
+        last = ranked.shape[-1] - 1
+        kth = (budget - 1).clamp(min=0, max=last).unsqueeze(-1)
+        theta = 0.5 * (ranked.gather(-1, kth)
+                       + ranked.gather(-1, (kth + 1).clamp(max=last)))
+
+    policy = torch.sigmoid((z - theta) / temperature) * counted
+    # Rescale so the policy spends exactly the budget. Without this a flat
+    # predictor wins: z = 0 everywhere puts sigmoid at 0.5 on *every*
+    # column, so it 'keeps' half the row and scores below -1, i.e. better
+    # than the oracle. That is the forward-KL failure mode -- a loss
+    # reducible by flattening -- reintroduced through the relaxation.
+    # At tau -> 0 the policy is already exactly k-hot, so this is a no-op
+    # in the limit and the loss still equals the metric.
+    policy = policy * (budget.unsqueeze(-1).to(policy.dtype)
+                       / policy.sum(-1, keepdim=True).clamp(min=1e-6))
+    retained = (policy * mass).sum(-1) / ceiling[..., 0].clamp(
+        min=torch.finfo(torch.float32).tiny)
+    per_head = -(retained * row_ok).sum(-1) / row_ok.sum(-1).clamp(min=1)
     return per_head.mean()
 
 

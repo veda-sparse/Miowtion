@@ -128,6 +128,12 @@ class TrainConfig:
     # mode-seeking, which is what a top-k read-out actually wants. See
     # heatmap.seer_kl for the measured failure of the forward direction.
     kl_direction: str = 'forward'
+    # Weight of the expected-retained-mass loss derived from reading
+    # attention as one-sided entropic optimal transport (see
+    # heatmap.transport_loss). It is the only objective here that is
+    # invariant to the per-row affine maps a top-k read-out is invariant
+    # to; the other three each lost to a gauge direction instead.
+    transport_weight: float = 0.0
     # Weight of the oracle top-k BCE added to the seer KL (0 = KL only).
     # The KL fits the whole teacher distribution; only the top-k ordering
     # reaches the kernel. See heatmap.oracle_bce().
@@ -190,6 +196,13 @@ class TrainConfig:
         return cls(**raw)
 
     def validate(self) -> None:
+        if self.transport_weight < 0:
+            raise ValueError('transport_weight must be >= 0: '
+                             f'{self.transport_weight}')
+        if self.transport_weight and self.heat_reduce != 'sum':
+            raise ValueError("transport_weight needs heat_reduce 'sum': "
+                             'the loss is about transported mass, and the '
+                             'block maximum is not a mass')
         if self.kl_direction not in ('forward', 'reverse'):
             raise ValueError("kl_direction must be 'forward' or 'reverse': "
                              f'{self.kl_direction!r}')
@@ -323,6 +336,7 @@ class Trainer:
             ref_budget=ref_budget,
             heat_reduce=config.heat_reduce,
             kl_weight=config.kl_weight,
+            transport_weight=config.transport_weight,
             kl_direction=config.kl_direction,
             tile_conditions=config.tile_conditions,
             teacher_q_tiles=config.teacher_q_tiles,
@@ -573,9 +587,10 @@ class Trainer:
         resolved = collector.stats.resolve()  # one device transfer
         stats['kl'].append(sum(resolved['kl']) / num_layers)
         stats['kl_layers'].append(resolved['kl'])
-        for name in ('topk_bce', 'logit_std', 'recall', 'heat_kept',
-                     'heat_ceiling'):
-            stats[name] += resolved[name]
+        for name in ('topk_bce', 'transport', 'logit_std', 'recall',
+                     'heat_kept', 'heat_ceiling'):
+            # A zero-weighted loss records nothing, so the key is absent.
+            stats[name] += resolved.get(name, [])
         progress.log(f'  update {self.step + 1}/{self.config.steps} micro '
                      f'{len(stats["kl"])}/{self.config.accum}: traj step '
                      f'{traj.step + 1}/{self.schedule.num_steps}, '
@@ -604,8 +619,8 @@ class Trainer:
         while self.step < config.steps:
             start = time.time()
             stats = {name: [] for name in
-                     ('kl', 'kl_layers', 'topk_bce', 'logit_std', 'recall',
-                      'heat_kept',
+                     ('kl', 'kl_layers', 'topk_bce', 'transport',
+                      'logit_std', 'recall', 'heat_kept',
                       'heat_ceiling', 'mse')}
             for _ in range(config.accum):
                 self._micro_step(stats)
@@ -688,7 +703,8 @@ class Trainer:
             # against, so it has to come from the step that just ran.
             record['update_rms'] = round(self.optimizer.last_update_rms(), 5)
             record['update_align'] = round(self.optimizer.last_alignment(), 4)
-        for name in ('topk_bce', 'heat_kept', 'heat_ceiling', 'logit_std'):
+        for name in ('topk_bce', 'transport', 'heat_kept', 'heat_ceiling',
+                     'logit_std'):
             if stats[name]:
                 record[name] = round(self._reduce_mean(stats[name]), 5)
         # The geometry-normalized one. heat_kept alone is not comparable
@@ -713,7 +729,8 @@ class Trainer:
     def _progress_line(self, record: dict) -> str:
         """The short status: the loss, and the thing the kernel reads."""
         parts = [f"kl {record.get('kl', float('nan')):.4f}"]
-        for key, fmt in (('recall', '.3f'), ('kept_over_ceiling', '.4f')):
+        for key, fmt in (('transport', '.5f'), ('recall', '.3f'),
+                         ('kept_over_ceiling', '.4f')):
             if key in record:
                 parts.append(f'{key} {record[key]:{fmt}}')
         return '  '.join(parts)

@@ -616,3 +616,129 @@ def test_oracle_bce_still_separates_a_good_mask_from_a_bad_one():
     bad = -good
     assert float(heatmap.oracle_bce(good, heat, lay, blocks, rows)) < \
         float(heatmap.oracle_bce(bad, heat, lay, blocks, rows))
+
+
+# --- the transport loss --------------------------------------------------
+
+
+def _transport_case(seed=0, heads=2, ratio=0.9):
+    lay, blocks, rows, heat = _tiny_oracle_case(
+        ratio=ratio, heads=heads, seed=seed)
+    g = torch.Generator().manual_seed(seed + 100)
+    logits = torch.randn(heads, rows.numel(), lay.n_tiles, generator=g)
+    return lay, blocks, rows, heat, logits
+
+
+def test_transport_loss_is_invariant_to_a_per_row_affine_map():
+    """The gauge the top-k has, the loss must have.
+
+    This is the property all four earlier objectives lacked: a shift, a
+    positive scale, or both, moved the loss without moving the decision,
+    so descent spent itself on directions the kernel cannot see. Here it
+    is an equality test, not a tolerance test, because the invariance is
+    exact by construction and not an approximation that happens to hold.
+    """
+    lay, blocks, rows, heat, logits = _transport_case()
+    base = float(heatmap.transport_loss(logits, heat, lay, blocks, rows))
+    shift = torch.arange(rows.numel(), dtype=logits.dtype)[None, :, None]
+    for moved in (logits + 7.0,
+                  logits * 3.0,
+                  logits * 0.01,
+                  logits * 5.0 + shift * 100.0):
+        got = float(heatmap.transport_loss(moved, heat, lay, blocks, rows))
+        assert got == pytest.approx(base, rel=1e-5, abs=1e-6)
+
+
+def test_transport_loss_is_the_metric_it_is_judged_on():
+    """As tau -> 0 the loss is exactly -heat_kept / heat_ceiling.
+
+    This is the point of the objective: the loss and the metric are one
+    object, so they cannot move in opposite directions. All four earlier
+    objectives could, and two of them did.
+    """
+    lay, blocks, rows, heat, logits = _transport_case(seed=3)
+    n_video = lay.n_video_tiles
+    diag = torch.nn.functional.one_hot(rows, n_video).bool()[None]
+    valid = lay.kv_ok[None, None, :n_video] & ~diag
+    mass = heat[:, :, :n_video].masked_fill(~valid, 0.0)
+
+    oracle = veda_mask.select_video_blocks(heat, lay, blocks, rows)
+    chosen = torch.zeros(*oracle.index.shape[:2], n_video, dtype=torch.bool)
+    chosen.scatter_(2, oracle.index, oracle.keep)
+    budget = (chosen & valid).sum(-1)
+    ceiling = (mass * (chosen & valid)).sum(-1)
+
+    # The student's own hard top-k at the same per-row budget.
+    order = mass.new_zeros(mass.shape, dtype=torch.bool)
+    ranked = logits[:, :, :n_video].masked_fill(~valid, -1e4).argsort(
+        -1, descending=True)
+    for h in range(mass.shape[0]):
+        for r in range(mass.shape[1]):
+            order[h, r, ranked[h, r, :int(budget[h, r])]] = True
+    kept = (mass * order).sum(-1)
+    want = -float((kept[ceiling > 0] / ceiling[ceiling > 0]).mean())
+
+    got = float(heatmap.transport_loss(logits, heat, lay, blocks, rows,
+                                       temperature=1e-4))
+    assert got == pytest.approx(want, abs=1e-4)
+    # And the oracle's own choice scores exactly -1.
+    perfect = mass.masked_fill(~valid, -1e4)
+    assert float(heatmap.transport_loss(perfect, heat, lay, blocks, rows,
+                                        temperature=1e-4)) == \
+        pytest.approx(-1.0, abs=1e-4)
+
+
+def test_transport_loss_rewards_the_right_blocks_and_rejects_bad_tau():
+    lay, blocks, rows, heat, logits = _transport_case(seed=4)
+    n_video = lay.n_video_tiles
+    diag = torch.nn.functional.one_hot(rows, n_video).bool()[None]
+    valid = lay.kv_ok[None, None, :n_video] & ~diag
+    good = torch.zeros_like(logits)
+    good[:, :, :n_video] = heat[:, :, :n_video].masked_fill(~valid, -1e4)
+    losses = [float(heatmap.transport_loss(x, heat, lay, blocks, rows))
+              for x in (good, torch.zeros_like(logits), -good)]
+    assert losses[0] < losses[1] < losses[2]
+    with pytest.raises(ValueError, match='temperature must be'):
+        heatmap.transport_loss(logits, heat, lay, blocks, rows,
+                               temperature=0.0)
+
+
+def test_transport_loss_gradient_lives_only_where_the_decision_is():
+    """Zero in both gauge directions, and concentrated at the boundary."""
+    lay, blocks, rows, heat, logits = _transport_case(seed=7, heads=1)
+    logits = logits.clone().requires_grad_(True)
+    heatmap.transport_loss(logits, heat, lay, blocks, rows).backward()
+    grad = logits.grad[0, 0][lay.kv_ok]
+    # Standardising removes both a constant and a scale direction, so the
+    # gradient is orthogonal to both: it sums to zero over the columns and
+    # is orthogonal to the centred scores themselves. Zero, not small --
+    # no update can be spent on a gauge.
+    assert float(grad.sum()) == pytest.approx(0.0, abs=1e-6)
+    centred = (logits.detach()[0, 0][lay.kv_ok]
+               - logits.detach()[0, 0][lay.kv_ok].mean())
+    assert float((grad * centred).sum()) == pytest.approx(0.0, abs=1e-5)
+    # A column far above the boundary is already kept and a column far
+    # below is already dropped, so neither carries gradient; the softmax
+    # policy this replaced put 61% of its weight on exactly those.
+    z = centred / centred.std()
+    far = logits.grad[0, 0][:lay.n_video_tiles].abs()
+    near = far[(z[:lay.n_video_tiles].abs() < 1.0)]
+    outer = far[(z[:lay.n_video_tiles].abs() > 2.0)]
+    if outer.numel() and near.numel():
+        assert float(outer.max()) < float(near.max())
+
+
+def test_transport_loss_ignores_empty_key_tiles_and_empty_rows():
+    lay, blocks, rows, heat, logits = _transport_case(seed=5)
+    lay.kv_ok[1] = False
+    base = float(heatmap.transport_loss(logits, heat, lay, blocks, rows))
+    moved = logits.clone()
+    moved[:, :, 1] = 500.0          # an excluded column cannot matter
+    assert float(heatmap.transport_loss(moved, heat, lay, blocks,
+                                        rows)) == pytest.approx(base,
+                                                                rel=1e-6)
+    # A row the teacher gives no mass is skipped, not counted as perfect.
+    heat = heat.clone()
+    heat[:, 0] = 0.0
+    assert torch.isfinite(
+        heatmap.transport_loss(logits, heat, lay, blocks, rows))
