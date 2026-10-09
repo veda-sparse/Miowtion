@@ -17,6 +17,7 @@ predictor (its EMA weights).
 
 from __future__ import annotations
 
+import collections.abc
 import contextlib
 import dataclasses
 import json
@@ -100,6 +101,17 @@ class TrainConfig:
     # been answered yet -- whether training the base against the right
     # target and features moves the predictor towards the oracle.
     freeze_second_order: bool = False
+    # Hold the per-head log B gain at its closed-form 1.0. Veda2 added it
+    # and it is the predictor's only non-matrix parameter, so `optimizer:
+    # muon` cannot train it: Muon orthogonalizes matrices and refuses 1-D
+    # tensors. Freezing it is cheap rather than a compromise -- 56 scalars
+    # a layer against 2 * 56 * 384 * 128 matrix entries, so about 1e-5 of
+    # the capacity -- and its initialisation is already the exact
+    # coefficient. Its one job is to shrink towards 0 on geometries whose
+    # tile row counts barely vary, and every geometry in these runs has
+    # real spread (16:9@37: std(log B) 0.664). Never set implicitly: a
+    # config that wants Muon has to say this out loud.
+    freeze_count_gain: bool = False
     # Stop a run that is not improving instead of paying for the rest.
     # On by default, and deliberately so: a Veda2 run degraded for 59
     # updates before anyone looked, which was an hour of GPU spent on a
@@ -285,6 +297,34 @@ def learning_rate(config: TrainConfig, step: int) -> float:
     return lr * (config.lr_min_ratio + (1.0 - config.lr_min_ratio) * cosine)
 
 
+def _require_matrix_params(
+        named: collections.abc.Sequence[
+            tuple[str, torch.nn.Parameter]]) -> None:
+    """Rejects 1-D trainables before Muon gets a chance to.
+
+    Group names stopped being enough when Veda2 added `count_gain`, which
+    is [num_heads] and sits inside the 'predictor' group: the group-level
+    check passes, and Muon's own shape check then fires several minutes
+    in, after the 33B of weights have loaded, saying only
+    `got shape (56,)`. This says which parameter and what to do instead.
+
+    Args:
+        named: The trainable (name, parameter) pairs the optimizer will own.
+
+    Raises:
+        ValueError: If any trainable parameter has fewer than two dims.
+    """
+    flat = [(n, p) for n, p in named if p.requires_grad and p.ndim < 2]
+    if not flat:
+        return
+    name, param = flat[0]
+    raise ValueError(
+        f'optimizer muon cannot train {len(flat)} non-matrix parameters, '
+        f'e.g. {name} with shape {tuple(param.shape)}: Muon orthogonalizes '
+        'matrices. Set freeze_count_gain: true to hold them at their '
+        'initialisation, or use optimizer: adamw.')
+
+
 class Trainer:
     """Owns the model, predictor, optimizer and the trajectory stream."""
 
@@ -355,6 +395,16 @@ class Trainer:
                               if not n.endswith(('so_q', 'so_k'))]
             progress.log(f'second-order head frozen: {len(held)} tensors '
                          'held at the warm start')
+        if config.freeze_count_gain:
+            held = [n for n, p in self.predictor.named_parameters()
+                    if n.endswith('count_gain')]
+            for name, param in self.predictor.named_parameters():
+                if name.endswith('count_gain'):
+                    param.requires_grad_(False)
+            self.trainable = [(n, p) for n, p in self.trainable
+                              if not n.endswith('count_gain')]
+            progress.log(f'count gain frozen: {len(held)} tensors held at '
+                         'the closed-form 1.0')
         if config.stage == 2:
             self.trainable += lora.lora_parameters(self.model)
             self.trainable += [
@@ -391,6 +441,7 @@ class Trainer:
                 raise ValueError(
                     f'optimizer muon needs a predictor-only run; this one '
                     f'also trains {sorted(non_matrix)}')
+            _require_matrix_params(self.opt_params)
             self.optimizer = muon.Muon(
                 groups['predictor'], lr=config.lr,
                 momentum=config.muon_momentum, rms_target=config.muon_rms,

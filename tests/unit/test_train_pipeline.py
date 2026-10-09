@@ -720,3 +720,29 @@ def test_transport_config_on_disk_is_loadable():
     assert config.topk_weight == 0.0
     assert config.heat_reduce == 'sum'
     assert config.freeze_second_order is True
+
+
+def test_muon_refuses_non_matrix_predictor_parameters_by_name():
+    """The guard has to name the parameter and the way out.
+
+    Veda2's count_gain is [num_heads], the predictor's only non-matrix
+    parameter, and it sits inside the 'predictor' parameter group. So a
+    group-level check passes and Muon's own shape check fires minutes
+    into a run, after the 33B of weights have loaded. That happened; the
+    message said only 'got shape (56,)'.
+    """
+    matrices = [('layers.0.proj_q', torch.nn.Parameter(torch.zeros(4, 8, 8)))]
+    trainer_lib._require_matrix_params(matrices)        # no raise
+
+    gain = torch.nn.Parameter(torch.ones(56))
+    with pytest.raises(ValueError) as caught:
+        trainer_lib._require_matrix_params(
+            matrices + [('layers.0.count_gain', gain)])
+    message = str(caught.value)
+    assert 'count_gain' in message and '(56,)' in message
+    assert 'freeze_count_gain' in message      # the way out, not just the no
+
+    # A frozen one is not the optimizer's problem.
+    gain.requires_grad_(False)
+    trainer_lib._require_matrix_params(
+        matrices + [('layers.0.count_gain', gain)])
