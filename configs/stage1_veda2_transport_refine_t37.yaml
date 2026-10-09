@@ -1,0 +1,126 @@
+# Veda2 stage 1, run (5): the objective derived from the decision rule.
+#
+# Runs (1)-(4) each failed differently, and the unified reason is a
+# symmetry one. A top-k read-out is invariant to any per-row positive
+# affine map of the scores: adding a constant to a row, or scaling a row
+# by 3, selects the same blocks. Every objective tried so far could be
+# reduced without changing a single selection, and the gradient went
+# there:
+#
+#   objective      row shift   row scale   observed
+#   forward KL     invariant   sensitive   spread compressed, recall down
+#   reverse KL     invariant   sensitive   logit spread 6x in 48 updates
+#   raw BCE        sensitive   sensitive   loss = the offset (537)
+#   centred BCE    invariant   sensitive   loss up on 3 of 4 geometries
+#   transport      invariant   invariant   this run
+#
+# transport_loss comes out of reading attention as one-sided entropic
+# optimal transport (arXiv 2508.08369). Restricting the plan's support to
+# a block set S makes the attainable value F(S) = log sum_{v in S}
+# exp(s_uv) = log E_u(S), so argmax over |S| = k is *exactly* top-k by
+# block attention mass, with no approximation, and the value a selection
+# gives up is -log(1 - r_u) in the discarded mass fraction r_u. The loss
+# is the expected retained mass under the policy the scores induce, which
+# makes the objective and the metric (heat_kept / heat_ceiling) the same
+# object -- the thing that was broken in all four earlier runs, where the
+# loss could fall while the metric fell with it.
+run_name: stage1_veda2_transport_refine_t37
+checkpoint_root: weights/MiniMax-H3
+sample_cache: artifacts/samples/moviegen_video_bench
+geometries: ['1:1@37', '4:3@37', '16:9@37', '9:16@37']
+geometry_sampling: cycle
+variant: FL2VA
+tasks: [t2va]
+plan_dir: plans/released
+schedule: turbo
+num_steps: 8
+teacher_adapter: weights/turbo_lora/minimax_h3_turbo_v4_step600_ema.safetensors
+keep_ratio: 0.1
+teacher_q_tiles: 1.0
+second_order_rank: 128
+count_term: true
+# Held at the warm start for run (1)'s reason: the term is quadratic in
+# so_q and so_k, so a step size tuned for the base projections runs it
+# away. Only the base projections move.
+freeze_second_order: true
+# count_gain stays trainable. It is [num_heads], the predictor's only
+# non-matrix parameter, so Muon cannot own it -- but AdamW can, and the
+# optimizer now routes by shape instead of refusing (train.optim.Hybrid).
+# Its own learning rate is muon_aux_lr_scale x the base, because the two
+# conventions are not comparable: Muon's step has RMS lr * muon_rms
+# whatever the gradient is, AdamW's is about lr whatever the weight is.
+# The gain starts at the exact coefficient 1.0, so 1e-3 is a 0.1%
+# relative change per update -- refinement, not search.
+freeze_count_gain: false
+muon_aux_lr_scale: 0.1
+# Mass, not peak. The transport value of a block set is its summed
+# exponentiated score; a block maximum is not a mass, and the trainer
+# refuses the combination rather than quietly using the wrong target.
+heat_reduce: sum
+kl_weight: 0.0
+topk_weight: 0.0
+transport_weight: 1.0
+# 0.06, because this is a refinement rather than a journey: proj = 0 is
+# already the closed form, so there is no trough to pass through and any
+# sustained fall is the run overwriting a correct term.
+# Previously 0.35, on the journey theory. The run starts from a closed-form initialisation
+# that is already at the quality bar (kept/ceiling 0.934), while the
+# base projections start at 1e-4 and are useful around 1.15e-2. So the
+# first hundreds of updates are a journey *away* from a good score, not
+# a regression: from-scratch training on this predictor legitimately
+# passes through 0.60-0.75 before it comes back. A guard tuned to a warm
+# start would kill exactly the journey the run exists to measure, which
+# already happened once (pitfall: judging in 12 to 59 updates something
+# that takes hundreds). What the guard must still catch is a runaway,
+# and a runaway goes far past 0.35 -- the reverse-KL failure took the
+# logit spread up 6x.
+abort_window: 8
+abort_patience: 0
+abort_max_drop: 0.06
+accum: 4
+steps: 400
+# Muon, and a step size derived from a measurement rather than from the
+# 'find the scale' story, which was wrong.
+#
+# LayerPredictor.embed is a *residual*: it returns
+# `feats @ proj + feats[..., :D]`, so at proj = 0 the tile embedding is
+# the mean-pooled feature and the logit is exactly the closed-form
+# zero-order term. proj is therefore a correction on top of a correct
+# answer, not a path that has to be travelled. There is no 115x journey
+# from 1e-4 to 1.15e-2; 1.15e-2 is the size of the correction Veda1
+# happened to learn over 600 updates under a different objective.
+#
+# Every earlier arm got this backwards and paid for it. Measured on the
+# lr 1e-2 arm's own checkpoint at update 25: proj_q RMS had gone from
+# 1e-4 to 1.65e-2, already past Veda1's trained scale, in 25 updates.
+# Muon's step RMS is lr * muon_rms = 2e-3, so a random walk of 25 steps
+# is 2e-3 * sqrt(25) = 1e-2, which matches. And update_align fell 0.16
+# to 0.087, so most of that growth was in directions that serve no
+# batch: the run was not travelling, it was overwriting an exact term
+# with noise. Every geometry degraded monotonically over 30 updates, and
+# so did the loss itself -- while a local check confirms a step along
+# -grad always reduces it, so the objective and its gradient are sound.
+#
+# lr 5e-4 puts the step RMS at 1e-4: the size of the initialisation, and
+# 1% of the trained correction. Over 400 updates the incoherent part
+# accumulates to 1e-4 * sqrt(400) = 2e-3, a fifth of the useful scale,
+# while the coherent part can still reach several times that. This is a
+# refinement run, which is what the question actually asks.
+optimizer: muon
+lr: 5.0e-4
+# 0.5, not 0.95. The buffer averages 1/(1-momentum) updates, so 0.95
+# spans 20 of them -- and each update uses one geometry out of four
+# cycled, whose gradients are measured to be nearly orthogonal
+# (grad_cos 0.92 within a geometry, 0.05-0.57 across). At 0.95 the step
+# is a mixture of four conflicting directions and only ~9% of it serves
+# the batch in hand. 0.5 spans two updates and keeps the variance
+# reduction that actually applies.
+muon_momentum: 0.5
+muon_rms: 0.2
+warmup: 20
+save_every: 25
+keep_optimizer: 1
+out_dir: runs
+offload_blocks: 30
+prefetch: 1
+mlp_chunk_rows: 8192
