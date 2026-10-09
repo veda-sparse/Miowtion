@@ -144,3 +144,4 @@
 | 二阶头在 48 步内把 logit_std 推高 6 倍，损失自己在上升 | 项是 `so_q`·`so_k` 的双线性，对参数是**二次**的；`so_*` 初值 0.0625，每步漂 1.6%、48 步漂 77%，乘积动 3 倍 | `freeze_second_order`，或者改成 `g_h·(归一化项)` 把「多少」和「哪个子空间」解耦 | [veda2](features/veda2.md) |
 | 早停用「trailing mean 不再创新高」，把一次只是**平**的长跑砍在第 50 步 | 那个判据分不清「还在路上」和「到终点了」：lr 1e-4 下 50 步只让投影走了有用尺度的一半 | 长跑用 `max_drop`（跌破起点）判**发散**，`patience` 只留给短诊断跑；两个判据都不给直接报错 | [veda2](features/veda2.md) |
 | 刚 kill 掉的训练，`pgrep -f 'scripts/train.py'` 还报 RUNNING | pgrep 匹配到了**自己的 ssh 命令串** | GPU 作业用 `nvidia-smi --query-gpu=memory.used` 或 `ps -eo args \| grep -v grep` 确认 | [veda2](features/veda2.md) |
+| 声称 `log B` 的收益「取决于补齐比例」，另一个几何上复测不出来 | `log B_j` 是每列常数，只在这些常数**彼此有差别**时才改变 top-k。预测量是 `std_j(log B_j)` 比基础分数 spread，不是补齐比例——而且补齐在各轴上是**乘性**的：16:9@37 两个轴都短，角落 tile 只有 8/128 行，std 0.664；双采几何只有一个轴短，最低 72/128，std 0.160，杠杆小 4 倍。补齐**比例**反而是 19.1% 对 9.6%，指向相反 | `solattn.count_term_leverage(grid, shape)`，纯静态、不需要 GPU，上几何之前先查 | [veda2](features/veda2.md) |

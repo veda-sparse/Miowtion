@@ -42,7 +42,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument('--window', type=int, default=8,
                         help='updates per trailing mean')
     parser.add_argument('--patience', type=int, default=10,
-                        help='updates without a new best before stopping')
+                        help='updates without a new best before stopping; '
+                        '0 disables it, which is what a long run wants')
     parser.add_argument('--max-drop', type=float, default=0.05,
                         help='stop if the metric falls this far below its '
                         'first trailing mean')
@@ -84,13 +85,22 @@ def verdict(values: list[float], window: int, patience: int,
     Args:
         values: The watched metric, one per update, in order.
         window: Updates per trailing mean.
-        patience: Updates without a new best before stopping.
+        patience: Updates without a new best before stopping; 0 disables
+            that criterion, which is what a long run wants, because 'no
+            improvement' cannot tell a journey from a destination.
         max_drop: Absolute fall below the first trailing mean that counts
-            as divergence on its own.
+            as divergence on its own; 0 disables that criterion.
 
     Returns:
         A reason, with the numbers in it, or None.
+
+    Raises:
+        ValueError: If both criteria are disabled, which would mean a
+            watcher that never fires.
     """
+    if not patience and not max_drop:
+        raise ValueError('give at least one of patience or max_drop; a '
+                         'watcher with neither never fires')
     if len(values) < window:
         return None
     means = [sum(values[i:i + window]) / window
@@ -103,7 +113,7 @@ def verdict(values: list[float], window: int, patience: int,
                 f'{means[0] - latest:.4f} below its starting value '
                 f'{means[0]:.4f} (limit {max_drop})')
     since = len(means) - 1 - best_at
-    if since >= patience:
+    if patience and since >= patience:
         return (f'no improvement for {since} updates: trailing mean '
                 f'{latest:.4f} against a best of {best:.4f} at update '
                 f'{best_at + window}')

@@ -1184,3 +1184,40 @@ def test_logit_term_report_separates_the_offset_from_the_spread():
     # And the count term is a per-column constant: no spread across rows.
     assert out['count']['row_all'] > 0.0
     assert out['features']['sq_q_mean'] > 0.0
+
+
+# --- static leverage of the log B term -----------------------------------
+
+
+def test_count_term_leverage_explains_the_two_regimes():
+    """Two measurements disagreed on log B; the layout says why.
+
+    16:9@37 pads two axes at once, so corner tiles hold 8 rows of 128 and
+    the term has real leverage. A two-stage 15x27x72 grid pads one axis,
+    nothing falls below 72 rows, and the term can barely reorder
+    anything -- even though its mean padding fraction is *lower*.
+    """
+    mine = solattn.count_term_leverage((37, 24, 42),
+                                       tiling.TileShape(4, 4, 8))
+    theirs = solattn.count_term_leverage((15, 27, 72),
+                                         tiling.TileShape(4, 4, 8))
+    assert mine['min_rows'] == 8 and theirs['min_rows'] >= 64
+    assert mine['log_count_std'] > 3 * theirs['log_count_std']
+    # The mean padding fraction points the other way, so it is not the
+    # predictor: this is the claim the first version of the doc got wrong.
+    assert mine['padding'] > theirs['padding']
+    assert mine['leverage'] > 0.15 and theirs['leverage'] < 0.06
+
+
+def test_count_term_leverage_is_zero_without_padding():
+    """A grid the shape divides exactly gives every tile 128 rows."""
+    out = solattn.count_term_leverage((8, 8, 16),
+                                      tiling.TileShape(4, 4, 8))
+    assert out['min_rows'] == out['max_rows'] == 128
+    assert out['log_count_std'] == pytest.approx(0.0)
+    assert out['leverage'] == pytest.approx(0.0)
+    assert out['padding'] == pytest.approx(0.0)
+    assert out['partial_share'] == pytest.approx(0.0)
+    with pytest.raises(ValueError, match='base_spread must be positive'):
+        solattn.count_term_leverage((8, 8, 16), tiling.TileShape(4, 4, 8),
+                                    base_spread=0.0)

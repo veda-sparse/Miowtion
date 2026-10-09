@@ -66,3 +66,24 @@ def test_parse_args_defaults_match_the_documented_policy():
     assert args.patience == 10 and args.window == 8
     assert args.metric == 'kept_over_ceiling'
     assert args.kill is False, 'killing must be opt-in'
+
+
+def test_patience_zero_disables_that_criterion():
+    """It did not, and that killed a healthy run at update 9.
+
+    `since >= patience` is true for every `since` when patience is 0, so
+    the watcher fired on the first update that was not a new best.
+    """
+    w = _watcher()
+    values = [0.9343, 0.9346, 0.9239, 0.9294, 0.9091, 0.9100, 0.9037,
+              0.9092, 0.8899]
+    assert w.verdict(values, 8, 10, 0.05) is None, 'patience 10 tolerates it'
+    assert w.verdict(values, 8, 0, 0.12) is None, 'patience 0 must be off'
+    # max_drop still fires on its own.
+    assert w.verdict([0.93] * 8 + [0.70] * 8, 8, 0, 0.05)
+
+
+def test_verdict_rejects_having_no_criterion_at_all():
+    w = _watcher()
+    with pytest.raises(ValueError, match='at least one of'):
+        w.verdict([0.9] * 10, 8, 0, 0.0)

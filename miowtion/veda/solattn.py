@@ -507,6 +507,62 @@ def relative_errors(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
 # differs, never the total cost.
 
 
+def count_term_leverage(grid: tuple[int, int, int],
+                        shape: tiling.TileShape,
+                        base_spread: float = 3.9) -> dict:
+    """How much the log B_j term can reorder a top-k, from the layout alone.
+
+    `log B_j` is a per-key-tile *constant*, so adding it reorders a row's
+    top-k only in proportion to how much those constants differ across
+    columns. The predictor is therefore `std_j(log B_j)` measured against
+    the spread of the base score, and **not** the mean padding fraction,
+    which is what docs/features/veda2.md claimed at first and what a
+    second measurement then contradicted.
+
+    The two disagree because padding is multiplicative across axes. At
+    16:9@37 with 4x4x8 both t (37 of 40) and w (42 of 48) are short, so
+    the corner tiles hold 8 real rows of 128 and std(log B) is 0.66. On a
+    two-stage 15x27x72 grid only one axis is short, no tile falls below 72
+    rows, and std(log B) is 0.16 -- four times less leverage against the
+    same base spread, which is a null result rather than a contradiction.
+    The mean padding fraction runs the other way there (19.1% against
+    9.6%), so it cannot be the predictor.
+
+    This is a property of (geometry, tile shape) and needs no GPU, so it
+    can be checked before committing a run to the term.
+
+    Args:
+        grid: Target token grid (T, H, W).
+        shape: Tile shape.
+        base_spread: Standard deviation of the base block score, which is
+            what the term competes against. The measured value on real
+            weights is about 3.9 over video columns.
+
+    Returns:
+        std of log B, its ratio to `base_spread`, the real row counts'
+        range, and the share of tiles that are not full.
+
+    Raises:
+        ValueError: If `base_spread` is not positive.
+    """
+    if base_spread <= 0:
+        raise ValueError(f'base_spread must be positive: {base_spread}')
+    counts = (tiling.span_tiles(tiling.TiledSpan(0, grid, shape)) >= 0
+              ).sum(1).float()
+    log_counts = torch.log(counts.clamp(min=1.0))
+    spread = float(log_counts.std())
+    full = tiling.TILE_SIZE
+    return {
+        'tiles': int(counts.numel()),
+        'log_count_std': spread,
+        'leverage': spread / base_spread,
+        'min_rows': int(counts.min()),
+        'max_rows': int(counts.max()),
+        'padding': 1.0 - float(counts.sum()) / (counts.numel() * full),
+        'partial_share': float((counts < full).float().mean()),
+    }
+
+
 def video_budget(density: float, n_tiles: int, n_global: int) -> float:
     """Video key tiles per row at an overall keep `density`.
 
