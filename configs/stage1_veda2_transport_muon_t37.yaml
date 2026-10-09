@@ -1,0 +1,100 @@
+# Veda2 stage 1, run (5): the objective derived from the decision rule.
+#
+# Runs (1)-(4) each failed differently, and the unified reason is a
+# symmetry one. A top-k read-out is invariant to any per-row positive
+# affine map of the scores: adding a constant to a row, or scaling a row
+# by 3, selects the same blocks. Every objective tried so far could be
+# reduced without changing a single selection, and the gradient went
+# there:
+#
+#   objective      row shift   row scale   observed
+#   forward KL     invariant   sensitive   spread compressed, recall down
+#   reverse KL     invariant   sensitive   logit spread 6x in 48 updates
+#   raw BCE        sensitive   sensitive   loss = the offset (537)
+#   centred BCE    invariant   sensitive   loss up on 3 of 4 geometries
+#   transport      invariant   invariant   this run
+#
+# transport_loss comes out of reading attention as one-sided entropic
+# optimal transport (arXiv 2508.08369). Restricting the plan's support to
+# a block set S makes the attainable value F(S) = log sum_{v in S}
+# exp(s_uv) = log E_u(S), so argmax over |S| = k is *exactly* top-k by
+# block attention mass, with no approximation, and the value a selection
+# gives up is -log(1 - r_u) in the discarded mass fraction r_u. The loss
+# is the expected retained mass under the policy the scores induce, which
+# makes the objective and the metric (heat_kept / heat_ceiling) the same
+# object -- the thing that was broken in all four earlier runs, where the
+# loss could fall while the metric fell with it.
+run_name: stage1_veda2_transport_muon_t37
+checkpoint_root: weights/MiniMax-H3
+sample_cache: artifacts/samples/moviegen_video_bench
+geometries: ['1:1@37', '4:3@37', '16:9@37', '9:16@37']
+geometry_sampling: cycle
+variant: FL2VA
+tasks: [t2va]
+plan_dir: plans/released
+schedule: turbo
+num_steps: 8
+teacher_adapter: weights/turbo_lora/minimax_h3_turbo_v4_step600_ema.safetensors
+keep_ratio: 0.1
+teacher_q_tiles: 1.0
+second_order_rank: 128
+count_term: true
+# Held at the warm start for run (1)'s reason: the term is quadratic in
+# so_q and so_k, so a step size tuned for the base projections runs it
+# away. Only the base projections move.
+freeze_second_order: true
+# Mass, not peak. The transport value of a block set is its summed
+# exponentiated score; a block maximum is not a mass, and the trainer
+# refuses the combination rather than quietly using the wrong target.
+heat_reduce: sum
+kl_weight: 0.0
+topk_weight: 0.0
+transport_weight: 1.0
+# 0.35, not the 0.12 the AdamW arm used, and the difference is the
+# point of this arm. The run starts from a closed-form initialisation
+# that is already at the quality bar (kept/ceiling 0.934), while the
+# base projections start at 1e-4 and are useful around 1.15e-2. So the
+# first hundreds of updates are a journey *away* from a good score, not
+# a regression: from-scratch training on this predictor legitimately
+# passes through 0.60-0.75 before it comes back. A guard tuned to a warm
+# start would kill exactly the journey the run exists to measure, which
+# already happened once (pitfall: judging in 12 to 59 updates something
+# that takes hundreds). What the guard must still catch is a runaway,
+# and a runaway goes far past 0.35 -- the reverse-KL failure took the
+# logit spread up 6x.
+abort_window: 8
+abort_patience: 0
+abort_max_drop: 0.35
+accum: 4
+steps: 400
+# Muon, not AdamW, and for a measured reason. The predictor is a stack of
+# per-head [56, 384, 128] matrices and nothing else -- no embeddings, no
+# biases, no norms -- so Muon applies without splitting the optimizer
+# (docs/features/training.md). On a from-scratch arm with an identical
+# seed it reached 1/2.7 of AdamW's layer-49 KL by update 20 and settled
+# logit_std into the trained range by update 30, where AdamW was still
+# out at 4.33 after 20.
+#
+# The reason it matters *here* is the shape of the problem rather than
+# the speed. The base projections start at 1e-4 and are useful around
+# 1.15e-2, so this is a scale-finding problem, and AdamW's step is ~lr
+# whatever the weight currently is: at lr 5e-4 that is a 5x relative
+# change per update, which is why the AdamW arm degraded every geometry
+# inside 14 updates while still in warmup. Muon sets the update's RMS
+# explicitly to lr * muon_rms, so the step is a property of the
+# configuration and `update_rms` / `update_align` are logged as measured
+# values rather than assumed.
+optimizer: muon
+# lr 1e-2 x rms 0.2 = an update RMS of 2e-3. Against a weight at 1e-4
+# that is a complete rewrite per step, which is what a 140x journey
+# needs and also why the warmup below is not optional.
+lr: 1.0e-2
+muon_momentum: 0.95
+muon_rms: 0.2
+warmup: 20
+save_every: 25
+keep_optimizer: 1
+out_dir: runs
+offload_blocks: 30
+prefetch: 1
+mlp_chunk_rows: 8192
