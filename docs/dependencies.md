@@ -66,3 +66,25 @@ fastvideo-kernel（d995516）、SageAttention（d1a57a5）、SpargeAttn（ae5b62
 **为什么要调用它的 `prepare`**：`tau` 是阈值不是预算。上游的路由规则是逐 (query block, head) 算 `mean + tau * std`，当一个 key block 的 proxy 分数在该 query block 上的均值超过它就精确计算（`triton_ref/fwd.py`：`exact = (sum(scores, 0) / q_len > route_threshold)`）。所以要和固定预算的 router 在同一稀疏度上比，必须**标定 tau 并报告实际达到的密度**。`sol.density()` 调用上游自己的 `prepare` 取 block summary 和阈值，只重写最后那一步比较，这样判定来自上游而不是我们的近似。
 
 **不允许的做法**：假定 tau 对应某个密度。`MIOWTION_SOL_DENSITY=1` 让每次生成都记录实际路由比例，`scripts/generate.py` 会把均值与区间打进日志。
+
+## 对比基线：第三方稀疏注意力实现（只读，仅用于横向对比）
+
+为 `EXPERIMENT_PLAN.md` 的 P0-3 / P0-4 准备。全部以 `third_party/` 下的浅克隆放置、锁定
+commit、**不修改内容**，并按 AGENTS.md §3 核对许可证必须与 MIT 兼容。
+
+| 方法 | 仓库 | 锁定 commit | 许可证 | 可用性 |
+|---|---|---|---|---|
+| Sol-Attn | `NVlabs/Sana`（`sol-engine` 分支，子目录 `techniques/sparse_backends`） | `670482d` | Apache-2.0（内含 FlashAttention BSD-3、cuDNN Frontend Apache-2.0） | **已装并实测**，CuTe SM120 后端 |
+| SpargeAttn | `thu-ml/SpargeAttn` | `ae5b629` | **Apache-2.0** | 已克隆，未装 |
+| SVG / SVG-EAR | `svg-project/Sparse-VideoGen` | `f89aeda`（含 svg-ear PR #80） | **Apache-2.0** | 已克隆，未装 |
+| SLA | `thu-ml/SLA` | `7db4039` | **Apache-2.0** | 已克隆，未装 |
+| STA | `hao-ai-lab/FastVideo` | main | **Apache-2.0** | 已克隆，未装 |
+| XAttention | `mit-han-lab/x-attention` | `e379887` | **无顶层 LICENSE** | **不可用**：许可证不明，按 §3 不得使用 |
+
+**安装一律 `--no-deps`**，和 Sol-Attn 同一个理由：其中几个要求比本仓库更新的 torch，
+让 pip 去满足会替换掉 vendored FA4 所钉的那一套，打断训练与推理栈。
+
+**XAttention 的处理**：仓库没有顶层许可证文件，所以无法确认与 MIT 兼容。
+按 AGENTS.md §3，**不使用**，并在论文的横向对比里注明「该方法因许可证不明未纳入」，
+而不是悄悄跳过。
+
