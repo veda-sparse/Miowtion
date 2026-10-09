@@ -31,7 +31,31 @@ teacher_q_tiles: 1.0
 second_order_rank: 128
 count_term: true
 heat_reduce: sum
+# Reverse KL, i.e. KL(student || teacher). Forward is mass-covering:
+# measured here, 25 updates took it from 134 to 48 while recall fell
+# 0.714 -> 0.654, because spreading out is the cheapest way to pay it
+# down. Reverse is mode-seeking, which is what a top-k read-out wants,
+# and the teacher floor bounds it near 14 instead of 300.
+kl_direction: reverse
+# The BCE is off, and not for the documented reason. At the logit scale
+# this predictor actually produces (logit_std 192-275 measured, with
+# either base) sigmoid saturates outright, so the loss is just |logit|,
+# about 537, and its gradient is +-1 per element: grad_norm 7522 against a
+# clip of 1.0, i.e. every update scaled to nothing. Reverse KL goes
+# through a softmax and is scale-robust, which is what makes it usable
+# here. The logit scale itself is an open question -- the offline probe
+# measures 3.9 for the same predictor -- and until that is resolved a loss
+# that depends on absolute logit magnitude cannot be trusted.
+topk_weight: 0.0
 # -----------------------------
+# No init_from on purpose. Warm-starting from the released Veda1 weights
+# was tried and is *worse*: at the same keep ratio and geometry cycle it
+# starts at recall 0.631 against 0.756 here, with logit_std 192-275 and
+# grad_norm 7522 against 2037, so every update is clipped to nothing. The
+# closed-form terms compose with an untrained base and not with one
+# trained against the block maximum, which is the same mismatch that made
+# bolting them on fail. 600 steps of feature learning is not worth
+# starting 12 points behind.
 accum: 4
 steps: 400
 lr: 1.0e-3
