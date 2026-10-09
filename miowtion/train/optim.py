@@ -63,3 +63,86 @@ class HostMasters:
         for name, p in self.device.items():
             p.copy_(self.host[name], non_blocking=True)
         _synchronize()
+
+
+class _StateView:
+    """Routes `optimizer.state[p]` to whichever optimizer owns `p`.
+
+    The checkpoint reads `optimizer.state[p]` when saving and assigns to
+    it when resuming, so a plain ChainMap is not enough: an assignment
+    has to land in the optimizer that will actually step that parameter.
+    """
+
+    def __init__(self, parts: Sequence[torch.optim.Optimizer]):
+        self._parts = list(parts)
+
+    def _owner(self, param) -> torch.optim.Optimizer:
+        for part in self._parts:
+            for group in part.param_groups:
+                if any(p is param for p in group['params']):
+                    return part
+        raise KeyError('parameter belongs to no sub-optimizer')
+
+    def __getitem__(self, param):
+        return self._owner(param).state[param]
+
+    def __setitem__(self, param, value) -> None:
+        self._owner(param).state[param] = value
+
+    def __contains__(self, param) -> bool:
+        return any(param in part.state for part in self._parts)
+
+
+class Hybrid:
+    """One optimizer interface over several, split by parameter shape.
+
+    Muon orthogonalizes matrices, so it cannot own a 1-D parameter, and
+    Veda2 gave the predictor exactly one: `count_gain`, a per-head gain
+    on log B_j. Freezing it works but gives up a parameter that has a
+    real job (shrinking towards 0 on geometries whose tile row counts
+    barely vary). Routing it to AdamW instead costs nothing and keeps it
+    trainable.
+
+    Each sub-optimizer's groups carry an `lr_scale`, because a learning
+    rate does not mean the same thing on both sides: Muon's step has RMS
+    `lr * rms_target` whatever the gradient is, while AdamW's is about
+    `lr` whatever the weight is. The trainer's schedule sets one `lr` and
+    every group scales it, so the ratio between the two is fixed by the
+    configuration rather than drifting with the warmup.
+    """
+
+    def __init__(self, parts: Sequence[torch.optim.Optimizer]):
+        if not parts:
+            raise ValueError('Hybrid needs at least one optimizer')
+        self.parts = list(parts)
+        self.state = _StateView(self.parts)
+
+    @property
+    def param_groups(self) -> list[dict]:
+        """The sub-optimizers' own group dicts, not copies.
+
+        Mutating `group['lr']` therefore reaches the optimizer that uses
+        it, which is how the trainer's schedule works.
+        """
+        return [g for part in self.parts for g in part.param_groups]
+
+    def step(self) -> None:
+        for part in self.parts:
+            part.step()
+
+    def zero_grad(self, set_to_none: bool = True) -> None:
+        for part in self.parts:
+            part.zero_grad(set_to_none=set_to_none)
+
+    def last_update_rms(self) -> float:
+        """The Muon side's measured update RMS, or 0 if there is none."""
+        for part in self.parts:
+            if hasattr(part, 'last_update_rms'):
+                return part.last_update_rms()
+        return 0.0
+
+    def last_alignment(self) -> float:
+        for part in self.parts:
+            if hasattr(part, 'last_alignment'):
+                return part.last_alignment()
+        return 0.0

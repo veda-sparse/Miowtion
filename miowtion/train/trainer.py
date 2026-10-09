@@ -164,6 +164,15 @@ class TrainConfig:
     optimizer: str = 'adamw'
     muon_momentum: float = 0.95
     muon_rms: float = 0.2      # RMS every orthogonalized update is scaled to
+    # Learning-rate ratio for the parameters Muon cannot own. Muon
+    # orthogonalizes matrices, so a 1-D parameter (Veda2's count_gain, a
+    # per-head gain on log B_j) goes to AdamW instead of being frozen.
+    # The two step sizes are not comparable: Muon's update has RMS
+    # lr * muon_rms whatever the gradient is, AdamW's is about lr
+    # whatever the weight is. count_gain starts at the exact coefficient
+    # 1.0, so 0.1 of a Muon lr of 1e-2 gives it a 0.1% relative change
+    # per update, a refinement rather than a search.
+    muon_aux_lr_scale: float = 0.1
     betas: tuple[float, float] = (0.9, 0.95)
     weight_decay: float = 0.0
     grad_clip: float = 1.0
@@ -208,6 +217,9 @@ class TrainConfig:
         return cls(**raw)
 
     def validate(self) -> None:
+        if self.optimizer == 'muon' and self.muon_aux_lr_scale < 0:
+            raise ValueError('muon_aux_lr_scale must be >= 0: '
+                             f'{self.muon_aux_lr_scale}')
         if self.transport_weight < 0:
             raise ValueError('transport_weight must be >= 0: '
                              f'{self.transport_weight}')
@@ -295,34 +307,6 @@ def learning_rate(config: TrainConfig, step: int) -> float:
     done = min(1.0, max(0.0, done))
     cosine = 0.5 * (1.0 + math.cos(math.pi * done))
     return lr * (config.lr_min_ratio + (1.0 - config.lr_min_ratio) * cosine)
-
-
-def _require_matrix_params(
-        named: collections.abc.Sequence[
-            tuple[str, torch.nn.Parameter]]) -> None:
-    """Rejects 1-D trainables before Muon gets a chance to.
-
-    Group names stopped being enough when Veda2 added `count_gain`, which
-    is [num_heads] and sits inside the 'predictor' group: the group-level
-    check passes, and Muon's own shape check then fires several minutes
-    in, after the 33B of weights have loaded, saying only
-    `got shape (56,)`. This says which parameter and what to do instead.
-
-    Args:
-        named: The trainable (name, parameter) pairs the optimizer will own.
-
-    Raises:
-        ValueError: If any trainable parameter has fewer than two dims.
-    """
-    flat = [(n, p) for n, p in named if p.requires_grad and p.ndim < 2]
-    if not flat:
-        return
-    name, param = flat[0]
-    raise ValueError(
-        f'optimizer muon cannot train {len(flat)} non-matrix parameters, '
-        f'e.g. {name} with shape {tuple(param.shape)}: Muon orthogonalizes '
-        'matrices. Set freeze_count_gain: true to hold them at their '
-        'initialisation, or use optimizer: adamw.')
 
 
 class Trainer:
@@ -441,11 +425,31 @@ class Trainer:
                 raise ValueError(
                     f'optimizer muon needs a predictor-only run; this one '
                     f'also trains {sorted(non_matrix)}')
-            _require_matrix_params(self.opt_params)
-            self.optimizer = muon.Muon(
-                groups['predictor'], lr=config.lr,
-                momentum=config.muon_momentum, rms_target=config.muon_rms,
-                weight_decay=config.weight_decay)
+            # Split by shape, not by group name. Muon orthogonalizes
+            # matrices and refuses 1-D tensors, and Veda2 put one inside
+            # the predictor group: count_gain, [num_heads]. Freezing it
+            # was the first fix and it works, but the parameter has a
+            # real job, so route it to AdamW instead and keep it
+            # trainable. `freeze_count_gain` stays available for a run
+            # that wants the closed form held exactly.
+            matrices = [p for p in groups['predictor'] if p.ndim >= 2]
+            flat = [p for p in groups['predictor'] if p.ndim < 2]
+            parts: list[torch.optim.Optimizer] = [muon.Muon(
+                matrices, lr=config.lr, momentum=config.muon_momentum,
+                rms_target=config.muon_rms,
+                weight_decay=config.weight_decay)]
+            if flat:
+                parts.append(torch.optim.AdamW(
+                    [{'params': flat, 'name': 'predictor_flat',
+                      'lr_scale': config.muon_aux_lr_scale}],
+                    lr=config.lr * config.muon_aux_lr_scale,
+                    betas=config.betas,
+                    weight_decay=config.weight_decay))
+                progress.log(f'optimizer muon: {len(matrices)} matrix '
+                             f'tensors on Muon, {len(flat)} non-matrix on '
+                             f'AdamW at {config.muon_aux_lr_scale}x lr')
+            self.optimizer = (parts[0] if len(parts) == 1
+                              else optim.Hybrid(parts))
         else:
             self.optimizer = torch.optim.AdamW(
                 [{'params': ps, 'name': g} for g, ps in groups.items()],
@@ -687,7 +691,10 @@ class Trainer:
                  for name, params in self.clip_groups.items()})
             lr = learning_rate(config, self.step)
             for group in self.optimizer.param_groups:
-                group['lr'] = lr
+                # A hybrid run has two step-size conventions in one
+                # optimizer, so the schedule sets a base and each group
+                # keeps its own ratio to it.
+                group['lr'] = lr * group.get('lr_scale', 1.0)
             if self.masters is not None:
                 self.masters.pull_grads()
             diagnostics = (self.monitor.before_step()

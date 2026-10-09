@@ -43,16 +43,16 @@ count_term: true
 # so_q and so_k, so a step size tuned for the base projections runs it
 # away. Only the base projections move.
 freeze_second_order: true
-# Muon orthogonalizes matrices and refuses 1-D tensors, and count_gain is
-# [num_heads] -- the predictor's only non-matrix parameter, added by
-# Veda2. Holding it at its closed-form 1.0 costs about 1e-5 of the
-# capacity (56 scalars a layer against 2 * 56 * 384 * 128 matrix
-# entries), and every geometry here has real log B spread for it to act
-# on anyway. So what trains is proj_q and proj_k alone, which is exactly
-# the parameterisation Veda1 is known to converge on, and that makes this
-# the cleanest form of the question: can a learned projection beat the
-# closed form?
-freeze_count_gain: true
+# count_gain stays trainable. It is [num_heads], the predictor's only
+# non-matrix parameter, so Muon cannot own it -- but AdamW can, and the
+# optimizer now routes by shape instead of refusing (train.optim.Hybrid).
+# Its own learning rate is muon_aux_lr_scale x the base, because the two
+# conventions are not comparable: Muon's step has RMS lr * muon_rms
+# whatever the gradient is, AdamW's is about lr whatever the weight is.
+# The gain starts at the exact coefficient 1.0, so 1e-3 is a 0.1%
+# relative change per update -- refinement, not search.
+freeze_count_gain: false
+muon_aux_lr_scale: 0.1
 # Mass, not peak. The transport value of a block set is its summed
 # exponentiated score; a block maximum is not a mass, and the trainer
 # refuses the combination rather than quietly using the wrong target.

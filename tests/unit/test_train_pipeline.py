@@ -14,6 +14,10 @@ from miowtion.h3 import schedule as h3_schedule
 from miowtion.train import adaln
 from miowtion.train import checkpoint
 from miowtion.train import data
+from miowtion.train import muon as muon_lib
+from miowtion.train import optim as optim_lib
+from miowtion.train import muon as muon_lib
+from miowtion.train import optim as optim_lib
 from miowtion.train import trainer as trainer_lib
 from miowtion.train import trajectory
 
@@ -722,27 +726,43 @@ def test_transport_config_on_disk_is_loadable():
     assert config.freeze_second_order is True
 
 
-def test_muon_refuses_non_matrix_predictor_parameters_by_name():
-    """The guard has to name the parameter and the way out.
+def test_hybrid_splits_by_shape_and_keeps_its_own_lr_ratio():
+    """Muon cannot own a 1-D parameter, so AdamW does, and still trains.
 
     Veda2's count_gain is [num_heads], the predictor's only non-matrix
-    parameter, and it sits inside the 'predictor' parameter group. So a
-    group-level check passes and Muon's own shape check fires minutes
-    into a run, after the 33B of weights have loaded. That happened; the
-    message said only 'got shape (56,)'.
+    tensor, and it sits inside the 'predictor' parameter group. The first
+    Muon arm died four minutes in on Muon's own shape check, after the
+    weights had loaded. Freezing it was the first fix; routing it is the
+    one that keeps the parameter.
     """
-    matrices = [('layers.0.proj_q', torch.nn.Parameter(torch.zeros(4, 8, 8)))]
-    trainer_lib._require_matrix_params(matrices)        # no raise
+    matrix = torch.nn.Parameter(torch.randn(3, 8, 8))
+    gain = torch.nn.Parameter(torch.ones(3))
+    hybrid = optim_lib.Hybrid([
+        muon_lib.Muon([matrix], lr=1e-2),
+        torch.optim.AdamW([{'params': [gain], 'lr_scale': 0.1}], lr=1e-3)])
 
-    gain = torch.nn.Parameter(torch.ones(56))
-    with pytest.raises(ValueError) as caught:
-        trainer_lib._require_matrix_params(
-            matrices + [('layers.0.count_gain', gain)])
-    message = str(caught.value)
-    assert 'count_gain' in message and '(56,)' in message
-    assert 'freeze_count_gain' in message      # the way out, not just the no
+    # One schedule, two conventions: each group keeps its ratio to the base.
+    for group in hybrid.param_groups:
+        group['lr'] = 5e-3 * group.get('lr_scale', 1.0)
+    assert [g['lr'] for g in hybrid.param_groups] == [5e-3, 5e-4]
 
-    # A frozen one is not the optimizer's problem.
-    gain.requires_grad_(False)
-    trainer_lib._require_matrix_params(
-        matrices + [('layers.0.count_gain', gain)])
+    before = (matrix.detach().clone(), gain.detach().clone())
+    matrix.grad = torch.randn_like(matrix)
+    gain.grad = torch.randn_like(gain)
+    hybrid.step()
+    assert not torch.equal(matrix.detach(), before[0])
+    assert not torch.equal(gain.detach(), before[1]), 'the gain must train'
+    # Muon's diagnostics have to survive the wrapper: they are the only
+    # measured read on whether the step size is what the config asked for.
+    assert hybrid.last_update_rms() > 0
+
+    # The checkpoint assigns into optimizer.state, so it has to land in
+    # the optimizer that will step that parameter, not in the first one.
+    hybrid.state[gain] = {'probe': 1}
+    assert hybrid.state[gain] == {'probe': 1}
+    assert gain in hybrid.state and matrix in hybrid.state
+
+
+def test_hybrid_rejects_an_empty_split():
+    with pytest.raises(ValueError, match='at least one'):
+        optim_lib.Hybrid([])
