@@ -100,6 +100,15 @@ def main():
         raise KeyError(f'{args.checkpoint} holds no {_PREFIX}* tensors')
     shape = weights[f'{_PREFIX}layers.0.proj_q'].shape  # [heads, 3D, D]
     num_layers = sum(1 for k in weights if k.endswith('.proj_q'))
+    # Veda2 added two optional heads. They are in the checkpoint's
+    # tensors but were not in the bundle's metadata, so the loader
+    # rejected a bundle this script had just written -- the keys were
+    # present and undeclared. Read them off the weights instead of
+    # taking a flag, so the metadata cannot disagree with the payload.
+    so_key = f'{_PREFIX}layers.0.so_q'
+    second_order_rank = (weights[so_key].shape[-1] if so_key in weights
+                         else 0)
+    count_term = f'{_PREFIX}layers.0.count_gain' in weights
     plans = veda_plan.PlanTable.load_dir(args.plan_dir)
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     veda_bundle.save(args.out, weights, plans, num_layers=num_layers,
@@ -113,6 +122,8 @@ def main():
                                      if args.leap is not None else
                                      'ema' if args.ema else 'live'),
                      step=int(payload['step']),
+                     second_order_rank=second_order_rank,
+                     count_term=count_term,
                      dtype=veda_bundle.DTYPES[args.dtype])
     size = os.path.getsize(args.out) / 1024 ** 3
     progress.log(f'wrote {args.out}: {size:.2f} GiB, {num_layers} layers x '

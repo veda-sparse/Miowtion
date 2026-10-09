@@ -219,7 +219,11 @@ def main():
     cache = data.SampleCache(cfg.sample_cache)
     rows, overlaps, churn = [], [], []
     for sample_id in cfg.sample_id:
-        sample = cache.sample(sample_id)
+        by_id = {s.id: s for s in cache.samples}
+        if sample_id not in by_id:
+            raise SystemExit(f'{sample_id} is not in '
+                             f'{cfg.sample_cache}')
+        sample = by_id[sample_id]
         for geometry in cfg.geometry:
             geo = data.parse_geometry(geometry)
             traj = traj_lib.Trajectory(tch.model, cache, sample, geo,

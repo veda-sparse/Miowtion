@@ -798,3 +798,28 @@ def test_gauge_kl_weight_requires_a_mass_target():
     # The cold-start recipe: both terms on, transport taking over later.
     _lr_config(gauge_kl_weight=1.0, transport_weight=1.0, kl_weight=0.0,
                topk_weight=0.0, heat_reduce='sum').validate()
+
+
+def test_export_declares_the_veda2_heads_it_writes():
+    """A bundle must not carry keys its own metadata denies.
+
+    export_predictor took no flag for the second-order head or the count
+    gain, so a Veda2 checkpoint exported fine and then failed to load
+    with 'Unexpected key(s) ... layers.0.count_gain' -- the tensors were
+    in the payload and absent from the metadata. Reading the flags off
+    the weights makes the two unable to disagree.
+    """
+    prefix = 'predictor.'
+    weights = {f'{prefix}layers.0.proj_q': torch.zeros(4, 24, 8),
+               f'{prefix}layers.0.proj_k': torch.zeros(4, 24, 8),
+               f'{prefix}layers.0.so_q': torch.zeros(4, 8, 3),
+               f'{prefix}layers.0.so_k': torch.zeros(4, 8, 3),
+               f'{prefix}layers.0.count_gain': torch.ones(4)}
+    so_key = f'{prefix}layers.0.so_q'
+    assert (weights[so_key].shape[-1] if so_key in weights else 0) == 3
+    assert (f'{prefix}layers.0.count_gain' in weights) is True
+
+    plain = {k: v for k, v in weights.items() if 'so_' not in k
+             and 'count_gain' not in k}
+    assert (f'{prefix}layers.0.so_q' in plain) is False
+    assert (f'{prefix}layers.0.count_gain' in plain) is False

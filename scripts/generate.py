@@ -280,6 +280,21 @@ def _denoise_all(args, env, cache, jobs, devices, assigned) -> list[dict]:
         offload_blocks=args.offload_blocks, prefetch=args.prefetch,
         mlp_chunk_rows=args.mlp_chunk_rows)
     plans = predictor = veda_config = None
+    # The oracle modes are tiled like veda and need the same plan and
+    # budget, but deliberately have no predictor: they mask by the
+    # teacher's own statistic. So the plan/budget setup cannot be gated
+    # on 'veda' alone.
+    oracle_modes = [m for m in args.attention if m.startswith('oracle_')]
+    if oracle_modes and 'veda' not in args.attention:
+        if not args.plan_dir:
+            raise ValueError(f'{oracle_modes[0]} needs --plan-dir')
+        plans = veda_plan.PlanTable.load_dir(args.plan_dir)
+        veda_config = veda_attention.VedaConfig(
+            target_budget=_budget(args.keep_ratio, args.keep_tiles),
+            ref_budget=_budget(args.ref_keep_ratio, args.ref_keep_tiles),
+            tile_conditions=args.tile_conditions,
+            collect_bytes=args.veda_collect_mib * 2**20)
+        source = f'plans {args.plan_dir}, oracle masks (no predictor)'
     if 'veda' in args.attention:
         if args.predictor:
             loaded = veda_bundle.load(args.predictor, devices[0])
