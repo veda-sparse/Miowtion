@@ -244,8 +244,7 @@ def _gather_lse(lse: torch.Tensor, tile_layout: tiling.TileLayout,
 
 # Diagnostic fields of LayerStats, in the order resolve() transfers them.
 _STAT_FIELDS = ('kl', 'topk_bce', 'transport', 'logit_std', 'recall',
-                'heat_kept',
-                'heat_ceiling')
+                'heat_kept', 'heat_ceiling', 'retained')
 
 
 @dataclasses.dataclass
@@ -263,6 +262,7 @@ class LayerStats:
     kl: list[torch.Tensor] = dataclasses.field(default_factory=list)
     topk_bce: list[torch.Tensor] = dataclasses.field(default_factory=list)
     transport: list[torch.Tensor] = dataclasses.field(default_factory=list)
+    retained: list[torch.Tensor] = dataclasses.field(default_factory=list)
     logit_std: list[torch.Tensor] = dataclasses.field(default_factory=list)
     recall: list[torch.Tensor] = dataclasses.field(default_factory=list)
     heat_kept: list[torch.Tensor] = dataclasses.field(default_factory=list)

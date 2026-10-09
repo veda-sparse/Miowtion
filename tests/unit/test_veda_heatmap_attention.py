@@ -742,3 +742,30 @@ def test_transport_loss_ignores_empty_key_tiles_and_empty_rows():
     heat[:, 0] = 0.0
     assert torch.isfinite(
         heatmap.transport_loss(logits, heat, lay, blocks, rows))
+
+
+def test_retained_diagnostic_is_the_objective_on_the_hard_selection():
+    """mask_diagnostics must report the quantity the loss optimises.
+
+    `transport_loss` at tau -> 0 is minus the share of the attainable
+    off-diagonal mass the selection holds. Reporting `heat_kept /
+    heat_ceiling` instead reports a near-twin: it keeps the forced
+    diagonal, which is a kernel rule rather than a predictor decision,
+    and it is a ratio of row-averaged shares rather than a mean of
+    per-row ratios. Measured over 360 tiles with log-normal block mass
+    the two rank predictors at Spearman 0.9997 within one clip but only
+    0.9937 once the diagonal's mass share varies between clips. So this
+    reports both, and `retained` is the one the loss is about.
+    """
+    lay, blocks, rows, heat, logits = _transport_case(seed=9, heads=3)
+    got = heatmap.mask_diagnostics(logits, heat, lay, blocks, rows)
+    want = -float(heatmap.transport_loss(logits, heat, lay, blocks, rows,
+                                         temperature=1e-4))
+    assert float(got['retained']) == pytest.approx(want, abs=1e-4)
+    # The oracle's own scores retain all of the attainable mass.
+    n_video = lay.n_video_tiles
+    perfect = heat.clone()
+    perfect[:, :, :n_video] = heat[:, :, :n_video]
+    assert float(heatmap.mask_diagnostics(
+        perfect, heat, lay, blocks, rows)['retained']) == \
+        pytest.approx(1.0, abs=1e-5)

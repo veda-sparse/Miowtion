@@ -422,6 +422,11 @@ def mask_diagnostics(logits: torch.Tensor, heat: torch.Tensor,
             most any predictor could keep at this budget. A low ceiling
             means the teacher itself is not concentrated enough for the
             budget, which no amount of training can fix.
+        retained: the share of the *attainable* off-diagonal mass the
+            prediction holds, as a mean of per-row ratios. This is
+            exactly `-transport_loss` in the zero-temperature limit, so
+            it is the training objective measured on the hard selection
+            rather than a proxy for it. 1.0 is the oracle's own choice.
     """
     n_video = layout.n_video_tiles
     pred = veda_mask.select_video_blocks(logits, layout, blocks, q_tiles)
@@ -449,5 +454,22 @@ def mask_diagnostics(logits: torch.Tensor, heat: torch.Tensor,
     # No Python branch on `possible`: that would synchronize.
     recall = torch.where(possible > 0, found / possible.clamp(min=1),
                          torch.nan)
+    # The hard-selection twin of transport_loss: off-diagonal, and a mean
+    # of per-row ratios rather than a ratio of row-averaged shares. The
+    # two differences sound pedantic and are not. The forced diagonal is
+    # a kernel rule, so including it credits the predictor for a decision
+    # it did not make, and how much mass it holds is a property of the
+    # clip -- which is what makes heat_kept / heat_ceiling less
+    # comparable across clips than the objective is. Measured, over 360
+    # tiles with log-normal block mass: the two agree to Spearman 0.9997
+    # within a clip and fall to 0.9937 once the diagonal's share varies
+    # between clips (3.1% of pairwise comparisons invert).
+    off_mass = video_heat.masked_fill(diag, 0.0)
+    off_ceiling = (off_mass * oracle_off).sum(-1)
+    off_rows = off_ceiling > 0
+    per_row = ((off_mass * pred_off).sum(-1)
+               / off_ceiling.clamp(min=tiny))
+    retained = ((per_row * off_rows).sum()
+                / off_rows.sum().clamp(min=1))
     return {'recall': recall, 'heat_kept': share(pred_set),
-            'heat_ceiling': share(oracle_set)}
+            'heat_ceiling': share(oracle_set), 'retained': retained}

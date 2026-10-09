@@ -643,7 +643,7 @@ class Trainer:
         stats['kl'].append(sum(resolved['kl']) / num_layers)
         stats['kl_layers'].append(resolved['kl'])
         for name in ('topk_bce', 'transport', 'logit_std', 'recall',
-                     'heat_kept', 'heat_ceiling'):
+                     'heat_kept', 'heat_ceiling', 'retained'):
             # A zero-weighted loss records nothing, so the key is absent.
             stats[name] += resolved.get(name, [])
         progress.log(f'  update {self.step + 1}/{self.config.steps} micro '
@@ -676,7 +676,7 @@ class Trainer:
             stats = {name: [] for name in
                      ('kl', 'kl_layers', 'topk_bce', 'transport',
                       'logit_std', 'recall', 'heat_kept',
-                      'heat_ceiling', 'mse')}
+                      'heat_ceiling', 'retained', 'mse')}
             for _ in range(config.accum):
                 self._micro_step(stats)
             replicated = [p for n, p in self.trainable
@@ -762,7 +762,7 @@ class Trainer:
             record['update_rms'] = round(self.optimizer.last_update_rms(), 5)
             record['update_align'] = round(self.optimizer.last_alignment(), 4)
         for name in ('topk_bce', 'transport', 'heat_kept', 'heat_ceiling',
-                     'logit_std'):
+                     'retained', 'logit_std'):
             if stats[name]:
                 record[name] = round(self._reduce_mean(stats[name]), 5)
         # The geometry-normalized one. heat_kept alone is not comparable
@@ -787,8 +787,8 @@ class Trainer:
     def _progress_line(self, record: dict) -> str:
         """The short status: the loss, and the thing the kernel reads."""
         parts = [f"kl {record.get('kl', float('nan')):.4f}"]
-        for key, fmt in (('transport', '.5f'), ('recall', '.3f'),
-                         ('kept_over_ceiling', '.4f')):
+        for key, fmt in (('transport', '.5f'), ('retained', '.4f'),
+                         ('recall', '.3f'), ('kept_over_ceiling', '.4f')):
             if key in record:
                 parts.append(f'{key} {record[key]:{fmt}}')
         return '  '.join(parts)
