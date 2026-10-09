@@ -113,6 +113,11 @@ class TrainConfig:
     abort_window: int = 8
     abort_patience: int = 20
     abort_metric: str = 'kept_over_ceiling'
+    # Falls below the starting trailing mean by this much and the run
+    # stops, whatever its age. This is the criterion that catches what
+    # actually went wrong here, and unlike patience it is safe on a long
+    # run. Give at least one of the two.
+    abort_max_drop: float = 0.05
     # 'max' distils against the block's peak probability (Veda1), 'sum'
     # against its attention mass. Mass is what determines the output
     # error, and it is also what the predictor's own initialization
@@ -591,9 +596,11 @@ class Trainer:
         config = self.config
         self._updates = progress.Progress('updates', config.steps - self.step)
         abort = (monitor_lib.EarlyAbort(config.abort_window,
-                                    config.abort_patience,
-                                    config.abort_metric)
-                 if config.abort_patience else None)
+                                        config.abort_patience,
+                                        config.abort_metric,
+                                        config.abort_max_drop)
+                 if (config.abort_patience or config.abort_max_drop)
+                 else None)
         while self.step < config.steps:
             start = time.time()
             stats = {name: [] for name in

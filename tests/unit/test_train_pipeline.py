@@ -620,7 +620,7 @@ def test_early_abort_waits_for_a_full_window_and_ignores_gaps():
     with pytest.raises(ValueError, match='window must be'):
         monitor.EarlyAbort(window=0)
     with pytest.raises(ValueError, match='patience must be'):
-        monitor.EarlyAbort(patience=0)
+        monitor.EarlyAbort(patience=-1)
 
 
 def test_kl_weight_zero_leaves_the_bce_alone():
@@ -659,3 +659,34 @@ def test_the_abort_guard_is_on_by_default():
     assert config.abort_metric == 'kept_over_ceiling'
     # Disabling it is still possible, but a config has to say so.
     assert _lr_config(abort_patience=0).abort_patience == 0
+
+
+def test_early_abort_catches_divergence_regardless_of_age():
+    """max_drop is the criterion that matches the observed failures."""
+    from miowtion.train import monitor
+    abort = monitor.EarlyAbort(window=4, patience=0, max_drop=0.05)
+    # A long flat stretch must not fire, however long it is.
+    for _ in range(100):
+        assert abort.update({'kept_over_ceiling': 0.92}) is None
+    # A real fall does, immediately.
+    reasons = [abort.update({'kept_over_ceiling': 0.80}) for _ in range(4)]
+    assert any(r and 'diverging' in r for r in reasons)
+
+
+def test_early_abort_needs_at_least_one_criterion():
+    from miowtion.train import monitor
+    with pytest.raises(ValueError, match='at least one of'):
+        monitor.EarlyAbort(patience=0, max_drop=0.0)
+    # Patience alone, or max_drop alone, are both fine.
+    monitor.EarlyAbort(patience=10, max_drop=0.0)
+    monitor.EarlyAbort(patience=0, max_drop=0.05)
+
+
+def test_patience_zero_lets_a_long_flat_run_continue():
+    """The case that cut run (1) at 50 updates when it was only flat."""
+    from miowtion.train import monitor
+    abort = monitor.EarlyAbort(window=8, patience=0, max_drop=0.05)
+    values = [0.9343, 0.9335, 0.9238, 0.9290, 0.9128, 0.9127, 0.9196,
+              0.9210, 0.9150, 0.9173, 0.9112, 0.9119, 0.9197, 0.9224]
+    for v in values * 4:
+        assert abort.update({'kept_over_ceiling': v}) is None

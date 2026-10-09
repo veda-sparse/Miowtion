@@ -35,24 +35,27 @@ freeze_second_order: true
 heat_reduce: sum
 kl_weight: 0.0
 topk_weight: 1.0
-# Looser than the default, deliberately. With lr this low the base
-# projections take hundreds of updates to reach a useful scale, so an
-# early dip is the journey and not the verdict. The guard is here for a
-# runaway, which this parameterisation has already shown it can do.
+# Patience off, max_drop on. 'No improvement' cut a previous run at 50
+# updates when it was merely flat: at these learning rates the base
+# projections need hundreds of updates to reach a useful scale, so a
+# plateau early on is the journey, not the verdict. Divergence is the
+# failure that actually happened, twice, and it does not care how old the
+# run is. 0.12 is double the deepest legitimate dip measured here
+# (0.061 by update 11 at this lr), so only a runaway trips it.
 abort_window: 8
-abort_patience: 30
+abort_patience: 0
+abort_max_drop: 0.12
 accum: 4
 steps: 400
-# Adam's step is about lr whatever the parameter's own scale, and these
-# projections are initialised at 1e-4 while the released trained ones sit
-# at 1.15e-2. At lr 1e-3 that is a 10x relative change per update: the
-# base travelled its whole useful range in 12 updates, overwriting the
-# zero-order estimator it starts as with 12 updates' worth of noise.
-# Veda1 could afford that because it ran 600 updates from a warm start.
-# At 1e-4, 400 updates cover about 4x the useful scale: enough to learn
-# something, slow enough to refine the initialisation rather than erase
-# it.
-lr: 1.0e-4
+# Back to Veda1's own learning rate, and for its reason: that recipe is
+# known to converge, over 600 updates. 1e-4 was tried first on the theory
+# that it would refine the closed-form initialisation rather than
+# overwrite it, and over 50 updates it moved nothing at all -- every
+# geometry flat to within 0.01 of where it started. So the choice is not
+# between refining and overwriting, it is between learning a projection
+# and keeping the closed form, and only the full journey answers that.
+# The early dip (0.061 of kept_over_ceiling by update 11) is part of it.
+lr: 1.0e-3
 warmup: 20
 save_every: 25
 keep_optimizer: 1

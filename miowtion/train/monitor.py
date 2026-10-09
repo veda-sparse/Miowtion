@@ -105,22 +105,46 @@ class EarlyAbort:
     plausible improvement. A window of twice the geometry count sees each
     geometry about twice.
 
+    Two criteria, and they are for different jobs.
+
+    `max_drop` catches divergence: the metric has fallen below its own
+    starting value by more than this. That is what every failure here
+    actually looked like, and it does not care how long the run has been
+    going.
+
+    `patience` catches a plateau: no new best trailing mean for this many
+    updates. It is only safe on a short diagnostic run. On a long one it
+    cuts the journey rather than the destination: at lr 1e-4 the base
+    projections need hundreds of updates to reach a useful scale, and a
+    50-update run read as 'no improvement' when it had not yet had the
+    chance. Set it to 0 on a long run and rely on `max_drop`.
+
     Attributes:
         window: Updates per trailing mean.
-        patience: Updates without a new best trailing mean before aborting.
+        patience: Updates without a new best trailing mean before
+            aborting; 0 disables that criterion.
+        max_drop: Fall below the first trailing mean that aborts on its
+            own; 0 disables that criterion.
         metric: Record field to watch; larger is better.
     """
 
     def __init__(self, window: int = 8, patience: int = 10,
-                 metric: str = 'kept_over_ceiling'):
+                 metric: str = 'kept_over_ceiling', max_drop: float = 0.0):
         if window < 1:
             raise ValueError(f'window must be >= 1: {window}')
-        if patience < 1:
-            raise ValueError(f'patience must be >= 1: {patience}')
+        if patience < 0:
+            raise ValueError(f'patience must be >= 0: {patience}')
+        if max_drop < 0:
+            raise ValueError(f'max_drop must be >= 0: {max_drop}')
+        if not patience and not max_drop:
+            raise ValueError('give at least one of patience or max_drop; '
+                             'a guard with neither never fires')
         self.window = window
         self.patience = patience
+        self.max_drop = max_drop
         self.metric = metric
         self._history: list[float] = []
+        self._first: float | None = None
         self._best: float | None = None
         self._best_at = 0
 
@@ -142,10 +166,17 @@ class EarlyAbort:
             return None
         trailing = sum(self._history[-self.window:]) / self.window
         step = len(self._history)
+        if self._first is None:
+            self._first = trailing
+        if self.max_drop and self._first - trailing > self.max_drop:
+            return (f'{self.metric} is diverging: trailing mean over '
+                    f'{self.window} is {trailing:.4f}, '
+                    f'{self._first - trailing:.4f} below its starting '
+                    f'value {self._first:.4f} (limit {self.max_drop})')
         if self._best is None or trailing > self._best:
             self._best, self._best_at = trailing, step
             return None
-        if step - self._best_at >= self.patience:
+        if self.patience and step - self._best_at >= self.patience:
             return (f'{self.metric} has not improved for '
                     f'{step - self._best_at} updates: trailing mean over '
                     f'{self.window} is {trailing:.4f} against a best of '
