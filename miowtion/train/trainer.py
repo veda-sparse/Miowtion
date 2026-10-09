@@ -100,12 +100,18 @@ class TrainConfig:
     # been answered yet -- whether training the base against the right
     # target and features moves the predictor towards the oracle.
     freeze_second_order: bool = False
-    # Stop a run that is not improving instead of paying for the rest. 0
-    # disables it. See train.monitor.EarlyAbort: the comparison is between
-    # trailing means, because the watched metric is not comparable across
-    # the cycled geometries.
+    # Stop a run that is not improving instead of paying for the rest.
+    # On by default, and deliberately so: a Veda2 run degraded for 59
+    # updates before anyone looked, which was an hour of GPU spent on a
+    # result that was visible by update 20. Set abort_patience to 0 to
+    # disable, which is a choice a config now has to make out loud.
+    # See train.monitor.EarlyAbort: the comparison is between trailing
+    # means, because the watched metric is not comparable across the
+    # cycled geometries, so single updates swing more than progress does.
+    # Patience 20 with window 8 tolerates a long plateau; it is there to
+    # catch a decline, not to prune a slow run.
     abort_window: int = 8
-    abort_patience: int = 0
+    abort_patience: int = 20
     abort_metric: str = 'kept_over_ceiling'
     # 'max' distils against the block's peak probability (Veda1), 'sum'
     # against its attention mass. Mass is what determines the output

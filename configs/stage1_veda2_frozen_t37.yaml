@@ -35,7 +35,8 @@ freeze_second_order: true
 heat_reduce: sum
 kl_weight: 0.0
 topk_weight: 1.0
-# Stop rather than spend five hours proving it again.
+# Tighter than the default 20: this run is a question, not a product, and
+# the answer is visible inside 20 updates either way.
 abort_window: 8
 abort_patience: 10
 accum: 4

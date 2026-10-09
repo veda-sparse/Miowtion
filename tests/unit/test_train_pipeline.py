@@ -646,3 +646,16 @@ def test_freeze_second_order_removes_only_that_head():
     assert len(names) - len(kept) == 4           # two layers x so_q, so_k
     assert any(n.endswith('count_gain') for n in kept)
     assert any(n.endswith('proj_q') for n in kept)
+
+
+def test_the_abort_guard_is_on_by_default():
+    """A run that is not improving must stop without anyone remembering.
+
+    It was off by default once, and a degrading run cost an hour.
+    """
+    config = _lr_config()
+    assert config.abort_patience > 0
+    assert config.abort_window > 0
+    assert config.abort_metric == 'kept_over_ceiling'
+    # Disabling it is still possible, but a config has to say so.
+    assert _lr_config(abort_patience=0).abort_patience == 0
