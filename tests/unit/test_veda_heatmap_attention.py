@@ -769,3 +769,79 @@ def test_retained_diagnostic_is_the_objective_on_the_hard_selection():
     assert float(heatmap.mask_diagnostics(
         perfect, heat, lay, blocks, rows)['retained']) == \
         pytest.approx(1.0, abs=1e-5)
+
+
+# --- the gauge-fixed forward KL -------------------------------------------
+
+
+def test_gauge_fixed_kl_is_zero_at_the_truth_and_gauge_invariant():
+    """Both halves of the construction are load-bearing.
+
+    Standardising removes the gauge; transporting onto the teacher's own
+    scale puts the loss's zero at the truth. Fixing to unit variance
+    instead would leave an irreducible offset, because the teacher is
+    generally not in the family {softmax(z) : std(z) = 1} -- measured at
+    0.291 -- and an irreducible offset is what made the raw BCE useless.
+    """
+    lay, blocks, rows, heat, logits = _transport_case(seed=4, heads=3)
+    n_video = lay.n_video_tiles
+    truth = heat.clone()
+    truth[:, :, :n_video] = heat[:, :, :n_video].clamp(min=1e-20).log()
+    assert float(heatmap.gauge_fixed_kl(truth, heat, lay, rows)) == \
+        pytest.approx(0.0, abs=1e-6)
+    shift = torch.arange(rows.numel(), dtype=logits.dtype)[None, :, None]
+    for moved in (truth + 7.0, truth * 3.0, truth * 0.01,
+                  truth * 5.0 + shift * 100.0):
+        assert float(heatmap.gauge_fixed_kl(moved, heat, lay, rows)) == \
+            pytest.approx(0.0, abs=1e-6)
+    # And it is positive and larger the worse the ordering is.
+    worse = float(heatmap.gauge_fixed_kl(logits, heat, lay, rows))
+    assert worse > 1e-3
+    assert float(heatmap.gauge_fixed_kl(-truth, heat, lay, rows)) > worse
+
+
+def test_gauge_fixed_kl_spreads_its_gradient_wider_than_transport():
+    """This is the only reason to keep it next to transport_loss.
+
+    transport_loss concentrates its gradient at the rank-k cut, which is
+    right near a good solution and wrong far from one: a badly ordered
+    row gets little signal about blocks far from its own boundary. At
+    realistic size the effect is large -- 90% of transport's gradient
+    weight sits on about 58 blocks out of 360. The KL's gradient is a
+    plan mismatch, so it is spread over the row, and the ordering of the
+    two concentrations is visible even on this six-tile fixture.
+    """
+    lay, blocks, rows, heat, logits = _transport_case(seed=6, heads=2)
+    n_video = lay.n_video_tiles
+
+    def concentration(loss_fn):
+        x = logits.clone().requires_grad_(True)
+        loss_fn(x).backward()
+        g = x.grad[:, :, :n_video].abs()
+        ranked = g.sort(-1, descending=True).values
+        share = (ranked[..., :2].sum(-1)
+                 / ranked.sum(-1).clamp(min=1e-30)).mean()
+        return float(share), float(x.grad.sum().abs())
+
+    kl_share, kl_sum = concentration(
+        lambda x: heatmap.gauge_fixed_kl(x, heat, lay, rows))
+    tr_share, tr_sum = concentration(
+        lambda x: heatmap.transport_loss(x, heat, lay, blocks, rows))
+    assert kl_share < tr_share, (kl_share, tr_share)
+    # Both still live on the gauge slice: the column sums vanish, so
+    # neither can be reduced by shifting or rescaling a row.
+    assert kl_sum < 1e-5 and tr_sum < 1e-5
+
+
+def test_gauge_fixed_kl_ignores_excluded_columns_and_empty_rows():
+    lay, blocks, rows, heat, logits = _transport_case(seed=8)
+    lay.kv_ok[1] = False
+    base = float(heatmap.gauge_fixed_kl(logits, heat, lay, rows))
+    moved = logits.clone()
+    moved[:, :, 1] = 500.0
+    assert float(heatmap.gauge_fixed_kl(moved, heat, lay, rows)) == \
+        pytest.approx(base, rel=1e-6)
+    heat = heat.clone()
+    heat[:, 0] = 0.0
+    # 0 * log 0 drops out of a divergence; it must not become NaN.
+    assert torch.isfinite(heatmap.gauge_fixed_kl(logits, heat, lay, rows))

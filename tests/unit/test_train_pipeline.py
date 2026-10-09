@@ -788,3 +788,13 @@ def test_muon_diagnostics_survive_the_hybrid_wrapper():
     # AdamW alone has neither, so the record skips them.
     assert not hasattr(torch.optim.AdamW([matrix], lr=1e-3),
                        'last_update_rms')
+
+
+def test_gauge_kl_weight_requires_a_mass_target():
+    with pytest.raises(ValueError, match='gauge_kl_weight needs'):
+        _lr_config(gauge_kl_weight=1.0, heat_reduce='max').validate()
+    with pytest.raises(ValueError, match='gauge_kl_weight must be'):
+        _lr_config(gauge_kl_weight=-1.0, heat_reduce='sum').validate()
+    # The cold-start recipe: both terms on, transport taking over later.
+    _lr_config(gauge_kl_weight=1.0, transport_weight=1.0, kl_weight=0.0,
+               topk_weight=0.0, heat_reduce='sum').validate()

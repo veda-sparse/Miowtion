@@ -75,6 +75,7 @@ class VedaConfig:
 
     heat_reduce: str = 'max'
     transport_weight: float = 0.0
+    gauge_kl_weight: float = 0.0
     kl_weight: float = 1.0
     kl_direction: str = 'forward'
     target_budget: veda_mask.Budget = veda_mask.Budget(ratio=0.1)
@@ -244,7 +245,7 @@ def _gather_lse(lse: torch.Tensor, tile_layout: tiling.TileLayout,
 
 # Diagnostic fields of LayerStats, in the order resolve() transfers them.
 _STAT_FIELDS = ('kl', 'topk_bce', 'transport', 'logit_std', 'recall',
-                'heat_kept', 'heat_ceiling', 'retained')
+                'gauge_kl', 'heat_kept', 'heat_ceiling', 'retained')
 
 
 @dataclasses.dataclass
@@ -262,6 +263,7 @@ class LayerStats:
     kl: list[torch.Tensor] = dataclasses.field(default_factory=list)
     topk_bce: list[torch.Tensor] = dataclasses.field(default_factory=list)
     transport: list[torch.Tensor] = dataclasses.field(default_factory=list)
+    gauge_kl: list[torch.Tensor] = dataclasses.field(default_factory=list)
     retained: list[torch.Tensor] = dataclasses.field(default_factory=list)
     logit_std: list[torch.Tensor] = dataclasses.field(default_factory=list)
     recall: list[torch.Tensor] = dataclasses.field(default_factory=list)
@@ -367,6 +369,12 @@ class TeacherCollector:
                         loss = loss + (self.clip.config.transport_weight
                                        * transport)
                         self.stats.transport.append(transport.detach())
+                    if self.clip.config.gauge_kl_weight:
+                        gkl = heatmap.gauge_fixed_kl(
+                            logits, heat, tile_layout, rows)
+                        loss = loss + (self.clip.config.gauge_kl_weight
+                                       * gkl)
+                        self.stats.gauge_kl.append(gkl.detach())
                     if self.topk_weight:
                         bce = heatmap.oracle_bce(
                             logits, heat, tile_layout,

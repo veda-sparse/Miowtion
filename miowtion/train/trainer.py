@@ -146,6 +146,17 @@ class TrainConfig:
     # invariant to the per-row affine maps a top-k read-out is invariant
     # to; the other three each lost to a gauge direction instead.
     transport_weight: float = 0.0
+    # Weight of the gauge-fixed forward KL (heatmap.gauge_fixed_kl).
+    # Forward KL is the Bregman divergence of the EOT dual potential, so
+    # it is the divergence this problem comes with; what made it unusable
+    # was that a per-row rescaling of the scores is a choice of the
+    # entropic eps, which the top-k cannot see and the KL could therefore
+    # be reduced along. Fixed, it is still useful next to the transport
+    # loss for one reason: it has gradient on every column, while
+    # transport concentrates 90% of its gradient on 58 blocks out of 360
+    # at the rank-k cut. Intended as a cold-start term, with transport
+    # taking over once the ordering is roughly right.
+    gauge_kl_weight: float = 0.0
     # Weight of the oracle top-k BCE added to the seer KL (0 = KL only).
     # The KL fits the whole teacher distribution; only the top-k ordering
     # reaches the kernel. See heatmap.oracle_bce().
@@ -220,6 +231,13 @@ class TrainConfig:
         if self.optimizer == 'muon' and self.muon_aux_lr_scale < 0:
             raise ValueError('muon_aux_lr_scale must be >= 0: '
                              f'{self.muon_aux_lr_scale}')
+        if self.gauge_kl_weight < 0:
+            raise ValueError('gauge_kl_weight must be >= 0: '
+                             f'{self.gauge_kl_weight}')
+        if self.gauge_kl_weight and self.heat_reduce != 'sum':
+            raise ValueError("gauge_kl_weight needs heat_reduce 'sum': "
+                             'the divergence is against the teacher block '
+                             'mass, and a block maximum is not a mass')
         if self.transport_weight < 0:
             raise ValueError('transport_weight must be >= 0: '
                              f'{self.transport_weight}')
@@ -361,6 +379,7 @@ class Trainer:
             heat_reduce=config.heat_reduce,
             kl_weight=config.kl_weight,
             transport_weight=config.transport_weight,
+            gauge_kl_weight=config.gauge_kl_weight,
             kl_direction=config.kl_direction,
             tile_conditions=config.tile_conditions,
             teacher_q_tiles=config.teacher_q_tiles,
@@ -642,8 +661,8 @@ class Trainer:
         resolved = collector.stats.resolve()  # one device transfer
         stats['kl'].append(sum(resolved['kl']) / num_layers)
         stats['kl_layers'].append(resolved['kl'])
-        for name in ('topk_bce', 'transport', 'logit_std', 'recall',
-                     'heat_kept', 'heat_ceiling', 'retained'):
+        for name in ('topk_bce', 'transport', 'gauge_kl', 'logit_std',
+                     'recall', 'heat_kept', 'heat_ceiling', 'retained'):
             # A zero-weighted loss records nothing, so the key is absent.
             stats[name] += resolved.get(name, [])
         progress.log(f'  update {self.step + 1}/{self.config.steps} micro '
@@ -675,7 +694,7 @@ class Trainer:
             start = time.time()
             stats = {name: [] for name in
                      ('kl', 'kl_layers', 'topk_bce', 'transport',
-                      'logit_std', 'recall', 'heat_kept',
+                      'gauge_kl', 'logit_std', 'recall', 'heat_kept',
                       'heat_ceiling', 'retained', 'mse')}
             for _ in range(config.accum):
                 self._micro_step(stats)
@@ -766,8 +785,8 @@ class Trainer:
             # against, so it has to come from the step that just ran.
             record['update_rms'] = round(self.optimizer.last_update_rms(), 5)
             record['update_align'] = round(self.optimizer.last_alignment(), 4)
-        for name in ('topk_bce', 'transport', 'heat_kept', 'heat_ceiling',
-                     'retained', 'logit_std'):
+        for name in ('topk_bce', 'transport', 'gauge_kl', 'heat_kept',
+                     'heat_ceiling', 'retained', 'logit_std'):
             if stats[name]:
                 record[name] = round(self._reduce_mean(stats[name]), 5)
         # The geometry-normalized one. heat_kept alone is not comparable
@@ -792,7 +811,8 @@ class Trainer:
     def _progress_line(self, record: dict) -> str:
         """The short status: the loss, and the thing the kernel reads."""
         parts = [f"kl {record.get('kl', float('nan')):.4f}"]
-        for key, fmt in (('transport', '.5f'), ('retained', '.4f'),
+        for key, fmt in (('transport', '.5f'), ('gauge_kl', '.4f'),
+                         ('retained', '.4f'),
                          ('recall', '.3f'), ('kept_over_ceiling', '.4f')):
             if key in record:
                 parts.append(f'{key} {record[key]:{fmt}}')

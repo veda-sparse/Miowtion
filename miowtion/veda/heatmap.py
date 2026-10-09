@@ -331,6 +331,105 @@ def transport_loss(logits: torch.Tensor, heat: torch.Tensor,
     return per_head.mean()
 
 
+# Floor on the teacher's block mass, relative to the row's largest, used
+# only for the log that sets the row's scale. A zero-mass column carries
+# zero weight in the divergence either way, but log 0 would poison the
+# row's mean and standard deviation.
+_GAUGE_FLOOR = 1e-6
+
+
+def gauge_fixed_kl(logits: torch.Tensor, heat: torch.Tensor,
+                   layout: tiling.TileLayout,
+                   q_tiles: torch.Tensor) -> torch.Tensor:
+    """Forward KL after fixing the one gauge the kernel cannot see.
+
+    Forward KL is not an arbitrary choice here: with F(s) = log sum_v
+    exp(s_v), the EOT dual potential, the Bregman divergence of F is
+
+        D_F(s_S, s_T) = F(s_S) - F(s_T) - <grad F(s_T), s_S - s_T>
+                      = KL(p_T || p_S),
+
+    since grad F = softmax. Verified numerically to 1e-6. So forward KL
+    is the divergence this problem comes with, living in the dual (score)
+    space, and reverse KL is the primal (plan) one.
+
+    What made both unusable is also an EOT statement. The EOT solution at
+    regularisation eps is softmax(s / eps), so a per-row rescaling of the
+    scores *is* a choice of eps -- and the top-k at fixed k does not
+    depend on eps at all. Measured with the student's ordering held
+    fixed: the retained mass is bit-identical at every eps while forward
+    KL is minimised at eps 1.33 (it wants a flatter plan) and reverse
+    sits further sharp and penalises over-sharpening a third as hard.
+    Mass-covering and mode-seeking are that one derivative's two signs.
+
+    This fixes eps instead of letting the loss choose it: the student's
+    scores are standardised per row and then transported onto the
+    teacher's own scale. Fixing them to unit variance would be wrong --
+    the teacher is generally not in the family {softmax(z) : std(z) = 1},
+    so the loss would keep an irreducible offset (measured: 0.291), and
+    an irreducible offset is exactly what made the raw BCE unusable.
+    Transported onto the teacher's scale the loss is 0 at the truth to
+    float precision, and invariant to a per-row positive affine map of
+    the scores to the same precision.
+
+    Why keep it when `transport_loss` is the decision's own value: this
+    one has gradient on *every* column, while transport_loss concentrates
+    90% of its gradient on about 58 blocks out of 360 at the rank-k
+    boundary. That focus is what makes transport the right objective near
+    a good solution and a poor one far from it, because a badly ordered
+    row gets no signal about blocks far from its own cut. The intended
+    use is this early and transport late, or a weighted sum.
+
+    Args:
+        logits: [H', R, n_tiles] fp32 student block logits (with grad).
+        heat: [H', R, n_tiles] fp32 teacher heat; the *mass* reduction.
+        layout: Tile layout (empty key tiles are excluded).
+        q_tiles: [R] int64 video query tile ids; the forced diagonal is
+            excluded, as in transport_loss and mask_diagnostics.
+
+    Returns:
+        Scalar divergence, averaged over rows then heads. 0 is the
+        student reproducing the teacher's ordering and relative spacing
+        up to the gauge.
+    """
+    n_video = layout.n_video_tiles
+    diag = F.one_hot(q_tiles, n_video).bool()[None]
+    valid = layout.kv_ok[None, None, :n_video] & ~diag
+    counted = valid.to(logits.dtype)
+    rows = counted.sum(-1, keepdim=True).clamp(min=1.0)
+
+    with torch.no_grad():
+        mass = heat[:, :, :n_video].float().masked_fill(~valid, 0.0)
+        mass = mass.clamp(min=0.0)
+        total = mass.sum(-1, keepdim=True)
+        row_ok = total[..., 0] > 0
+        target = mass / total.clamp(min=torch.finfo(torch.float32).tiny)
+        floored = target.clamp(min=_GAUGE_FLOOR * target.amax(
+            -1, keepdim=True).clamp(min=torch.finfo(torch.float32).tiny))
+        log_t = torch.log(floored) * counted
+        t_mean = log_t.sum(-1, keepdim=True) / rows
+        t_var = (((log_t - t_mean) * counted).square()
+                 * counted).sum(-1, keepdim=True) / rows
+
+    scores = logits[:, :, :n_video].float()
+    centre = (scores * counted).sum(-1, keepdim=True) / rows
+    centred = (scores - centre) * counted
+    var = (centred.square() * counted).sum(-1, keepdim=True) / rows
+    # Standardise, then transport onto the teacher's scale. Both halves
+    # are needed: the first removes the gauge, the second puts the loss's
+    # zero at the truth instead of at an arbitrary offset.
+    z = centred / var.clamp(min=1e-12).sqrt() * t_var.sqrt() + t_mean
+
+    log_p = torch.log_softmax(z.masked_fill(~valid, float('-inf')), dim=-1)
+    # An excluded column has log_p = -inf and target = 0, and 0 * -inf is
+    # NaN, which would poison the whole reduction rather than drop out of
+    # it. Zero the log before it ever meets the weight.
+    log_p = log_p.masked_fill(~valid, 0.0)
+    per_row = (target * (torch.log(floored) - log_p) * counted).sum(-1)
+    per_head = (per_row * row_ok).sum(-1) / row_ok.sum(-1).clamp(min=1)
+    return per_head.mean()
+
+
 def oracle_bce(logits: torch.Tensor, heat: torch.Tensor,
                layout: tiling.TileLayout,
                blocks: list[veda_mask.ColumnBlock],
