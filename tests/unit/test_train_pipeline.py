@@ -525,3 +525,60 @@ def test_veda_config_carries_the_heat_target():
     from miowtion.veda import attention as veda_attention
     assert veda_attention.VedaConfig().heat_reduce == 'max'
     assert veda_attention.VedaConfig(heat_reduce='sum').heat_reduce == 'sum'
+
+
+def test_init_weights_allows_only_the_named_new_parameters():
+    """A published checkpoint predates this stage's extra parameters.
+
+    The loader stays strict on everything else: that strictness is what
+    catches a typo'd or dropped key, so the escape has to be by name.
+    """
+    import torch.nn as nn
+    old = nn.Parameter(torch.ones(2))
+    payload = {'ema': {'predictor.layers.0.proj_q': torch.zeros(2)},
+               'weights': {}}
+    params = [('predictor.layers.0.proj_q', nn.Parameter(torch.ones(2))),
+              ('predictor.layers.0.so_q', old)]
+    with pytest.raises(KeyError, match='missing from checkpoint'):
+        checkpoint.init_weights(params, payload)
+    checkpoint.init_weights(params, payload, new_suffixes=['so_q'])
+    # The placed one is overwritten, the new one keeps its warm start.
+    assert torch.equal(params[0][1].data, torch.zeros(2))
+    assert torch.equal(params[1][1].data, torch.ones(2))
+    # A suffix that covers nothing still leaves a real gap an error.
+    params.append(('predictor.layers.0.proj_k', nn.Parameter(torch.ones(2))))
+    with pytest.raises(KeyError, match='missing from checkpoint'):
+        checkpoint.init_weights(params, payload, new_suffixes=['so_q'])
+
+
+def test_kl_weight_applies_in_stage_one_too():
+    """It used to be a stage-2-only knob; stage 1 needs it as well.
+
+    With a mass target the KL and recall came apart in stage 1 exactly as
+    the docs describe for stage 2, so the balance against topk_weight has
+    to be reachable from both sides.
+    """
+    assert _lr_config().kl_weight == 1.0
+    config = _lr_config(kl_weight=0.05, topk_weight=1.0)
+    config.validate()
+    assert config.kl_weight == 0.05
+
+
+def test_kl_direction_knob_defaults_to_veda1_and_is_validated():
+    assert _lr_config().kl_direction == 'forward'
+    _lr_config(kl_direction='reverse').validate()
+    with pytest.raises(ValueError, match='kl_direction must be'):
+        _lr_config(kl_direction='js').validate()
+
+
+def test_progress_line_shows_the_normalized_metric():
+    """kl alone is the wrong thing to watch; it can fall while this does."""
+    from miowtion.train import trainer as train_trainer
+    line = train_trainer.Trainer._progress_line(
+        None, {'kl': 47.5182, 'recall': 0.654, 'kept_over_ceiling': 0.8123})
+    assert 'kl 47.5182' in line
+    assert 'recall 0.654' in line
+    assert 'kept_over_ceiling 0.8123' in line
+    # Missing keys are skipped rather than crashing a long run's logging.
+    assert 'recall' not in train_trainer.Trainer._progress_line(
+        None, {'kl': 1.0})

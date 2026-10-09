@@ -273,12 +273,27 @@ def load(directory: str) -> dict:
 @torch.no_grad()
 def init_weights(named_params: Sequence[tuple[str, nn.Parameter]],
                  payload: dict, use_ema: bool = True,
-                 drop_prefixes: Sequence[str] = ()) -> None:
+                 drop_prefixes: Sequence[str] = (),
+                 new_suffixes: Sequence[str] = ()) -> None:
     """New-stage init: weights only, strict.
+
+    Args:
+        named_params: Destinations, by name.
+        payload: A checkpoint from `save_weights` or `save`.
+        use_ema: Read the EMA shadow rather than the live weights.
+        drop_prefixes: Stored tensors to ignore instead of placing.
+        new_suffixes: Parameter names ending in one of these may be absent
+            from the checkpoint, because this stage introduced them and
+            the published weights predate them. Their current values are
+            kept, so the caller must have initialized them already. This
+            is deliberately a named opt-in and not a blanket strict=False:
+            anything else missing is still an error, which is the whole
+            point of loading strictly.
 
     Raises:
         KeyError: If a stored tensor has no destination (and is not
-            dropped), or if a destination is missing from the file.
+            dropped), or if a destination is missing from the file and is
+            not covered by `new_suffixes`.
     """
     source = payload['ema'] if use_ema else payload['weights']
     source = {k: v for k, v in source.items()
@@ -289,6 +304,8 @@ def init_weights(named_params: Sequence[tuple[str, nn.Parameter]],
         raise KeyError(f'checkpoint tensors without a destination: '
                        f'{unused[:5]} ({len(unused)})')
     missing = sorted(set(params) - set(source))
+    missing = [name for name in missing
+               if not (new_suffixes and name.endswith(tuple(new_suffixes)))]
     if missing:
         raise KeyError(f'parameters missing from checkpoint: {missing[:5]}')
     for name, value in source.items():

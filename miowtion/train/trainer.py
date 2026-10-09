@@ -97,6 +97,11 @@ class TrainConfig:
     # error, and it is also what the predictor's own initialization
     # estimates, so the two Veda2 changes belong together.
     heat_reduce: str = 'max'
+    # 'forward' is KL(teacher || student), mass-covering, which is what
+    # Veda1 trained with; 'reverse' is KL(student || teacher),
+    # mode-seeking, which is what a top-k read-out actually wants. See
+    # heatmap.seer_kl for the measured failure of the forward direction.
+    kl_direction: str = 'forward'
     # Weight of the oracle top-k BCE added to the seer KL (0 = KL only).
     # The KL fits the whole teacher distribution; only the top-k ordering
     # reaches the kernel. See heatmap.oracle_bce().
@@ -127,6 +132,12 @@ class TrainConfig:
     init_from: str | None = None
     init_drop_prefixes: list[str] = dataclasses.field(default_factory=list)
     lora_rank: int = 64
+    # Weight of the seer KL. It used to apply in stage 2 only, but the KL
+    # and the thing the kernel reads can pull apart in stage 1 too: with a
+    # mass target, 25 updates took the KL from 134 to 48 while recall went
+    # 0.714 -> 0.654, the KL buying its reduction by flattening towards
+    # the teacher's bulk. Being able to turn it down against topk_weight
+    # is how that gets balanced. 1.0 is the historical behaviour.
     kl_weight: float = 1.0
     mlp_chunk_rows: int | None = None
     offload_blocks: int = 0
@@ -153,6 +164,9 @@ class TrainConfig:
         return cls(**raw)
 
     def validate(self) -> None:
+        if self.kl_direction not in ('forward', 'reverse'):
+            raise ValueError("kl_direction must be 'forward' or 'reverse': "
+                             f'{self.kl_direction!r}')
         if self.heat_reduce not in ('max', 'sum'):
             raise ValueError("heat_reduce must be 'max' or 'sum': "
                              f'{self.heat_reduce!r}')
@@ -282,6 +296,7 @@ class Trainer:
             target_budget=target_budget,
             ref_budget=ref_budget,
             heat_reduce=config.heat_reduce,
+            kl_direction=config.kl_direction,
             tile_conditions=config.tile_conditions,
             teacher_q_tiles=config.teacher_q_tiles,
             recall_every=config.recall_every,
@@ -453,8 +468,18 @@ class Trainer:
             payload = checkpoint.load(config.init_from)
             predictor_only = [(n, p) for n, p in self.opt_params
                               if n.startswith('predictor.')]
+            # Parameters this stage added are absent from a published
+            # checkpoint by construction, and the warm start above already
+            # put them on their closed-form values. Everything else must
+            # still be present.
+            new_suffixes = []
+            if config.second_order_rank:
+                new_suffixes += ['so_q', 'so_k']
+            if config.count_term:
+                new_suffixes.append('count_gain')
             checkpoint.init_weights(predictor_only, payload, use_ema=True,
-                                    drop_prefixes=config.init_drop_prefixes)
+                                    drop_prefixes=config.init_drop_prefixes,
+                                    new_suffixes=new_suffixes)
             self.ema = checkpoint.Ema(self.opt_params, config.ema)
             self._log({'event': 'initialized', 'from': config.init_from})
         if self.masters is not None:
@@ -495,9 +520,8 @@ class Trainer:
         inputs = traj.inputs()
         table = self.tables.get(inputs.timestep.timesteps)
         num_layers = self.model.config.num_layers
-        kl_scale = 1.0 / (num_layers * self.config.accum)
-        if self.config.stage == 2:
-            kl_scale *= self.config.kl_weight
+        kl_scale = (self.config.kl_weight
+                    / (num_layers * self.config.accum))
         collector = veda_attention.TeacherCollector(
             self.clip_tiling, self.plan, self.predictor, self.noise_gen,
             grad_scale=kl_scale, dense_backend=self.config.dense_backend,
@@ -569,8 +593,7 @@ class Trainer:
             self.ema.update(self.opt_params)
             self.step += 1
             self._log_step(stats, norms, time.time() - start, diagnostics)
-            self._updates.update(f'kl {self._last_record["kl"]:.4f} recall '
-                                 f'{self._last_record["recall"]:.3f}')
+            self._updates.update(self._progress_line(self._last_record))
             if self.step % config.save_every == 0 or self.step == config.steps:
                 self._save()
         self.ckpt.wait()
@@ -616,6 +639,14 @@ class Trainer:
         for name in ('topk_bce', 'heat_kept', 'heat_ceiling', 'logit_std'):
             if stats[name]:
                 record[name] = round(self._reduce_mean(stats[name]), 5)
+        # The geometry-normalized one. heat_kept alone is not comparable
+        # across geometries, because the ceiling itself moves with the
+        # tile count, and the geometries are cycled. This is the number to
+        # watch: the KL can fall while it stays flat or drops, which is
+        # the loss paying itself down by flattening.
+        if record.get('heat_ceiling'):
+            record['kept_over_ceiling'] = round(
+                record['heat_kept'] / record['heat_ceiling'], 5)
         # Per-layer KL is rank 0's own micro-steps: it says where in depth
         # the predictor is behind, and averaging it across ranks would only
         # hide that they saw different geometries.
@@ -626,6 +657,14 @@ class Trainer:
         record.update(diagnostics)
         self._last_record = record
         self._log(record)
+
+    def _progress_line(self, record: dict) -> str:
+        """The short status: the loss, and the thing the kernel reads."""
+        parts = [f"kl {record.get('kl', float('nan')):.4f}"]
+        for key, fmt in (('recall', '.3f'), ('kept_over_ceiling', '.4f')):
+            if key in record:
+                parts.append(f'{key} {record[key]:{fmt}}')
+        return '  '.join(parts)
 
     def _log(self, record: dict) -> None:
         if not self.env.is_main:

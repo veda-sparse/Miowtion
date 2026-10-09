@@ -513,3 +513,69 @@ def test_gather_and_pool_second_moments_match_pool_tiles():
         torch.testing.assert_close(
             moment, veda_predictor.pool_tiles(tiles, tl, which), rtol=1e-5,
             atol=1e-6)
+
+
+def _kl_case(student_logits, teacher_heat):
+    """One query row, four key tiles, all valid."""
+    lay = _layout()
+    heat = torch.zeros(1, 1, lay.n_tiles)
+    logits = torch.zeros(1, 1, lay.n_tiles)
+    n = min(4, lay.n_tiles)
+    heat[0, 0, :n] = torch.tensor(teacher_heat[:n])
+    logits[0, 0, :n] = torch.tensor(student_logits[:n])
+    # Everything past the four is given no teacher mass and a low logit.
+    logits[0, 0, n:] = -20.0
+    return logits, heat, lay
+
+
+def test_forward_and_reverse_kl_vanish_on_a_match():
+    """Both are zero when the student reproduces the teacher."""
+    lay = _layout()
+    heat = torch.rand(2, 3, lay.n_tiles) + 0.1
+    heat = heat * lay.kv_ok[None, None, :]
+    target = heat / heat.sum(-1, keepdim=True)
+    logits = torch.log(target.clamp(min=1e-30))
+    for direction in ('forward', 'reverse'):
+        loss = heatmap.seer_kl(logits, heat, lay, direction)
+        assert float(loss) == pytest.approx(0.0, abs=2e-5), direction
+
+
+def test_the_two_directions_punish_opposite_mistakes():
+    """This is the whole reason the knob exists.
+
+    The teacher puts most of its mass on one block and a little on a
+    second. A mode-seeking student takes the first and ignores the tail; a
+    mass-covering student spreads over everything. Forward KL should
+    prefer the spread one, reverse KL the peaked one.
+    """
+    teacher = [0.9, 0.1, 0.0, 0.0]
+    peaked = [6.0, -6.0, -6.0, -6.0]     # all on the teacher's mode
+    spread = [0.3, 0.0, -0.3, -0.3]      # covers everything, including 0s
+    fwd, rev = {}, {}
+    for name, logits in (('peaked', peaked), ('spread', spread)):
+        lg, heat, lay = _kl_case(logits, teacher)
+        fwd[name] = float(heatmap.seer_kl(lg, heat, lay, 'forward'))
+        rev[name] = float(heatmap.seer_kl(lg, heat, lay, 'reverse'))
+    assert fwd['spread'] < fwd['peaked'], (fwd, 'forward covers mass')
+    assert rev['peaked'] < rev['spread'], (rev, 'reverse seeks modes')
+
+
+def test_reverse_kl_floors_the_teachers_zeros():
+    """log 0 would make any student mass there infinite, not merely bad."""
+    teacher = [1.0, 0.0, 0.0, 0.0]
+    lg, heat, lay = _kl_case([0.0, 0.0, 0.0, 0.0], teacher)
+    loss = heatmap.seer_kl(lg, heat, lay, 'reverse')
+    assert torch.isfinite(loss) and float(loss) > 1.0
+
+
+def test_seer_kl_rejects_an_unknown_direction():
+    lay = _layout()
+    heat = torch.ones(1, 1, lay.n_tiles)
+    with pytest.raises(ValueError, match="direction must be"):
+        heatmap.seer_kl(torch.zeros(1, 1, lay.n_tiles), heat, lay, 'js')
+
+
+def test_veda_config_carries_the_kl_direction():
+    assert veda_attention.VedaConfig().kl_direction == 'forward'
+    assert veda_attention.VedaConfig(
+        kl_direction='reverse').kl_direction == 'reverse'

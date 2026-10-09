@@ -47,6 +47,10 @@ class VedaConfig:
             between geometries.
         recall_every: Compute the mask diagnostics on every n-th layer.
         dense_layers: Layers that stay dense in the sparse student.
+        kl_direction: 'forward' for KL(teacher || student), which is
+            mass-covering and flattens, or 'reverse' for
+            KL(student || teacher), which is mode-seeking and is what a
+            top-k read-out wants. See heatmap.seer_kl.
         heat_reduce: Which teacher heat the predictor is distilled
             against: 'max' for the block's peak probability (Veda1) or
             'sum' for its total attention mass (Veda2). Mass is what
@@ -60,6 +64,7 @@ class VedaConfig:
     """
 
     heat_reduce: str = 'max'
+    kl_direction: str = 'forward'
     target_budget: veda_mask.Budget = veda_mask.Budget(ratio=0.1)
     ref_budget: veda_mask.Budget | None = None
     tile_conditions: bool = False
@@ -338,7 +343,8 @@ class TeacherCollector:
                 with torch.enable_grad():
                     logits = self.predictor.layers[layer_index](
                         feats_q[:, rows], feats_k, heads, **extra)
-                    kl = heatmap.seer_kl(logits, heat, tile_layout)
+                    kl = heatmap.seer_kl(logits, heat, tile_layout,
+                                         self.clip.config.kl_direction)
                     loss = kl
                     if self.topk_weight:
                         bce = heatmap.oracle_bce(

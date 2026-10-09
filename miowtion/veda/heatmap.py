@@ -110,28 +110,66 @@ def teacher_heat(q: torch.Tensor, k: torch.Tensor, lse: torch.Tensor,
     return teacher_heat_reference(q, k, lse, layout, q_tiles, reduce=reduce)
 
 
+# Floor on the teacher's probability in the reverse direction. log t is
+# -inf on a block the teacher gives no mass, which would make any student
+# mass there an infinite penalty; this caps that at ~14 per unit of mass,
+# which is still strongly zero-forcing but finite.
+_REVERSE_FLOOR = 1e-6
+
+
 def seer_kl(logits: torch.Tensor, heat: torch.Tensor,
-            layout: tiling.TileLayout) -> torch.Tensor:
-    """KL(teacher || student) over key tiles, averaged over rows then heads.
+            layout: tiling.TileLayout,
+            direction: str = 'forward') -> torch.Tensor:
+    """Seer KL over key tiles, averaged over rows then heads.
+
+    Which direction matters, because the two have opposite failure modes
+    and only one of them matches a top-k read-out.
+
+    'forward' is KL(teacher || student): mass-covering. Every block the
+    teacher touches has to get student probability, so the cheapest way to
+    reduce it is to spread out. Measured in stage 1 against a mass target,
+    25 updates took it from 134 to 48 while recall fell 0.714 -> 0.654;
+    the loss was being paid down by flattening, not by ordering. It also
+    explains the absolute scale: the penalty blows up wherever the teacher
+    has a little mass and the student has almost none.
+
+    'reverse' is KL(student || teacher): mode-seeking. The student is only
+    punished for mass where the teacher has none, so it concentrates on
+    the teacher's dominant blocks, which is what the kernel then reads out
+    as a top-k.
 
     Args:
         logits: [H', R, n_tiles] fp32 student block logits (with grad).
         heat: [H', R, n_tiles] fp32 teacher heat.
         layout: Tile layout (empty key tiles are excluded).
+        direction: 'forward' or 'reverse'.
 
     Returns:
         Scalar loss.
+
+    Raises:
+        ValueError: On an unknown direction.
     """
+    if direction not in ('forward', 'reverse'):
+        raise ValueError(f"direction must be 'forward' or 'reverse': "
+                         f'{direction!r}')
     col_ok = layout.kv_ok[None, None, :]
     logp = F.log_softmax(logits.masked_fill(~col_ok, float('-inf')), dim=-1)
     target = heat.masked_fill(~col_ok, 0.0).clamp(min=0.0)
     total = target.sum(-1, keepdim=True)
     row_ok = total[..., 0] > 0
     target = target / total.clamp(min=torch.finfo(torch.float32).tiny)
-    positive = (target > 0) & col_ok
-    terms = torch.where(positive,
-                        target * (torch.log(torch.where(positive, target, 1.0))
-                                  - torch.where(positive, logp, 0.0)), 0.0)
+    if direction == 'forward':
+        positive = (target > 0) & col_ok
+        terms = torch.where(
+            positive,
+            target * (torch.log(torch.where(positive, target, 1.0))
+                      - torch.where(positive, logp, 0.0)), 0.0)
+    else:
+        # Weighted by the student's own mass, so the sum is over columns
+        # it actually uses, and the teacher's zeros are floored.
+        log_target = torch.log(target.clamp(min=_REVERSE_FLOOR))
+        terms = torch.where(col_ok, logp.exp() * (logp - log_target), 0.0)
     per_row = terms.sum(-1)  # [H', R]
     per_head = (per_row * row_ok).sum(-1) / row_ok.sum(-1).clamp(min=1)
     return per_head.mean()

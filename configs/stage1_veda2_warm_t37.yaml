@@ -1,0 +1,53 @@
+# Veda2 stage 1, warm-started from the released Veda1 predictor.
+#
+# Same two changes as stage1_veda2_t37 (the second-cumulant head and the
+# log B term present from step one, distilled against block mass), but the
+# base projections start from the published step600 weights instead of
+# N(0, 1e-4). Those 600 updates learned real feature extraction; only
+# their calibration was aimed at the block maximum.
+#
+# Measured earlier: *bolting* the two closed-form terms onto these trained
+# projections without training makes things worse, monotonically in the
+# scale, because max-target training shrinks the base logit spread from
+# 3.78 to 2.65 and the physically-scaled terms then drown it out. That is
+# a mismatch gradient descent fixes in a few dozen steps, so it argues
+# against bolting, not against warm-starting and then training. The terms
+# still start at their exact coefficients and the optimizer rescales.
+run_name: stage1_veda2_warm_t37
+checkpoint_root: weights/MiniMax-H3
+sample_cache: artifacts/samples/moviegen_video_bench
+geometries: ['1:1@37', '4:3@37', '16:9@37', '9:16@37']
+geometry_sampling: cycle
+variant: FL2VA
+tasks: [t2va]
+plan_dir: plans/released
+schedule: turbo
+num_steps: 8
+teacher_adapter: weights/turbo_lora/minimax_h3_turbo_v4_step600_ema.safetensors
+init_from: artifacts/init/veda1_step600
+keep_ratio: 0.1
+teacher_q_tiles: 1.0
+second_order_rank: 128
+count_term: true
+heat_reduce: sum
+# Reverse KL, i.e. KL(student || teacher). The forward direction is
+# mass-covering: measured on the from-scratch run, 25 updates took it from
+# 134 to 48 while recall fell 0.714 -> 0.654, because spreading out is the
+# cheapest way to pay it down. Reverse is mode-seeking, which is what a
+# top-k read-out wants, and it is also bounded by the teacher floor
+# (~14) instead of running to 300.
+kl_direction: reverse
+# The BCE states the objective outright: is this block in the oracle's
+# top-k. With reverse KL now on a comparable scale (~14 vs ~3) the two
+# sit together at weight 1 each.
+topk_weight: 1.0
+accum: 4
+steps: 400
+lr: 1.0e-3
+warmup: 20
+save_every: 25
+keep_optimizer: 1
+out_dir: runs
+offload_blocks: 30
+prefetch: 1
+mlp_chunk_rows: 8192
