@@ -754,7 +754,12 @@ class Trainer:
                   if torch.cuda.is_available() else 0.0}
         if stats['mse']:
             record['mse'] = self._reduce_mean(stats['mse'])
-        if isinstance(self.optimizer, muon.Muon):
+        # Ask for the capability, not the class: a hybrid run wraps Muon
+        # in optim.Hybrid, and an isinstance check silently dropped these
+        # two numbers from the log for a whole run. They are the only
+        # measured read on whether the step size is what the config asked
+        # for, which is exactly the quantity six runs were lost to.
+        if hasattr(self.optimizer, 'last_update_rms'):
             # Measured, not derived: the scale formula assumes a full-rank
             # update, and a rank-deficient gradient lands below the target
             # (miowtion.train.muon). This is the number lr is calibrated

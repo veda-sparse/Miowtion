@@ -766,3 +766,25 @@ def test_hybrid_splits_by_shape_and_keeps_its_own_lr_ratio():
 def test_hybrid_rejects_an_empty_split():
     with pytest.raises(ValueError, match='at least one'):
         optim_lib.Hybrid([])
+
+
+def test_muon_diagnostics_survive_the_hybrid_wrapper():
+    """An isinstance check dropped them for a whole run.
+
+    update_rms and update_align are the only measured read on whether
+    the step size is what the config asked for, and that is the quantity
+    six training runs were lost to. A hybrid run wraps Muon in
+    optim.Hybrid, so the record has to ask for the capability rather
+    than the concrete class.
+    """
+    matrix = torch.nn.Parameter(torch.randn(2, 8, 8))
+    gain = torch.nn.Parameter(torch.ones(2))
+    plain = muon_lib.Muon([matrix], lr=1e-3)
+    hybrid = optim_lib.Hybrid([muon_lib.Muon([matrix], lr=1e-3),
+                               torch.optim.AdamW([gain], lr=1e-4)])
+    for opt in (plain, hybrid):
+        assert hasattr(opt, 'last_update_rms')
+        assert hasattr(opt, 'last_alignment')
+    # AdamW alone has neither, so the record skips them.
+    assert not hasattr(torch.optim.AdamW([matrix], lr=1e-3),
+                       'last_update_rms')
