@@ -19,6 +19,7 @@ import torch
 
 from miowtion.h3 import geometry as h3_geometry
 from miowtion.h3 import model as h3_model
+from miowtion.kernels import sol
 from miowtion.train import checkpoint
 from miowtion.train import data
 from miowtion.train import trajectory as traj_lib
@@ -27,7 +28,8 @@ from miowtion.veda import attention as veda_attention
 from miowtion.veda import plan as veda_plan
 from miowtion.veda import predictor as veda_predictor
 
-ATTENTION_MODES = ('dense', 'veda')
+ATTENTION_MODES = ('dense', 'veda', 'sol',
+                   'oracle_mass', 'oracle_max', 'oracle_mean')
 
 
 @dataclasses.dataclass
@@ -103,7 +105,8 @@ def generate(model: h3_model.H3DiT, schedule, tables,
              plan: veda_plan.TilePlan | None = None,
              predictor: veda_predictor.TileScorePredictor | None = None,
              veda_config: veda_attention.VedaConfig | None = None,
-             dense_steps: Collection[int] = ()) -> Generated:
+             dense_steps: Collection[int] = (),
+             sol_tau: float = 1.0) -> Generated:
     """Rolls one sample from noise to the end of the schedule.
 
     Args:
@@ -120,6 +123,9 @@ def generate(model: h3_model.H3DiT, schedule, tables,
         predictor: Trained predictor (veda only).
         veda_config: Budgets and dense layers (veda only).
         dense_steps: Denoising steps that stay dense in a veda run.
+        sol_tau: Threshold coefficient of the sol mode. Larger routes
+            fewer key blocks exactly. It is not a budget, so a run that
+            has to match a fixed-budget router must calibrate it.
 
     Raises:
         ValueError: On an unknown mode or missing veda components.
@@ -128,10 +134,17 @@ def generate(model: h3_model.H3DiT, schedule, tables,
         raise ValueError(f'attention must be one of {ATTENTION_MODES}')
     if attention == 'veda' and None in (plan, predictor, veda_config):
         raise ValueError('veda needs a plan, a predictor and a VedaConfig')
+    if attention.startswith('oracle_') and None in (plan, veda_config):
+        raise ValueError(f'{attention} needs a plan and a VedaConfig; it '
+                         'needs no predictor, which is the point')
+    if attention == 'sol' and not sol.available(device):
+        raise RuntimeError('attention sol is unavailable: '
+                           f'{sol.unavailable_reason() or "device is not CUDA"}')
     traj = traj_lib.Trajectory(model, cache, sample, geometry, schedule,
                                seed, device)
+    tiled = attention == 'veda' or attention.startswith('oracle_')
     clip = (veda_attention.ClipTiling(traj.layout, veda_config, device)
-            if attention == 'veda' else None)
+            if tiled else None)
     steps = progress.Progress(f'generate {sample.id} ({attention})',
                               schedule.num_steps, every=1)
     calls = {'sparse': 0, 'dense': 0}
@@ -142,16 +155,27 @@ def generate(model: h3_model.H3DiT, schedule, tables,
         inputs = traj.inputs()
         if attention == 'veda' and inputs.step not in dense_steps:
             fn = veda_attention.SparseStudent(clip, plan, predictor)
+        elif (attention.startswith('oracle_')
+              and inputs.step not in dense_steps):
+            fn = veda_attention.OracleStudent(
+                clip, plan, attention.removeprefix('oracle_'))
+        elif attention == 'sol' and inputs.step not in dense_steps:
+            fn = h3_model.SolAttention(traj.layout.used, tau=sol_tau)
         else:
             fn = h3_model.DenseAttention(traj.layout.used)
         timed = _TimedAttention(fn)
         video_v, audio_v = model(traj.clip, inputs.video_rows,
                                  inputs.audio_rows, inputs.timestep, timed,
                                  tables.get(inputs.timestep.timesteps))
-        sparse = isinstance(fn, veda_attention.SparseStudent)
-        if sparse:
+        sparse = isinstance(fn, (veda_attention.SparseStudent,
+                                 veda_attention.OracleStudent,
+                                 h3_model.SolAttention))
+        if isinstance(fn, (veda_attention.SparseStudent,
+                           veda_attention.OracleStudent)):
             calls['sparse'] += fn.calls['sparse']
             calls['dense'] += fn.calls['dense']
+        elif isinstance(fn, h3_model.SolAttention):
+            calls['sparse'] += model.config.num_layers
         else:
             calls['dense'] += model.config.num_layers
         traj.advance(video_v, audio_v)

@@ -410,6 +410,119 @@ class TeacherCollector:
 
 
 
+ORACLE_TARGETS = ('mass', 'max', 'mean')
+
+
+class OracleStudent:
+    """Block sparsity masked by the *true* block statistic, not a predictor.
+
+    An upper bound, and the experiment that says which upper bound. Veda
+    showed that approaching an oracle is what matters; this answers which
+    oracle a router should approach, at the level of the generated video
+    rather than of the attention output error.
+
+    Three targets, which differ by exactly the terms of the cumulant
+    expansion (see miowtion/veda/predictor.py):
+
+    * `mass`: the block's summed attention probability. Derived as
+      optimal -- restricting a one-sided entropic transport plan to a
+      block set S attains log sum_{v in S} exp(s_uv), so the best set of
+      size k is the top-k by mass, exactly.
+    * `max`: the block's peak probability, which is the target Veda's
+      released scorer was distilled against. An extreme-value statistic.
+    * `mean`: mass divided by the key tile's real row count, i.e. mass
+      with the log B_j term removed. Separates "mass is right" from
+      "counting rows is right".
+
+    Cost is dense plus sparse per layer: the heat needs the dense LSE, so
+    this is an analysis mode and never an inference path.
+    """
+
+    def __init__(self, clip: ClipTiling, plan: veda_plan.TilePlan,
+                 target: str = 'mass',
+                 allow_reference_kernel: bool = False):
+        """Initializes the oracle.
+
+        Args:
+            clip: Clip tiling cache.
+            plan: Tile plan of the clip geometry.
+            target: One of ORACLE_TARGETS.
+            allow_reference_kernel: Permit the token-level reference
+                kernel (CPU tests only).
+
+        Raises:
+            ValueError: On an unknown target.
+            RuntimeError: If FA4 is unavailable and the reference kernel
+                is not explicitly allowed.
+        """
+        if target not in ORACLE_TARGETS:
+            raise ValueError(f'target must be one of {ORACLE_TARGETS}: '
+                             f'{target!r}')
+        if not fa4.available(clip.device) and not allow_reference_kernel:
+            raise RuntimeError('OracleStudent needs the FA4 block-sparse '
+                               'kernel; refusing to fall back silently')
+        self.clip = clip
+        self.plan = plan
+        self.target = target
+        self.use_fa4 = fa4.available(clip.device)
+        self.calls = {'sparse': 0, 'dense': 0}
+
+    def __call__(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                 layer_index: int) -> torch.Tensor:
+        used = self.clip.layout.used
+        if layer_index in self.clip.config.dense_layers:
+            self.calls['dense'] += 1
+            return h3_attention.dense_attention(q, k, v, used)[0]
+        self.calls['sparse'] += 1
+        # The oracle statistic is defined through the teacher's own
+        # normalisation, so the dense pass is not optional here.
+        with torch.no_grad():
+            _, lse = h3_attention.dense_attention(q, k, v, used,
+                                                  return_lse=True)
+        seq_len = q.shape[0]
+        out = q.new_zeros(seq_len + 1, *q.shape[1:])
+        for group in self.plan.head_groups(layer_index, self.clip.device):
+            tile_layout = self.clip.get(group.shape)
+            for heads in group.heads.split(
+                    _chunk_heads(tile_layout,
+                                 self.clip.config.collect_bytes)):
+                self._attend(q, k, v, lse, tile_layout, heads, out)
+        out = out[:seq_len]
+        if used < seq_len:
+            out[used:] = 0
+        return out
+
+    def _attend(self, q, k, v, lse, tile_layout: tiling.TileLayout,
+                heads: torch.Tensor, out: torch.Tensor) -> None:
+        """Oracle-masked attention of some heads of one group."""
+        q_tiles = _gather(q, tile_layout, heads)
+        k_tiles = _gather(k, tile_layout, heads)
+        v_tiles = _gather(v, tile_layout, heads)
+        rows = torch.arange(tile_layout.n_video_tiles, device=q.device)
+        with torch.no_grad():
+            reduce = 'max' if self.target == 'max' else 'sum'
+            heat = heatmap.teacher_heat(
+                q_tiles, k_tiles, _gather_lse(lse, tile_layout, heads),
+                tile_layout, rows, reduce)
+            if self.target == 'mean':
+                # Mass per real key row: the same ranking as mass with the
+                # log B_j term taken back out.
+                counts = tile_layout.valid_count.clamp(min=1).to(heat.dtype)
+                heat = heat / counts[None, None, :]
+            selection = veda_mask.select_video_blocks(
+                heat[:, :, :tile_layout.n_video_tiles], tile_layout,
+                self.clip.blocks(tile_layout), rows)
+            block_mask = veda_mask.dense_block_mask(selection, tile_layout)
+        if self.use_fa4:
+            o_tiles = fa4.block_sparse_attention(q_tiles, k_tiles, v_tiles,
+                                                 block_mask, tile_layout)
+        else:
+            o_tiles = reference.block_sparse_attention(
+                q_tiles, k_tiles, v_tiles, block_mask,
+                tile_layout.valid_count)
+        _scatter_(out, o_tiles, tile_layout, heads)
+
+
 class SparseStudent:
     """Stage-2 / evaluation attention: predictor-masked block sparsity."""
 

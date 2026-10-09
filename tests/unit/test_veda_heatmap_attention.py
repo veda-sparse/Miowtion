@@ -845,3 +845,44 @@ def test_gauge_fixed_kl_ignores_excluded_columns_and_empty_rows():
     heat[:, 0] = 0.0
     # 0 * log 0 drops out of a divergence; it must not become NaN.
     assert torch.isfinite(heatmap.gauge_fixed_kl(logits, heat, lay, rows))
+
+
+# --- the oracle attention modes ------------------------------------------
+
+
+def test_oracle_targets_differ_and_mean_removes_the_count_term():
+    """P0-5's three masks must actually be three different masks.
+
+    mass is the derived optimum, max is what the released scorer was
+    distilled against, and mean is mass with log B_j taken back out. If
+    mean and mass selected the same blocks the experiment would be
+    vacuous, so this pins that they do not on a ragged layout.
+    """
+    lay = _layout()
+    lay.valid_count[1] = 32           # one short tile makes mass != mean
+    blocks = veda_mask.column_blocks(lay, veda_mask.Budget(ratio=0.9))
+    rows = torch.arange(3)
+    g = torch.Generator().manual_seed(5)
+    mass = torch.rand(2, rows.numel(), lay.n_tiles, generator=g) + 0.01
+    mass = mass * lay.kv_ok[None, None, :]
+
+    counts = lay.valid_count.clamp(min=1).float()
+    mean = mass / counts[None, None, :]
+    by_mass = veda_mask.select_video_blocks(mass, lay, blocks, rows)
+    by_mean = veda_mask.select_video_blocks(mean, lay, blocks, rows)
+    assert not torch.equal(by_mass.index, by_mean.index), \
+        'dividing by the row count must change the ranking somewhere'
+
+    from miowtion.veda import attention as veda_attention
+    assert veda_attention.ORACLE_TARGETS == ('mass', 'max', 'mean')
+
+
+def test_oracle_student_rejects_an_unknown_target():
+    from miowtion.veda import attention as veda_attention
+
+    class _Clip:
+        device = torch.device('cpu')
+
+    with pytest.raises(ValueError, match='target must be one of'):
+        veda_attention.OracleStudent(_Clip(), None, 'peak',
+                                     allow_reference_kernel=True)
