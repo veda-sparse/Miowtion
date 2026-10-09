@@ -82,6 +82,21 @@ class TrainConfig:
     # VedaConfig.collect_bytes in MiB: the head-chunk bound of the teacher
     # heat. The default fits a 24 GB card; raise it where memory allows.
     veda_collect_mib: int = veda_attention.DEFAULT_COLLECT_BYTES // 2**20
+    # Veda2's two score terms (docs/features/veda2.md). They start at the
+    # closed-form coefficients of the block log-mass expansion, which the
+    # plain predictor structurally cannot express, and train from there.
+    # second_order_rank 0 and count_term false is Veda1 exactly.
+    second_order_rank: int = 0
+    count_term: bool = False
+    # Moments from 'ablate_sol.py --second-moments', required when
+    # second_order_rank is below head_dim: only full rank has a closed-form
+    # warm start. None at full rank uses that closed form.
+    second_order_moments: str | None = None
+    # 'max' distils against the block's peak probability (Veda1), 'sum'
+    # against its attention mass. Mass is what determines the output
+    # error, and it is also what the predictor's own initialization
+    # estimates, so the two Veda2 changes belong together.
+    heat_reduce: str = 'max'
     # Weight of the oracle top-k BCE added to the seer KL (0 = KL only).
     # The KL fits the whole teacher distribution; only the top-k ordering
     # reaches the kernel. See heatmap.oracle_bce().
@@ -138,6 +153,12 @@ class TrainConfig:
         return cls(**raw)
 
     def validate(self) -> None:
+        if self.heat_reduce not in ('max', 'sum'):
+            raise ValueError("heat_reduce must be 'max' or 'sum': "
+                             f'{self.heat_reduce!r}')
+        if self.second_order_rank < 0:
+            raise ValueError('second_order_rank must be >= 0: '
+                             f'{self.second_order_rank}')
         if self.stage not in (1, 2):
             raise ValueError(f'stage must be 1 or 2, got {self.stage}')
         if self.optimizer not in ('adamw', 'muon'):
@@ -249,13 +270,18 @@ class Trainer:
         # weights, so its initialization is seeded identically everywhere.
         torch.manual_seed(config.seed)
         self.predictor = veda_predictor.TileScorePredictor(
-            cfg.num_layers, cfg.num_heads, cfg.head_dim).to(self.device)
+            cfg.num_layers, cfg.num_heads, cfg.head_dim,
+            second_order_rank=config.second_order_rank,
+            count_term=config.count_term).to(self.device)
+        if config.second_order_rank:
+            self._warm_start_second_order(config, cfg)
         self.plans = (veda_plan.PlanTable.load_dir(config.plan_dir)
                       if config.plan_dir else None)
         target_budget, ref_budget = config.budgets()
         self.veda_config = veda_attention.VedaConfig(
             target_budget=target_budget,
             ref_budget=ref_budget,
+            heat_reduce=config.heat_reduce,
             tile_conditions=config.tile_conditions,
             teacher_q_tiles=config.teacher_q_tiles,
             recall_every=config.recall_every,
@@ -337,6 +363,38 @@ class Trainer:
         self.trajectory = None
 
     # --- setup -----------------------------------------------------------
+
+    def _warm_start_second_order(self, config: 'TrainConfig', cfg) -> None:
+        """Puts the second-cumulant head on its closed-form coefficients.
+
+        Starting there rather than at noise is the same idea the plain
+        predictor already uses: its N(0, 1e-4) projections make an
+        untrained score equal mean-pooled QK, the zero-order term of the
+        block log-mass. This extends that to the next term, so training
+        starts from the best estimate instead of discovering it.
+
+        Raises:
+            ValueError: If a rank below head_dim comes without moments.
+        """
+        if config.second_order_rank == cfg.head_dim and not (
+                config.second_order_moments):
+            self.predictor.init_exact_second_order_()
+            progress.log('second-order head warm-started at the exact '
+                         'diagonal cumulant (full rank)')
+            return
+        if not config.second_order_moments:
+            raise ValueError(
+                f'second_order_rank {config.second_order_rank} is below '
+                f'head_dim {cfg.head_dim}, which has no closed-form warm '
+                'start; pass second_order_moments from '
+                "'ablate_sol.py --second-moments'")
+        moments = torch.load(config.second_order_moments, map_location='cpu')
+        self.predictor.init_low_rank_second_order_(moments['c_u'],
+                                                   moments['c_v'])
+        progress.log(f'second-order head warm-started from '
+                     f'{config.second_order_moments} '
+                     f"(geometry {moments.get('geometry')})")
+
 
     def _check_geometry_coverage(self) -> None:
         """Refuses a geometry no sample can serve, before the first step.

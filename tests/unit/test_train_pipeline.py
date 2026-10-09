@@ -500,3 +500,28 @@ def test_a_geometry_with_no_sample_is_refused_at_startup():
                                               seed=0)
     with pytest.raises(ValueError, match='no sample fits'):
         checker._check_geometry_coverage()
+
+
+def test_veda2_knobs_default_to_veda1():
+    """second_order_rank 0 and count_term false must be Veda1 exactly."""
+    config = _lr_config()
+    assert config.second_order_rank == 0
+    assert config.count_term is False
+    assert config.heat_reduce == 'max'
+    assert config.second_order_moments is None
+    config.validate()
+
+
+def test_heat_reduce_and_rank_are_validated_before_the_run():
+    with pytest.raises(ValueError, match='heat_reduce must be'):
+        _lr_config(heat_reduce='mean').validate()
+    with pytest.raises(ValueError, match='second_order_rank must be'):
+        _lr_config(second_order_rank=-1).validate()
+    _lr_config(heat_reduce='sum', second_order_rank=8,
+               count_term=True).validate()
+
+
+def test_veda_config_carries_the_heat_target():
+    from miowtion.veda import attention as veda_attention
+    assert veda_attention.VedaConfig().heat_reduce == 'max'
+    assert veda_attention.VedaConfig(heat_reduce='sum').heat_reduce == 'sum'

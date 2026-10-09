@@ -47,6 +47,10 @@ class VedaConfig:
             between geometries.
         recall_every: Compute the mask diagnostics on every n-th layer.
         dense_layers: Layers that stay dense in the sparse student.
+        heat_reduce: Which teacher heat the predictor is distilled
+            against: 'max' for the block's peak probability (Veda1) or
+            'sum' for its total attention mass (Veda2). Mass is what
+            determines the output error; see docs/features/veda2.md.
         collect_bytes: Bound on one tile-ordered q / k / v / out copy; a
             head group is processed in chunks of heads under it. Heads are
             independent, so it changes only the launch count, never the
@@ -55,6 +59,7 @@ class VedaConfig:
             which is much faster (docs/benchmark/performance.md §11.3).
     """
 
+    heat_reduce: str = 'max'
     target_budget: veda_mask.Budget = veda_mask.Budget(ratio=0.1)
     ref_budget: veda_mask.Budget | None = None
     tile_conditions: bool = False
@@ -325,7 +330,7 @@ class TeacherCollector:
                     else (*_gather_and_pool(k, tile_layout, heads), None))
                 heat = heatmap.teacher_heat(
                     q_tiles, k_tiles, _gather_lse(lse, tile_layout, heads),
-                    tile_layout, rows)
+                    tile_layout, rows, self.clip.config.heat_reduce)
                 extra = _extra_features(self.predictor, tile_layout, sq_q,
                                         var_k, rows)
                 del q_tiles, k_tiles

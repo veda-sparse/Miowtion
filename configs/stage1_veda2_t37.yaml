@@ -1,0 +1,44 @@
+# Stage 1 for Veda2: the two score terms present from the first step, and
+# distilled against block *mass* rather than the block maximum.
+#
+# Why they have to move together: the predictor's N(0, 1e-4) projections
+# make an untrained score equal mean-pooled QK, which is the zero-order
+# term of the block log-mass. log B_j and the diagonal second cumulant are
+# the next two terms, and both start at their exact coefficients here. A
+# block maximum barely moves with the row count, so training against it is
+# what made the count term look useless; see docs/features/veda2.md.
+#
+# Everything else matches stage1_fast_t37_4090, the run that produced the
+# released Veda1 predictor, so the comparison is on the two changes and
+# not on the schedule: same four aspects at the cheapest length, same keep
+# ratio, same lr, same teacher_q_tiles, KL only (topk_weight 0).
+# Differences forced by this box: one rank instead of two, so accum 4 is
+# batch 4 rather than 8, and no init_from warm start.
+run_name: stage1_veda2_t37
+checkpoint_root: weights/MiniMax-H3
+sample_cache: artifacts/samples/moviegen_video_bench
+geometries: ['1:1@37', '4:3@37', '16:9@37', '9:16@37']
+geometry_sampling: cycle
+variant: FL2VA
+tasks: [t2va]
+plan_dir: plans/released
+schedule: turbo
+num_steps: 8
+teacher_adapter: weights/turbo_lora/minimax_h3_turbo_v4_step600_ema.safetensors
+keep_ratio: 0.1
+teacher_q_tiles: 1.0
+# --- the two Veda2 changes ---
+second_order_rank: 128
+count_term: true
+heat_reduce: sum
+# -----------------------------
+accum: 4
+steps: 400
+lr: 1.0e-3
+warmup: 20
+save_every: 25
+keep_optimizer: 1
+out_dir: runs
+offload_blocks: 30
+prefetch: 1
+mlp_chunk_rows: 8192
