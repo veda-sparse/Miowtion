@@ -1,0 +1,33 @@
+# Sol-Attn at a density matched to the Veda arms, at the ORIGINAL
+# durations. This config exists to correct an unfair comparison of our
+# own making: the first pass ran Sol at tau 1.2, which on real H3
+# activations routes only 1.67% of key blocks, against Veda at 5%. The
+# "Veda2 beats Sol on SSIM at t102" result from that pass therefore
+# compared a 5% budget with a 1.6% budget and does not hold.
+#
+# tau 0.7 measured 4.82% at 16:9@37, which is the closest operating
+# point to the 5% the Veda arms are given. tau is a threshold and not a
+# budget, so the density it reaches at t102 is a property of the
+# activations: MIOWTION_SOL_DENSITY=0.7 makes the run report the
+# density it actually used, and that number is what gets published
+# alongside the quality, not the target.
+root: weights/MiniMax-H3
+variant: FL2VA
+schedule: turbo
+num_steps: 8
+adapter: weights/turbo_lora/minimax_h3_turbo_v4_step600_ema.safetensors
+sample_cache: artifacts/samples/demo12
+seed: 0
+keep_ratio: 0.05
+offload_blocks: 30
+prefetch: 1
+mlp_chunk_rows: 8192
+decode_dtype: bf16
+# One head group per launch; the default bound is sized for 24 GB.
+veda_collect_mib: 2048
+sample_id: [
+  demo01_01M4G4ZS]
+geometry: ['9:16@102']
+attention: [sol]
+sol_tau: 0.7
+out_dir: artifacts/demo12_orig/sol07_9x16_t102

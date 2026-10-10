@@ -41,8 +41,19 @@ def _clips(root: str) -> dict[tuple[str, str], dict[str, str]]:
     one run can hold several modes (a dense+sol run writes both), so the
     key is the mode rather than the directory it came from.
     """
+    paths = sorted(glob.glob(os.path.join(root, '*', '*', '*.mp4')))
+    # Two arms can write the same mode: a dense+sol run and a
+    # recalibrated sol run both produce sol.mp4, and labelling by mode
+    # alone silently keeps whichever sorts last. So a mode that appears
+    # under more than one arm carries its arm in the label.
+    providers: dict[str, set[str]] = {}
+    for path in paths:
+        mode = os.path.splitext(os.path.basename(path))[0]
+        arm = os.path.basename(os.path.dirname(os.path.dirname(path)))
+        providers.setdefault(mode, set()).add(arm.rsplit('_', 2)[0])
+
     found: dict[tuple[str, str], dict[str, str]] = {}
-    for path in sorted(glob.glob(os.path.join(root, '*', '*', '*.mp4'))):
+    for path in paths:
         mode = os.path.splitext(os.path.basename(path))[0]
         clip = os.path.basename(os.path.dirname(path))
         arm = os.path.basename(os.path.dirname(os.path.dirname(path)))
@@ -50,7 +61,13 @@ def _clips(root: str) -> dict[tuple[str, str], dict[str, str]]:
         # fields (`16x9_t37`), the sample is everything before them.
         parts = clip.split('_')
         sample, geometry = '_'.join(parts[:-2]), '_'.join(parts[-2:])
-        label = mode if mode != 'veda' else arm.split('_')[0]
+        stem = arm.rsplit('_', 2)[0]
+        if len(providers[mode]) > 1:
+            label = f'{mode}@{stem}'
+        elif mode == 'veda':
+            label = stem
+        else:
+            label = mode
         found.setdefault((sample, geometry), {})[label] = path
     return found
 
