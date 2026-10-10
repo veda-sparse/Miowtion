@@ -91,3 +91,21 @@ def test_offline_probe_builds_a_valid_veda_config():
     built = veda_attention.VedaConfig(
         target_budget=veda_mask.Budget(ratio=config.keep_ratio))
     assert built.target_budget.ratio == config.keep_ratio
+
+
+def test_generate_does_not_silently_drop_the_plan_override():
+    """--plan-dir with --predictor used to be ignored.
+
+    The bundle carries the plan it was searched with, and that branch
+    returned before ever reading --plan-dir, so four runs with four
+    different plan directories produced pixel-identical video. The flag
+    must take effect; an explicit option that is silently dropped is
+    worse than one that raises.
+    """
+    source = open(os.path.join(_ROOT, 'scripts', 'generate.py')).read()
+    branch = source[source.index('if args.predictor:'):
+                    source.index('elif args.plan_dir and args.checkpoint:')]
+    assert 'args.plan_dir' in branch, (
+        'the --predictor branch never reads --plan-dir, so the override '
+        'is dropped again')
+    assert 'PlanTable.load_dir(args.plan_dir)' in branch

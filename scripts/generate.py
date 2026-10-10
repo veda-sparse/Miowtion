@@ -300,6 +300,15 @@ def _denoise_all(args, env, cache, jobs, devices, assigned) -> list[dict]:
             loaded = veda_bundle.load(args.predictor, devices[0])
             plans, predictor = loaded.plans, loaded.predictor
             source = f'bundle {args.predictor} ({loaded.metadata["source"]})'
+            if args.plan_dir:
+                # A bundle carries the plan it was searched with, so
+                # --plan-dir used to be dropped on the floor here: four
+                # runs with four different plan directories produced
+                # pixel-identical video. An explicit flag must either
+                # take effect or raise, never be ignored.
+                plans = veda_plan.PlanTable.load_dir(args.plan_dir)
+                source += (f', plans overridden by {args.plan_dir} '
+                           '(off-distribution for this predictor)')
         elif args.plan_dir and args.checkpoint:
             plans = veda_plan.PlanTable.load_dir(args.plan_dir)
             cfg = tch.model.config
