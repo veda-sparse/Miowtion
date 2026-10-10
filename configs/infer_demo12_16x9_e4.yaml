@@ -6,9 +6,11 @@
 # attribute a difference to the compensation itself.
 #
 # attention: [veda, veda_comp] runs both arms in one process, so they
-# also share the adapter merge and the AdaLN tables, and the attention
+# share the adapter merge and the AdaLN tables and their attention
 # seconds are directly comparable: veda_comp's extra cost is exactly the
 # [rows, n_tiles] centroid term.
+root: weights/MiniMax-H3
+variant: FL2VA
 schedule: turbo
 num_steps: 8
 adapter: weights/turbo_lora/minimax_h3_turbo_v4_step600_ema.safetensors
