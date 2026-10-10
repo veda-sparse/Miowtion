@@ -1,0 +1,33 @@
+# Second pass: the SAME 12 demo captions at their ORIGINAL durations,
+# so the four-way comparison is not confined to the short geometry. The
+# 95% sparsity target and every other parameter are unchanged; only
+# latent_t moves (37 -> 102 for the 15 s sources, 72 for the 10 s one).
+#
+# This is the expensive direction. At latent_t 102 the sequence is about
+# 2.8x longer than at 37, so attention is roughly 8x, and the measured
+# dense denoise is 448 s a clip against 147 s for a sparse arm
+# (docs/features/evaluation.md). It is also the regime where sparsity
+# actually pays: at t37 attention is only 16-26% of a step, so nothing
+# about end-to-end speed can be concluded there.
+root: weights/MiniMax-H3
+variant: FL2VA
+schedule: turbo
+num_steps: 8
+adapter: weights/turbo_lora/minimax_h3_turbo_v4_step600_ema.safetensors
+sample_cache: artifacts/samples/demo12
+seed: 0
+keep_ratio: 0.15
+offload_blocks: 30
+prefetch: 1
+mlp_chunk_rows: 8192
+decode_dtype: bf16
+# One head group per launch; the default bound is sized for 24 GB.
+veda_collect_mib: 2048
+sample_id: [
+  demo00_01M4GA5P, demo02_01M4G57X, demo03_01M4G3N3, demo04_01M4G1FK,
+  demo05_01M4G148, demo07_01M4FWTA, demo08_01M4FVNY, demo09_01M4FJEZ,
+  demo10_01M4FDY7, demo11_01M4FAD6]
+geometry: ['16:9@102']
+attention: [veda]
+predictor: weights/veda/veda2_r16.safetensors
+out_dir: artifacts/demo12_orig/veda2d015_16x9_t102
