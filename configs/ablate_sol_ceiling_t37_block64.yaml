@@ -1,0 +1,37 @@
+# E1 on 64-token blocks: does "more tiles beats compensation" depend on
+# the block size? The plan lists this as the step needed before our
+# conclusion can be extrapolated to the external comparison, whose Sol
+# runs on 64-token blocks while all our ceiling numbers (c=0/1/2 on
+# 33600 rows) were measured on 128-token 3D tiles.
+#
+# Only the block size moves: 4x4x8 (128) -> 4x4x4 (64) halves the
+# temporal extent and leaves the spatial footprint identical, so the
+# spatial locality of the tile is not a confound.
+#
+# IMPORTANT, this is NOT a test of contiguity. Sol takes 64 CONTIGUOUS
+# tokens in original sequence order; a 4x4x4 tile is still a 3D box.
+# So this answers "does the conclusion survive at Sol's block size",
+# not "does it survive at Sol's block shape". The second question needs
+# a contiguous-block masker and is still open.
+run_name: sol_ceiling_t37_block64
+checkpoint_root: weights/MiniMax-H3
+sample_cache: artifacts/samples/moviegen_holdout20
+geometries: ['16:9@37']
+variant: FL2VA
+tasks: [t2va]
+num_clips: 1
+steps: [0, 2, 5, 7]
+schedule: turbo
+num_steps: 8
+teacher_adapter: weights/turbo_lora/minimax_h3_turbo_v4_step600_ema.safetensors
+# No adopted plan for this geometry yet; one shape for every head. Set
+# `plan: plans/<geometry>.json` instead once a plan is in plans/.
+tile_shape: 4x4x4
+densities: [0.05, 0.1, 0.2]
+alphas: [0.5, 1.0, 2.0]
+query_tiles: 6
+oracle: Omega0
+out_dir: runs/sol_ceiling_t37_block64
+offload_blocks: 30
+prefetch: 1
+mlp_chunk_rows: 8192
