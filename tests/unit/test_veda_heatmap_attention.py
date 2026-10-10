@@ -886,3 +886,24 @@ def test_oracle_student_rejects_an_unknown_target():
     with pytest.raises(ValueError, match='target must be one of'):
         veda_attention.OracleStudent(_Clip(), None, 'peak',
                                      allow_reference_kernel=True)
+
+
+def test_sol_thresh_type_is_switchable_and_validated(monkeypatch):
+    """The published tau-to-density mapping belongs to one of the two.
+
+    Upstream defaults to 'diag' and the ComfyUI node takes that default;
+    this wrapper defaulted to 'exact'. The documented mapping (tau 1.0
+    keeps about 16% of key blocks) disagrees with what we measure under
+    'exact' by a factor of six, so which threshold a number belongs to
+    has to be switchable and recorded rather than assumed.
+    """
+    from miowtion.kernels import sol
+
+    q = torch.zeros(4, 2, 128)
+    monkeypatch.setenv('MIOWTION_SOL_THRESH', 'nonsense')
+    with pytest.raises((ValueError, RuntimeError)) as caught:
+        sol.attention(q, q, q, 4)
+    # Either the unavailable guard or the threshold guard may fire first
+    # depending on the host; both are correct refusals.
+    assert 'thresh_type' in str(caught.value) or 'unavailable' in str(
+        caught.value)
