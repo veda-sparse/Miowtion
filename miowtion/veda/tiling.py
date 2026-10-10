@@ -20,11 +20,24 @@ from __future__ import annotations
 
 import dataclasses
 import itertools
+import os
 from collections.abc import Callable, Sequence
 
 import torch
 
-TILE_SIZE = 128
+# Tiles hold this many tokens. Overridable only so the ablations can ask
+# what the conclusions owe to the block size: the external comparisons run
+# 64-token blocks while every number here was measured on 128. Modules
+# capture this at import (`_TILE = tiling.TILE_SIZE`), so it has to be set
+# in the environment before anything imports them, which is also why it is
+# not a function argument.
+_TILE_ENV = os.environ.get('MIOWTION_TILE_SIZE', '128')
+if _TILE_ENV not in ('64', '128'):
+    raise ValueError(
+        f'MIOWTION_TILE_SIZE must be 64 or 128, got {_TILE_ENV!r}; the '
+        'kernels and the pooling assume a power-of-two tile and have only '
+        'been exercised at these two')
+TILE_SIZE = int(_TILE_ENV)
 
 
 @dataclasses.dataclass(frozen=True, order=True)

@@ -175,3 +175,29 @@ def test_contiguous_layout_leaves_the_rows_where_they_were():
     assert torch.equal(layout.perm, torch.arange(128))
     permuted = tiling.build_tile_layout([span], used=128, seq_len=128)
     assert not torch.equal(permuted.perm, torch.arange(128))
+
+
+def test_tile_size_is_fixed_unless_the_environment_says_otherwise():
+    """64 exists only so the ablations can price the block size.
+
+    Every number in docs/features/veda2.md was measured on 128-token
+    tiles while the comparisons we argue with run 64, and the modules
+    capture this constant at import, so it cannot be a call argument.
+    The default must stay 128 and anything else must be refused.
+    """
+    import importlib
+    import os
+
+    assert tiling.TILE_SIZE == 128, 'the default moved'
+    old = os.environ.get('MIOWTION_TILE_SIZE')
+    try:
+        os.environ['MIOWTION_TILE_SIZE'] = '96'
+        with pytest.raises(ValueError, match='must be 64 or 128'):
+            importlib.reload(tiling)
+    finally:
+        if old is None:
+            os.environ.pop('MIOWTION_TILE_SIZE', None)
+        else:
+            os.environ['MIOWTION_TILE_SIZE'] = old
+        importlib.reload(tiling)
+    assert tiling.TILE_SIZE == 128
