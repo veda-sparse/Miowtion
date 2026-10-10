@@ -149,6 +149,20 @@ patch `[1,2,2]`、VAE 空间 8× 时间 4×。`head_dim 128` 和 H3 一样，所
    286 个 video tile + 4 个 global tile，`valid_count` 之和恰等于 `used`，
    排列里每个真实行恰好出现一次（单测 `tests/unit/test_wan_layout.py` 钉住）。
    尺寸不整除或帧数不是 4k+1 时显式报错，不静默丢 token。
+
+   **第二步也做掉了**：`miowtion/wan/attention.py`。Wan 是标准 diffusers DiT，
+   `WanAttnProcessor.__call__` 在 RoPE 之后调 `dispatch_attention_fn(q, k, v, ...)`，
+   张量形状 `[B, S, H, D]`——去掉 batch 维正好是我们 `AttentionFn` 协议的形状。
+   子类化并只覆盖那一次调用，投影、RoPE、图像交叉分支、输出投影全部不动；
+   交叉注意力（key 长度不同、无 tile 结构）保持稠密，用 `encoder_hidden_states`
+   是否为 None 区分。
+
+   **这一步必须对着上游逐值验证**，`tests/unit/test_wan_attention.py` 就是干这个的，
+   而且它当场抓到了两个转写错误：① norm 要在**展开头之前**作用在扁平的 `[B, S, H*D]`
+   上，写反会把 RMS 的分母从 `H*D` 变成 `D`；② RoPE 的交错——上游取
+   `freqs_cos[..., 0::2]` 与 `freqs_sin[..., 1::2]`，而**通常那种「整体乘 cos、旋转副本
+   乘 sin」的写法是另一个函数**，100% 的元素都不同。两个错误都不会抛异常，
+   只会让每一层安静地算偏。
 2. **tile 方案搜索**。Veda2 的收益依赖逐 (层, 头) 的 tile 形状，而那是搜出来的
    （`scripts/search_tiles.py`）。Wan 上必须重搜,这是 GPU 工作，按 H3 的经验是小时级。
 3. **二阶头的校准**。`ablate_sol.py --second-moments` 要在 Wan 上重跑一次（一条 clip，
