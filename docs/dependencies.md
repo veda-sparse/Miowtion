@@ -163,6 +163,23 @@ patch `[1,2,2]`、VAE 空间 8× 时间 4×。`head_dim 128` 和 H3 一样，所
    `freqs_cos[..., 0::2]` 与 `freqs_sin[..., 1::2]`，而**通常那种「整体乘 cos、旋转副本
    乘 sin」的写法是另一个函数**，100% 的元素都不同。两个错误都不会抛异常，
    只会让每一层安静地算偏。
+
+   **端到端跑通了**（`scripts/wan_smoke.py`，RTX PRO 6000，2026-10-11）：
+
+   ```
+   loaded: 30 layers, 12 heads, dim 128
+   256x256x9 -> grid (3, 16, 16), 768 tokens
+   tile shape 1x8x16: 6 tiles, 6 video
+   processors swapped on all 30 blocks
+   block-0 self-attention out (1, 768, 1536) bf16 | veda calls 1 | finite True
+   ```
+
+   真实 Wan 权重 → 我们的 `PackedLayout` → `build_tile_layout` → **FA4 块稀疏 kernel**
+   → 处理器写回。**Veda 这一侧一行都没改。**
+
+   **所以 P0-3 只剩 GPU 的那一半**：方案搜索（要稠密教师的真实激活，小时级，
+   无法走捷径）和二阶头校准（约 1.5 分钟）。原先写的「接口要重做一遍」是高估了
+   —— 实际是两个文件、约 200 行，加三个冒烟/等价性检查。
 2. **tile 方案搜索**。Veda2 的收益依赖逐 (层, 头) 的 tile 形状，而那是搜出来的
    （`scripts/search_tiles.py`）。Wan 上必须重搜,这是 GPU 工作，按 H3 的经验是小时级。
 3. **二阶头的校准**。`ablate_sol.py --second-moments` 要在 Wan 上重跑一次（一条 clip，
