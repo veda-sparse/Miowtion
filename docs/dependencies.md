@@ -88,3 +88,32 @@ commit、**不修改内容**，并按 AGENTS.md §3 核对许可证必须与 MIT
 按 AGENTS.md §3，**不使用**，并在论文的横向对比里注明「该方法因许可证不明未纳入」，
 而不是悄悄跳过。
 
+
+## Wan2.1-T2V-1.3B（P0-3 的第二个公开模型）
+
+| | |
+|---|---|
+| 来源 | `Wan-AI/Wan2.1-T2V-1.3B-Diffusers`（HuggingFace） |
+| 本地 | `weights/wan/Wan2.1-T2V-1.3B`，**27 GB，已验证完整** |
+| 构成 | `WanPipeline`（diffusers 0.33.0.dev0）：transformer 2 分片 5.29 GiB、text_encoder 5 分片 21.16 GiB、vae 0.47 GiB、scheduler、tokenizer；**incomplete 文件 0 个** |
+| 用途 | 横向对比的第二个模型，解决「只有一个非公开模型」这条审稿风险 |
+
+**下载必须走本地 mihomo 代理**（见 agent 的本地 memory），而且**要带重试循环**：前四次单次
+尝试全部静默失败,进程还在、`.incomplete` 是 0 字节、大小停在只有 config 的 6.7 MB。
+其中有两次是我自己造成的：容器里 `ss -ltn` 查不到 7890 的监听，我据此判断 mihomo 死了，
+把 `/etc/profile.d` 已经设对的代理变量 `unset` 了，于是每个请求直奔被阻的 CDN。
+**判断代理活没活要读它自己的日志或 `curl -x` 直测，不能看 `ss`。**
+
+### P0-3 剩下的工作量（权重已不是卡点）
+
+1. **Veda2 到 Wan 的移植**。Veda 的 tile 排列、方案表、FA4 块稀疏整合都绑在 H3 的
+   packed layout 上（video / audio / global 三个象限、ragged 补齐、按 (层, 头) 选形状）。
+   Wan 没有音频象限，latent 网格也不同，所以 `h3/layout.py` 与 `veda/tiling.py` 的
+   接口要为 Wan 重做一遍。
+2. **tile 方案搜索**。Veda2 的收益依赖逐 (层, 头) 的 tile 形状，而那是搜出来的
+   （`scripts/search_tiles.py`）。Wan 上必须重搜,这是 GPU 工作，按 H3 的经验是小时级。
+3. **二阶头的校准**。`ablate_sol.py --second-moments` 要在 Wan 上重跑一次（一条 clip，
+   约 1.5 分钟），因为 `C_u`/`C_v` 是模型相关的。
+4. **对比方法的接线**。SpargeAttn / SVG+EAR / SLA / STA 都有 Wan 路径（SVG 甚至有
+   `svg/models/wan/inference.py`），所以这一层比在 H3 上容易,它们本来就是为 Wan 写的。
+
