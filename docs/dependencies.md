@@ -136,10 +136,19 @@ patch `[1,2,2]`、VAE 空间 8× 时间 4×。`head_dim 128` 和 H3 一样，所
 
 ### P0-3 剩下的工作量（权重已不是卡点）
 
-1. **Veda2 到 Wan 的移植**。Veda 的 tile 排列、方案表、FA4 块稀疏整合都绑在 H3 的
-   packed layout 上（video / audio / global 三个象限、ragged 补齐、按 (层, 头) 选形状）。
-   Wan 没有音频象限，latent 网格也不同，所以 `h3/layout.py` 与 `veda/tiling.py` 的
-   接口要为 Wan 重做一遍。
+1. ~~**Veda2 到 Wan 的移植**：接口要重做一遍。~~ **这条是高估，已做掉第一步。**
+   Veda 从不碰音频和参考象限：`veda/tiling.py`、`veda/mask.py`、`veda/attention.py`、
+   `veda/search.py` 一共只读 **12 个** layout 字段，而且全是几何无关的
+   （`n_video_tiles` / `gather_index` / `used` / `pad_slots` / `valid_count` / `kv_ok` /
+   `seq_len` / `n_tiles` / `n_ref_tiles` / `spans` / `slot_valid` / `scatter_index`），
+   `tiling.build_tile_layout` 从 spans 就能全部导出。所以第二个模型要的是**一组正确的
+   span**，不是接口重做。
+
+   `miowtion/wan/layout.py` 已经给出：832×480×81 → token 网格 (21, 30, 52)、
+   `used` 33272、单个 target span、无音频无参考。Veda 的 tiling 直接跑通，
+   286 个 video tile + 4 个 global tile，`valid_count` 之和恰等于 `used`，
+   排列里每个真实行恰好出现一次（单测 `tests/unit/test_wan_layout.py` 钉住）。
+   尺寸不整除或帧数不是 4k+1 时显式报错，不静默丢 token。
 2. **tile 方案搜索**。Veda2 的收益依赖逐 (层, 头) 的 tile 形状，而那是搜出来的
    （`scripts/search_tiles.py`）。Wan 上必须重搜,这是 GPU 工作，按 H3 的经验是小时级。
 3. **二阶头的校准**。`ablate_sol.py --second-moments` 要在 Wan 上重跑一次（一条 clip，
