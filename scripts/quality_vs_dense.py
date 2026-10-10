@@ -81,6 +81,58 @@ def _bootstrap(values: list[float], draws: int, seed: int
     return (lo, hi)
 
 
+def _paired(per_clip: list[dict], metric: str, draws: int, seed: int
+            ) -> list[dict]:
+    """Paired comparisons between arms on the clips they share.
+
+    Clip difficulty dominates the variance here: at 16:9@37 the marginal
+    intervals of three routers overlap almost completely, which reads as
+    "no difference", while the same data paired shows one of them ahead
+    on 9 of 10 clips. Independent intervals therefore hide real effects
+    in this design, and a table that reports "no significant difference"
+    from them is not entitled to that conclusion.
+
+    Args:
+        per_clip: Rows as produced by the per-clip pass.
+        metric: Which metric to pair on.
+        draws: Bootstrap resamples over clips.
+        seed: Bootstrap seed.
+
+    Returns:
+        One row per (arm_a, arm_b, geometry) with the mean paired
+        difference, its percentile interval, and how many clips it won.
+    """
+    index: dict[tuple, dict[str, float]] = {}
+    for row in per_clip:
+        if metric in row:
+            index.setdefault((row['sample'], row['geometry']),
+                             {})[row['arm']] = row[metric]
+    out = []
+    arms = sorted({a for v in index.values() for a in v})
+    geometries = sorted({k[1] for k in index})
+    for geometry in geometries:
+        for i, first in enumerate(arms):
+            for second in arms[i + 1:]:
+                diffs = [v[first] - v[second] for k, v in index.items()
+                         if k[1] == geometry and first in v and second in v]
+                if len(diffs) < 3:
+                    continue
+                rng = random.Random(seed)
+                means = sorted(
+                    sum(diffs[rng.randrange(len(diffs))]
+                        for _ in diffs) / len(diffs)
+                    for _ in range(draws))
+                lo = means[int(0.025 * draws)]
+                hi = means[min(draws - 1, int(0.975 * draws))]
+                out.append({
+                    'metric': metric, 'geometry': geometry,
+                    'arm_a': first, 'arm_b': second, 'clips': len(diffs),
+                    'mean_difference': sum(diffs) / len(diffs),
+                    'ci': [lo, hi], 'significant': lo * hi > 0,
+                    'wins': sum(1 for d in diffs if d > 0)})
+    return out
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--root', required=True,
@@ -142,10 +194,29 @@ def main():
               f'{cells[0][0]:>10}{cells[0][1]:>18}'
               f'{cells[1][0]:>9}{cells[1][1]:>18}')
 
+    paired = []
+    for metric in _METRICS:
+        paired += _paired(per_clip, metric, args.bootstrap, args.seed)
+    if paired:
+        print(f'\npaired over the clips each pair shares '
+              f'(clip difficulty dominates the variance, so this is the '
+              f'test with power):')
+        print(f'{"metric":<9}{"geometry":<11}{"comparison":<22}{"n":>4}'
+              f'{"mean diff":>11}{"95% CI":>22}{"wins":>7}')
+        for row in paired:
+            mark = ' *' if row['significant'] else '  '
+            comparison = f'{row["arm_a"]} - {row["arm_b"]}'
+            print(f'{row["metric"]:<9}{row["geometry"]:<11}'
+                  f'{comparison:<22}{row["clips"]:>4}'
+                  f'{row["mean_difference"]:>+11.4f}'
+                  f'  [{row["ci"][0]:+.4f}, {row["ci"][1]:+.4f}]'
+                  f'{row["wins"]:>5}/{row["clips"]}{mark}')
+        print('  * the paired interval excludes zero')
     if args.out:
         os.makedirs(os.path.dirname(args.out) or '.', exist_ok=True)
         json.dump({'reference': args.reference, 'per_clip': per_clip,
-                   'summary': summary}, open(args.out, 'w'), indent=1)
+                   'summary': summary, 'paired': paired},
+                  open(args.out, 'w'), indent=1)
         progress.log(f'wrote {args.out}')
 
 
