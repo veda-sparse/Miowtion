@@ -65,6 +65,13 @@ class VedaConfig:
             against: 'max' for the block's peak probability (Veda1) or
             'sum' for its total attention mass (Veda2). Mass is what
             determines the output error; see docs/features/veda2.md.
+        zero_order_compensation: Replace each dropped tile by one
+            virtual key at its centroid instead of discarding it, which
+            is Sol's zero-order term. Only for the end-to-end ablation
+            (plan E4): it is the one comparison where nothing but the
+            compensation differs -- same tiles, same router, same kernel.
+            Off by default; it costs a [rows, n_tiles] score matrix on
+            top of the kernel, which is the cost the ablation measures.
         contiguous_tiles: Cut the sequence into blocks in its own order
             instead of permuting it into 3D tiles. Only for ablations
             against methods that block the sequence as it lies (Sol-Attn
@@ -89,6 +96,7 @@ class VedaConfig:
     ref_budget: veda_mask.Budget | None = None
     tile_conditions: bool = False
     contiguous_tiles: bool = False
+    zero_order_compensation: bool = False
     teacher_q_tiles: float = 1.0
     recall_every: int = 1
     dense_layers: frozenset[int] = frozenset()
@@ -534,6 +542,99 @@ class OracleStudent:
         _scatter_(out, o_tiles, tile_layout, heads)
 
 
+def zero_order_compensation(
+        o_kept: torch.Tensor, lse_kept: torch.Tensor, q_tiles: torch.Tensor,
+        k_tiles: torch.Tensor, v_tiles: torch.Tensor,
+        block_mask: torch.Tensor, tile_layout: tiling.TileLayout,
+        chunk_rows: int = 4096) -> torch.Tensor:
+    """Adds Sol's zero-order term for the tiles the mask dropped.
+
+    A dropped tile is not discarded but replaced by one virtual key at
+    its centroid: key `mean_j k` carrying value `sum_j v`, weighted as if
+    it stood for all `B_j` of the tile's real rows. This is the `c = 1`
+    arm of `solattn.relative_errors`, the one whose ceiling we measured,
+    reproduced here so it can run end to end rather than only offline.
+
+    Two facts make that possible inside a sparse path:
+
+    * **The exponential reference cancels.** Numerator and denominator
+      both carry `exp(-ref_u)`, so the output does not depend on `ref`
+      and in particular does not need the dense LSE, which is what made
+      this look impossible. Verified to 4e-16 in float64 against the
+      dense-LSE form.
+    * **Taking `ref = lse_kept` makes the kept denominator exactly 1**,
+      because `lse_kept` is by definition `log sum_kept exp(s)`. The
+      kernel's output is already `num/den`, so with that reference it
+      *is* the numerator and the whole combination collapses to
+      `(o_kept + extra) / (1 + den_extra)`.
+
+    Args:
+        o_kept: [R*128, H', D] block-sparse kernel output, i.e. num/den
+            over the kept keys.
+        lse_kept: [H', R*128] fp32 log-sum-exp over the kept keys.
+        q_tiles: [R*128, H', D] tile-ordered queries.
+        k_tiles: [N*128, H', D] tile-ordered keys, padding slots zeroed.
+        v_tiles: [N*128, H', D] tile-ordered values, padding slots zeroed.
+        block_mask: [H', R, n_tiles] bool, True where the tile was kept.
+        tile_layout: Tile layout, for the real row count of each key tile.
+        chunk_rows: Query rows per chunk. The term needs a
+            [rows, n_tiles] score matrix, which is per *row* and not per
+            query tile, so it cannot be materialised whole.
+
+    Returns:
+        [R*128, H', D] in o_kept.dtype.
+
+    Raises:
+        ValueError: On a shape mismatch.
+        RuntimeError: If a query row kept no key at all, which would make
+            the reference -inf. Every real row keeps its own diagonal
+            tile, so this means the mask is malformed rather than that a
+            fallback is needed.
+    """
+    n_rows, n_heads, head_dim = o_kept.shape
+    n_tiles = tile_layout.n_tiles
+    if lse_kept.shape != (n_heads, n_rows):
+        raise ValueError(f'lse_kept is {tuple(lse_kept.shape)}, expected '
+                         f'{(n_heads, n_rows)}')
+    if block_mask.shape != (n_heads, n_rows // tiling.TILE_SIZE, n_tiles):
+        raise ValueError(
+            f'block_mask is {tuple(block_mask.shape)}, expected '
+            f'{(n_heads, n_rows // tiling.TILE_SIZE, n_tiles)}')
+    scale = head_dim ** -0.5
+    counts = tile_layout.valid_count.to(torch.float32).clamp(min=1.0)
+    # Padding slots are zeroed by the gather, so a sum over all 128 slots
+    # of a tile is a sum over its real rows.
+    k_mean = (k_tiles.float().view(n_tiles, tiling.TILE_SIZE, n_heads,
+                                   head_dim).sum(1) / counts[:, None, None])
+    v_sum = v_tiles.float().view(n_tiles, tiling.TILE_SIZE, n_heads,
+                                 head_dim).sum(1)
+    out = torch.empty_like(o_kept)
+    for start in range(0, n_rows, chunk_rows):
+        stop = min(start + chunk_rows, n_rows)
+        ref = lse_kept[:, start:stop]                        # [H', C]
+        owner = torch.arange(start, stop, device=o_kept.device
+                             ) // tiling.TILE_SIZE
+        keep = block_mask[:, owner, :]                       # [H', C, N]
+        if not bool(torch.isfinite(ref[keep.any(-1)]).all()):
+            raise RuntimeError('a query row kept at least one tile but '
+                               'its lse is not finite')
+        drop = (~keep).to(torch.float32)
+        s_hat = torch.einsum(
+            'chd,nhd->hcn', q_tiles[start:stop].float(), k_mean) * scale
+        # A row that kept nothing has ref -inf; it carries no mass either
+        # way, and the gather already zeroed it, so neutralise the term
+        # rather than producing inf - inf.
+        safe = torch.where(torch.isfinite(ref), ref,
+                           torch.zeros_like(ref))
+        p_hat = torch.exp(s_hat - safe[..., None]) * drop     # [H', C, N]
+        num = torch.einsum('hcn,nhd->chd', p_hat, v_sum)
+        den = torch.einsum('hcn,n->hc', p_hat, counts)
+        out[start:stop] = ((o_kept[start:stop].float() + num)
+                           / (1.0 + den).transpose(0, 1)[..., None]
+                           ).to(o_kept.dtype)
+    return out
+
+
 class SparseStudent:
     """Stage-2 / evaluation attention: predictor-masked block sparsity."""
 
@@ -609,11 +710,18 @@ class SparseStudent:
                 logits[:, :tile_layout.n_video_tiles], tile_layout,
                 self.clip.blocks(tile_layout))
             block_mask = veda_mask.dense_block_mask(selection, tile_layout)
+        compensate = self.clip.config.zero_order_compensation
         if self.use_fa4:
-            o_tiles = fa4.block_sparse_attention(q_tiles, k_tiles, v_tiles,
-                                                 block_mask, tile_layout)
+            result = fa4.block_sparse_attention(
+                q_tiles, k_tiles, v_tiles, block_mask, tile_layout,
+                return_lse=compensate)
         else:
-            o_tiles = reference.block_sparse_attention(
+            result = reference.block_sparse_attention(
                 q_tiles, k_tiles, v_tiles, block_mask,
-                tile_layout.valid_count)
+                tile_layout.valid_count, return_lse=compensate)
+        if compensate:
+            o_tiles = zero_order_compensation(
+                *result, q_tiles, k_tiles, v_tiles, block_mask, tile_layout)
+        else:
+            o_tiles = result
         _scatter_(out, o_tiles, tile_layout, heads)

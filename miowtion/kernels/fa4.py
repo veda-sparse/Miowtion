@@ -237,7 +237,10 @@ def index_lists(block_mask: torch.Tensor, layout: tiling.TileLayout,
 
 def block_sparse_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
                            block_mask: torch.Tensor,
-                           layout: tiling.TileLayout) -> torch.Tensor:
+                           layout: tiling.TileLayout,
+                           return_lse: bool = False
+                           ) -> torch.Tensor | tuple[torch.Tensor,
+                                                     torch.Tensor]:
     """FA4 block-sparse attention on tile-ordered tensors.
 
     Args:
@@ -248,9 +251,13 @@ def block_sparse_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
         block_mask: [H', R, n_tiles] bool, row r = query tile r of `q`
             (mask.dense_block_mask). Empty key tiles are skipped.
         layout: Tile layout (slot validity for the mask_mod).
+        return_lse: Also return the [H', R * 128] fp32 log-sum-exp over
+            the kept keys. The kernel's output is already num/den, so a
+            term computed outside it can only be added once den is
+            recovered, and that takes the lse.
 
     Returns:
-        [R * 128, H', D] bf16.
+        [R * 128, H', D] bf16, or that and the lse when `return_lse`.
 
     Raises:
         NotImplementedError: On architectures without block sparsity.
@@ -293,7 +300,14 @@ def block_sparse_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
             mask_mod=_valid_key_mask_mod(),
             aux_tensors=[layout.slot_valid],
             block_sparse_tensors=tensors,
-            block_sparse_tensors_bwd=tensors_bwd)
-    if isinstance(out, tuple):
-        out = out[0]
-    return out[0]
+            block_sparse_tensors_bwd=tensors_bwd,
+            return_lse=return_lse)
+    if not return_lse:
+        if isinstance(out, tuple):
+            out = out[0]
+        return out[0]
+    if not isinstance(out, tuple):
+        raise RuntimeError('return_lse was requested but the FA4 '
+                           'interface returned a single tensor')
+    rows, lse = out[0], out[1]
+    return rows[0], lse[0]

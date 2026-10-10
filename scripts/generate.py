@@ -285,7 +285,7 @@ def _denoise_all(args, env, cache, jobs, devices, assigned) -> list[dict]:
     # teacher's own statistic. So the plan/budget setup cannot be gated
     # on 'veda' alone.
     oracle_modes = [m for m in args.attention if m.startswith('oracle_')]
-    if oracle_modes and 'veda' not in args.attention:
+    if oracle_modes and not (set(pipeline.VEDA_MODES) & set(args.attention)):
         if not args.plan_dir:
             raise ValueError(f'{oracle_modes[0]} needs --plan-dir')
         plans = veda_plan.PlanTable.load_dir(args.plan_dir)
@@ -295,7 +295,7 @@ def _denoise_all(args, env, cache, jobs, devices, assigned) -> list[dict]:
             tile_conditions=args.tile_conditions,
             collect_bytes=args.veda_collect_mib * 2**20)
         source = f'plans {args.plan_dir}, oracle masks (no predictor)'
-    if 'veda' in args.attention:
+    if set(pipeline.VEDA_MODES) & set(args.attention):
         if args.predictor:
             loaded = veda_bundle.load(args.predictor, devices[0])
             plans, predictor = loaded.plans, loaded.predictor

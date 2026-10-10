@@ -22,7 +22,10 @@ _TILE = tiling.TILE_SIZE
 
 def block_sparse_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
                            block_mask: torch.Tensor,
-                           valid_count: torch.Tensor) -> torch.Tensor:
+                           valid_count: torch.Tensor,
+                           return_lse: bool = False
+                           ) -> torch.Tensor | tuple[torch.Tensor,
+                                                     torch.Tensor]:
     """Masked softmax attention expanded to token granularity, fp32 math.
 
     Args:
@@ -31,9 +34,13 @@ def block_sparse_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
         v: [N, H', D] tile-ordered values.
         block_mask: [H', n_tiles, n_tiles] bool.
         valid_count: [n_tiles] int valid prefix length of each key tile.
+        return_lse: Also return the [H', N] fp32 log-sum-exp over the
+            kept keys. Needed to add a term computed outside the kernel:
+            the kernel's output is already num/den, so recovering den
+            takes the lse. A row with no kept key has lse -inf.
 
     Returns:
-        [N, H', D] in q.dtype.
+        [N, H', D] in q.dtype, or that and the lse when `return_lse`.
     """
     scale = 1.0 / math.sqrt(q.shape[-1])
     key_valid = (torch.arange(_TILE, device=q.device)[None, :]
@@ -44,4 +51,6 @@ def block_sparse_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
     scores = scores.masked_fill(~token_mask, float('-inf'))
     probs = torch.softmax(scores, dim=-1).nan_to_num(0.0)
     out = torch.einsum('hqk,khd->qhd', probs, v.float())
-    return out.to(q.dtype)
+    if not return_lse:
+        return out.to(q.dtype)
+    return out.to(q.dtype), torch.logsumexp(scores, dim=-1)

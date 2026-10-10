@@ -28,7 +28,11 @@ from miowtion.veda import attention as veda_attention
 from miowtion.veda import plan as veda_plan
 from miowtion.veda import predictor as veda_predictor
 
-ATTENTION_MODES = ('dense', 'veda', 'sol',
+# 'veda_comp' is 'veda' with Sol's zero-order compensation switched on;
+# it exists so the end-to-end comparison (plan E4) differs from a plain
+# Veda run in exactly one thing.
+VEDA_MODES = ('veda', 'veda_comp')
+ATTENTION_MODES = ('dense', 'veda', 'veda_comp', 'sol',
                    'oracle_mass', 'oracle_max', 'oracle_mean')
 
 
@@ -118,7 +122,8 @@ def generate(model: h3_model.H3DiT, schedule, tables,
         geometry: Target geometry.
         seed: Noise seed.
         device: Model device.
-        attention: 'dense' or 'veda'.
+        attention: One of ATTENTION_MODES. 'veda_comp' is 'veda' plus
+            the zero-order compensation, same plan and predictor.
         plan: Tile plan of `geometry` (veda only).
         predictor: Trained predictor (veda only).
         veda_config: Budgets and dense layers (veda only).
@@ -132,7 +137,7 @@ def generate(model: h3_model.H3DiT, schedule, tables,
     """
     if attention not in ATTENTION_MODES:
         raise ValueError(f'attention must be one of {ATTENTION_MODES}')
-    if attention == 'veda' and None in (plan, predictor, veda_config):
+    if attention in VEDA_MODES and None in (plan, predictor, veda_config):
         raise ValueError('veda needs a plan, a predictor and a VedaConfig')
     if attention.startswith('oracle_') and None in (plan, veda_config):
         raise ValueError(f'{attention} needs a plan and a VedaConfig; it '
@@ -142,7 +147,10 @@ def generate(model: h3_model.H3DiT, schedule, tables,
                            f'{sol.unavailable_reason() or "device is not CUDA"}')
     traj = traj_lib.Trajectory(model, cache, sample, geometry, schedule,
                                seed, device)
-    tiled = attention == 'veda' or attention.startswith('oracle_')
+    tiled = attention in VEDA_MODES or attention.startswith('oracle_')
+    if attention == 'veda_comp':
+        veda_config = dataclasses.replace(
+            veda_config, zero_order_compensation=True)
     clip = (veda_attention.ClipTiling(traj.layout, veda_config, device)
             if tiled else None)
     steps = progress.Progress(f'generate {sample.id} ({attention})',
@@ -153,7 +161,7 @@ def generate(model: h3_model.H3DiT, schedule, tables,
         torch.cuda.synchronize(device)
         start = time.time()
         inputs = traj.inputs()
-        if attention == 'veda' and inputs.step not in dense_steps:
+        if attention in VEDA_MODES and inputs.step not in dense_steps:
             fn = veda_attention.SparseStudent(clip, plan, predictor)
         elif (attention.startswith('oracle_')
               and inputs.step not in dense_steps):

@@ -907,3 +907,46 @@ def test_sol_thresh_type_is_switchable_and_validated(monkeypatch):
     # depending on the host; both are correct refusals.
     assert 'thresh_type' in str(caught.value) or 'unavailable' in str(
         caught.value)
+
+
+def test_sparse_student_compensated_equals_plain_at_full_density():
+    """The E4 arm has to be a one-variable change.
+
+    At full density nothing is dropped, so the compensated student must
+    return exactly what the plain student returns. Otherwise a difference
+    the arm shows could be plumbing rather than compensation.
+    """
+    lay, plan = _unequal_plan()
+    q, k, v = (t.float() for t in _qkv(lay.seq_len, heads=4))
+    pred = veda_predictor.TileScorePredictor(1, 4, 32)
+    plain_cfg = veda_attention.VedaConfig(
+        target_budget=veda_mask.Budget(ratio=1.0))
+    comp_cfg = dataclasses.replace(plain_cfg, zero_order_compensation=True)
+    outs = []
+    for cfg in (plain_cfg, comp_cfg):
+        clip = veda_attention.ClipTiling(lay, cfg, torch.device('cpu'))
+        with torch.no_grad():
+            outs.append(veda_attention.SparseStudent(
+                clip, plan, pred, allow_reference_kernel=True)(q, k, v, 0))
+    torch.testing.assert_close(outs[0], outs[1], rtol=1e-5, atol=1e-5)
+
+
+def test_sparse_student_compensation_changes_a_sparse_output():
+    """And it must actually do something when tiles are dropped.
+
+    Paired with the test above this pins the flag down from both sides:
+    inert at full density, active below it.
+    """
+    lay, plan = _unequal_plan()
+    q, k, v = (t.float() for t in _qkv(lay.seq_len, heads=4))
+    pred = veda_predictor.TileScorePredictor(1, 4, 32)
+    plain_cfg = veda_attention.VedaConfig(
+        target_budget=veda_mask.Budget(ratio=0.3))
+    comp_cfg = dataclasses.replace(plain_cfg, zero_order_compensation=True)
+    outs = []
+    for cfg in (plain_cfg, comp_cfg):
+        clip = veda_attention.ClipTiling(lay, cfg, torch.device('cpu'))
+        with torch.no_grad():
+            outs.append(veda_attention.SparseStudent(
+                clip, plan, pred, allow_reference_kernel=True)(q, k, v, 0))
+    assert (outs[0] - outs[1]).abs().max() > 1e-3
