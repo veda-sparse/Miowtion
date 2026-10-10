@@ -33,6 +33,59 @@ from miowtion.wan import attention as wan_attention        # noqa: E402
 from miowtion.wan import layout as wan_layout              # noqa: E402
 
 
+def _capture_on_trajectory(model, args, device) -> str:
+    """Denoise for real and stop at `--capture-step`.
+
+    Scoring random hidden states only sees what the weights impose. A
+    plan is about where attention actually goes, which is a property of
+    the trajectory, so this runs the released pipeline on a prompt and
+    lets the capture processors fire at one step.
+
+    Args:
+        model: The transformer whose processors are already swapped.
+        args: Parsed arguments; uses prompt, steps, capture_step, seed.
+        device: Where to run.
+
+    Returns:
+        A description of the activations, for the plan's metadata.
+    """
+    from diffusers import WanPipeline                       # noqa: PLC0415
+
+    with progress.Timer('load the pipeline (text encoder included)'):
+        pipe = WanPipeline.from_pretrained(
+            args.root, transformer=model, torch_dtype=torch.bfloat16)
+    pipe.to(device)
+    reached = {'step': -1}
+
+    def stop_after(_pipe, step, _timestep, kwargs):
+        reached['step'] = step
+        if step >= args.capture_step:
+            raise _Captured
+        return kwargs
+
+    try:
+        with torch.no_grad():
+            pipe(prompt=args.prompt, height=args.height, width=args.width,
+                 num_frames=args.frames, num_inference_steps=args.steps,
+                 guidance_scale=1.0,
+                 generator=torch.Generator(device).manual_seed(args.seed),
+                 callback_on_step_end=stop_after,
+                 callback_on_step_end_tensor_inputs=['latents'])
+    except _Captured:
+        pass
+    if reached['step'] < args.capture_step:
+        raise RuntimeError(
+            f'the pipeline stopped at step {reached["step"]} before '
+            f'{args.capture_step}; nothing was captured')
+    del pipe
+    return (f'denoising step {args.capture_step} of {args.steps}, '
+            f'prompt {args.prompt[:60]!r}')
+
+
+class _Captured(Exception):
+    """Unwinds the pipeline once the wanted step has run."""
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--root', default='weights/wan/Wan2.1-T2V-1.3B')
@@ -50,6 +103,14 @@ def main() -> None:
                         'so the shapes are compared paired')
     parser.add_argument('--out', default=None, help='write the plan here')
     parser.add_argument('--seed', type=int, default=0)
+    parser.add_argument('--prompt', default=None,
+                        help='run the real pipeline for a few steps and '
+                        'score the activations at --capture-step, instead '
+                        'of scoring random hidden states. Costs the text '
+                        'encoder (21 GB) on top of the transformer.')
+    parser.add_argument('--steps', type=int, default=8)
+    parser.add_argument('--capture-step', type=int, default=4,
+                        help='which denoising step to score')
     args = parser.parse_args()
 
     from diffusers import WanTransformer3DModel                # noqa: PLC0415
@@ -82,15 +143,22 @@ def main() -> None:
         model.blocks[index].attn1.set_processor(
             wan_attention.make_processor(capture, index))
 
-    width = cfg.num_attention_heads * cfg.attention_head_dim
-    hidden = torch.randn(1, layout.used, width, device=device,
-                         dtype=torch.bfloat16)
-    latent = (grid[0], grid[1] * 2, grid[2] * 2)
-    rope = model.rope(torch.randn(1, cfg.in_channels, *latent, device=device,
-                                  dtype=torch.bfloat16))
-    with torch.no_grad():
-        for index in args.layers:
-            model.blocks[index].attn1(hidden, None, None, rope)
+    if args.prompt is None:
+        # Random hidden states: this measures the structure the weights
+        # impose, not the activation distribution. Good enough to check
+        # the chain, not to adopt a plan from.
+        width = cfg.num_attention_heads * cfg.attention_head_dim
+        hidden = torch.randn(1, layout.used, width, device=device,
+                             dtype=torch.bfloat16)
+        latent = (grid[0], grid[1] * 2, grid[2] * 2)
+        rope = model.rope(torch.randn(1, cfg.in_channels, *latent,
+                                      device=device, dtype=torch.bfloat16))
+        with torch.no_grad():
+            for index in args.layers:
+                model.blocks[index].attn1(hidden, None, None, rope)
+        source = 'random hidden states'
+    else:
+        source = _capture_on_trajectory(model, args, device)
     del model
     torch.cuda.empty_cache()
 
@@ -127,8 +195,7 @@ def main() -> None:
         meta={'source': 'scripts/wan_search_tiles.py',
               'layers_scored': sorted(captured),
               'density': args.density,
-              'caveat': 'scored on random hidden states, not a denoising '
-                        'trajectory'})
+              'activations': source})
     best = {}
     for entry in entries:
         order = entry.table.mean(-1).argmin().item()
