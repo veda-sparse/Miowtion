@@ -283,10 +283,16 @@ def main():
                             'overlap': inter / max(1, union)})
                 traj.advance(vv, av)
                 steps.update(f'step {inputs.step}')
-    json.dump({'config': dataclasses.asdict(cfg), 'per_call': rows, 'layer_overlap': overlaps},
-              open(args.out, 'w'), indent=1)
-    progress.log(f'wrote {args.out}: {len(rows)} calls, '
-                 f'{len(overlaps)} layer pairs, {len(churn)} churn rows')
+    # `churn` was computed and then dropped on the floor here while the
+    # log still counted it, so the run looked complete and the file had
+    # no churn in it. The log line below reads the dict, not the locals,
+    # so the two cannot drift apart again.
+    payload = {'config': dataclasses.asdict(cfg), 'per_call': rows,
+               'layer_overlap': overlaps, 'churn': churn}
+    with open(args.out, 'w') as handle:
+        json.dump(payload, handle, indent=1)
+    progress.log(f'wrote {args.out}: ' + ', '.join(
+        f'{len(v)} {k}' for k, v in payload.items() if isinstance(v, list)))
 
 
 if __name__ == '__main__':

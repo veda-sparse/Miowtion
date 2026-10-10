@@ -109,3 +109,17 @@ def test_generate_does_not_silently_drop_the_plan_override():
         'the --predictor branch never reads --plan-dir, so the override '
         'is dropped again')
     assert 'PlanTable.load_dir(args.plan_dir)' in branch
+
+
+def test_offline_probe_writes_every_series_it_counts():
+    """The churn rows were computed, counted in the log, and not written.
+
+    The log line now derives from the payload instead of the locals, so
+    a series cannot be reported without being saved.
+    """
+    source = open(os.path.join(_ROOT, 'scripts', 'offline_probe.py')).read()
+    payload = source[source.index('payload = {'):source.index('with open(args.out')]
+    for key in ('per_call', 'layer_overlap', 'churn'):
+        assert f"'{key}'" in payload, f'{key} is not written'
+    log = source[source.index("progress.log(f'wrote {args.out}"):]
+    assert 'payload.items()' in log, 'the log must read the payload'
