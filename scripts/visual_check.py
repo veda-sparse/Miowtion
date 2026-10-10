@@ -24,9 +24,12 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 
-from miowtion.infer import decode
-from miowtion.utils import progress
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from miowtion.infer import decode                           # noqa: E402
+from miowtion.utils import progress                         # noqa: E402
 
 # Height of the title bar drawn above each pane, in pixels. Big enough to
 # read in a 3-up of a 720p clip without eating into the picture.

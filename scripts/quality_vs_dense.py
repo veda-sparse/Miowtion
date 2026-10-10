@@ -34,33 +34,60 @@ from miowtion.utils import progress                        # noqa: E402
 _METRICS = ('psnr_db', 'ssim')
 
 
+def _arm_clips(root: str) -> list[tuple[str, str, str, str]]:
+    """(arm, sample, geometry, mp4) over an output root.
+
+    generate.py writes `<root>/<arm>/<sample>_<geometry>/<mode>.mp4` when
+    a run covers several samples, but collapses the per-clip directory
+    when it covers exactly one, writing `<root>/<arm>/<mode>.mp4`. A glob
+    for the three-level layout alone therefore drops whole geometries
+    without saying so: on the original-duration demo set it silently
+    reported 10 clips of 12, leaving 16:9@72 and 9:16@102 out of every
+    table. So both layouts are read, and the collapsed one recovers the
+    sample and geometry from the run's own summary.json.
+    """
+    out: list[tuple[str, str, str, str]] = []
+    for path in sorted(glob.glob(os.path.join(root, '*', '*', '*.mp4'))):
+        arm = os.path.basename(os.path.dirname(os.path.dirname(path)))
+        clip = os.path.basename(os.path.dirname(path))
+        # `<sample>_<geometry>`; the geometry is the last two underscore
+        # fields (`16x9_t37`), the sample is everything before them.
+        parts = clip.split('_')
+        out.append((arm, '_'.join(parts[:-2]), '_'.join(parts[-2:]), path))
+    for path in sorted(glob.glob(os.path.join(root, '*', '*.mp4'))):
+        arm_dir = os.path.dirname(path)
+        summary = os.path.join(arm_dir, 'summary.json')
+        if not os.path.exists(summary):
+            raise FileNotFoundError(
+                f'{path} sits directly in an arm directory but {summary} '
+                'is missing, so its sample and geometry cannot be '
+                'recovered; a silently dropped clip is worse than a stop')
+        with open(summary) as handle:
+            meta = json.load(handle)
+        out.append((os.path.basename(arm_dir), meta['sample'],
+                    meta['geometry'], path))
+    return out
+
+
 def _clips(root: str) -> dict[tuple[str, str], dict[str, str]]:
     """{(sample, geometry): {arm_or_mode: mp4}} over an output root.
 
-    generate.py writes `<root>/<arm>/<sample>_<geometry>/<mode>.mp4`, and
-    one run can hold several modes (a dense+sol run writes both), so the
+    One run can hold several modes (a dense+sol run writes both), so the
     key is the mode rather than the directory it came from.
     """
-    paths = sorted(glob.glob(os.path.join(root, '*', '*', '*.mp4')))
+    entries = _arm_clips(root)
     # Two arms can write the same mode: a dense+sol run and a
     # recalibrated sol run both produce sol.mp4, and labelling by mode
     # alone silently keeps whichever sorts last. So a mode that appears
     # under more than one arm carries its arm in the label.
     providers: dict[str, set[str]] = {}
-    for path in paths:
+    for arm, _sample, _geometry, path in entries:
         mode = os.path.splitext(os.path.basename(path))[0]
-        arm = os.path.basename(os.path.dirname(os.path.dirname(path)))
         providers.setdefault(mode, set()).add(arm.rsplit('_', 2)[0])
 
     found: dict[tuple[str, str], dict[str, str]] = {}
-    for path in paths:
+    for arm, sample, geometry, path in entries:
         mode = os.path.splitext(os.path.basename(path))[0]
-        clip = os.path.basename(os.path.dirname(path))
-        arm = os.path.basename(os.path.dirname(os.path.dirname(path)))
-        # `<sample>_<geometry>`; the geometry is the last two underscore
-        # fields (`16x9_t37`), the sample is everything before them.
-        parts = clip.split('_')
-        sample, geometry = '_'.join(parts[:-2]), '_'.join(parts[-2:])
         stem = arm.rsplit('_', 2)[0]
         if len(providers[mode]) > 1:
             label = f'{mode}@{stem}'
