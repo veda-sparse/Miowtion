@@ -231,7 +231,7 @@ def main():
                                        env.device)
             plan = loaded.plans.select(geo)
             veda_cfg = veda_attention.VedaConfig(
-                keep_ratio=cfg.keep_ratio)
+                target_budget=veda_mask.Budget(ratio=cfg.keep_ratio))
             clip = veda_attention.ClipTiling(traj.layout, veda_cfg,
                                              env.device)
             steps = progress.Progress(f'probe {sample_id} {geometry}',

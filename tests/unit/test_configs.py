@@ -73,3 +73,21 @@ def _check_dataclass(path: str, config_type) -> None:
                                  dataclasses.fields(config_type)})
     assert not unknown, f'unknown config keys {unknown}'
     assert config_type(**raw).run_name
+
+
+def test_offline_probe_builds_a_valid_veda_config():
+    """The probe's config has to produce a VedaConfig that exists.
+
+    VedaConfig takes a Budget, not a keep_ratio: the probe passed the
+    float and died after eight minutes of model load, twice. Constructing
+    it here costs nothing and fails in the suite instead.
+    """
+    from miowtion.veda import attention as veda_attention
+    from miowtion.veda import mask as veda_mask
+
+    probe = _load_script('offline_probe.py')
+    config = probe.ProbeConfig.from_yaml(
+        os.path.join(_ROOT, 'configs', 'offline_probe_t37.yaml'))
+    built = veda_attention.VedaConfig(
+        target_budget=veda_mask.Budget(ratio=config.keep_ratio))
+    assert built.target_budget.ratio == config.keep_ratio
