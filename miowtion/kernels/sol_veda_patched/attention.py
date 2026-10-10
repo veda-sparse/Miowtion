@@ -42,6 +42,15 @@ import triton.language as _tl_consts
 LOG2E = _tl_consts.constexpr(1.4426950408889634)
 TILE = 128
 
+# Patch 3: upstream hard-codes num_warps=4, num_stages=1 and C=32 at the
+# launch. Its sibling INT8 kernel ships tools/tune_int8.py because those
+# constants are GPU-specific -- on SM120 the shipped INT8 default is
+# 1.58x off its own optimum -- so comparing a tuned baseline against this
+# untuned kernel would charge the compensation for a launch config.
+# scripts/bench_compensation.py --tune-fused sweeps these.
+LAUNCH = {'num_warps': 4, 'num_stages': 1}
+COLUMNS = 32
+
 
 def _summaries(k, v, counts):
     tiles, block, heads, dim = k.shape[0] // TILE, TILE, k.shape[1], k.shape[2]
@@ -151,6 +160,6 @@ def attend(q, k, v, counts, selected, sage):
     exact = torch.empty(heads, tiles, device=q.device, dtype=torch.int32)
     _forward[(tiles, heads)](
         q, k, v, qi, ki, qs, ks, kc, vc, counts, selected.contiguous(), out,
-        exact, N=tiles, H=heads, D=dim, B=TILE, C=32, SCALE=dim ** -.5,
-        num_warps=4, num_stages=1)
+        exact, N=tiles, H=heads, D=dim, B=TILE, C=COLUMNS, SCALE=dim ** -.5,
+        num_warps=LAUNCH['num_warps'], num_stages=LAUNCH['num_stages'])
     return out, exact
