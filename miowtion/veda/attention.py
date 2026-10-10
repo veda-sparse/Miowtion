@@ -65,6 +65,13 @@ class VedaConfig:
             against: 'max' for the block's peak probability (Veda1) or
             'sum' for its total attention mass (Veda2). Mass is what
             determines the output error; see docs/features/veda2.md.
+        contiguous_tiles: Cut the sequence into blocks in its own order
+            instead of permuting it into 3D tiles. Only for ablations
+            against methods that block the sequence as it lies (Sol-Attn
+            and most block-sparse attention): `span_tiles` moves both the
+            block size and the block shape at once, so attributing a
+            difference to either needs each moved separately. No plan
+            applies, every head gets the same contiguous cut.
         collect_bytes: Bound on one tile-ordered q / k / v / out copy; a
             head group is processed in chunks of heads under it. Heads are
             independent, so it changes only the launch count, never the
@@ -81,6 +88,7 @@ class VedaConfig:
     target_budget: veda_mask.Budget = veda_mask.Budget(ratio=0.1)
     ref_budget: veda_mask.Budget | None = None
     tile_conditions: bool = False
+    contiguous_tiles: bool = False
     teacher_q_tiles: float = 1.0
     recall_every: int = 1
     dense_layers: frozenset[int] = frozenset()
@@ -119,8 +127,11 @@ class ClipTiling:
             target = self.layout.target
             spans = self._condition_spans + [
                 tiling.TiledSpan(target.start, target.grid, shape)]
+            tiler = (tiling.contiguous_span_tiles
+                     if self.config.contiguous_tiles else tiling.span_tiles)
             self._cache[shape] = tiling.build_tile_layout(
-                spans, self.layout.used, self.layout.seq_len, self.device)
+                spans, self.layout.used, self.layout.seq_len, self.device,
+                tiler=tiler)
         return self._cache[shape]
 
     def blocks(self, tile_layout: tiling.TileLayout

@@ -135,3 +135,43 @@ def test_mirrored_plan_is_the_transposed_geometry():
                                  'mirrored_from': '16x9_t37'}
     table = veda_plan.PlanTable([plan, mirror])
     assert table.select(portrait) is mirror
+
+
+def test_contiguous_tiles_are_the_sequence_in_its_own_order():
+    """A contiguous cut must be bit-identical to a plain arange reshape.
+
+    This is the second one-variable ablation against methods that block
+    the sequence as it lies (Sol-Attn and most block-sparse attention):
+    `span_tiles` moves both the block size and the block shape at once,
+    so a comparison needs each moved separately.
+    """
+    span = tiling.TiledSpan(start=7, grid=(8, 4, 8),
+                            shape=tiling.TileShape.parse('4x4x8'))
+    tiles = tiling.contiguous_span_tiles(span)
+    want = (7 + torch.arange(8 * 4 * 8)).view(-1, tiling.TILE_SIZE)
+    assert tiles.shape == (2, tiling.TILE_SIZE)
+    assert torch.equal(tiles, want)
+
+
+def test_contiguous_tiles_pad_only_the_last_tile():
+    span = tiling.TiledSpan(start=0, grid=(3, 4, 8),
+                            shape=tiling.TileShape.parse('4x4x8'))
+    tiles = tiling.contiguous_span_tiles(span)
+    assert tiles.shape == (1, tiling.TILE_SIZE)
+    assert torch.equal(tiles[0, :96], torch.arange(96))
+    assert bool((tiles[0, 96:] == -1).all())
+
+
+def test_contiguous_layout_leaves_the_rows_where_they_were():
+    """With one contiguous span the permutation is the identity on it.
+
+    That is the whole point: no reordering, so a mask over these tiles
+    means "consecutive tokens" the way the outside methods mean it.
+    """
+    span = tiling.TiledSpan(start=0, grid=(4, 4, 8),
+                            shape=tiling.TileShape.parse('2x8x8'))
+    layout = tiling.build_tile_layout(
+        [span], used=128, seq_len=128, tiler=tiling.contiguous_span_tiles)
+    assert torch.equal(layout.perm, torch.arange(128))
+    permuted = tiling.build_tile_layout([span], used=128, seq_len=128)
+    assert not torch.equal(permuted.perm, torch.arange(128))

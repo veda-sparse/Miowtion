@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import dataclasses
 import itertools
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 import torch
 
@@ -123,6 +123,26 @@ def span_tiles(span: TiledSpan) -> torch.Tensor:
     return torch.gather(tiles, 1, order)
 
 
+def contiguous_span_tiles(span: TiledSpan) -> torch.Tensor:
+    """[n_tiles, 128] packed row ids of one span, cut in sequence order.
+
+    Sol-Attn and most block-sparse attention outside this project block
+    the sequence as it already lies: tile j is rows [j*128, (j+1)*128).
+    Our `span_tiles` instead permutes the rows into 3D boxes, so every
+    comparison against such a method confounds two things at once, the
+    block SIZE and the block SHAPE. This gives the second one-variable
+    ablation: same size, no permutation.
+
+    `span.shape` is ignored, a contiguous cut has no shape to choose.
+    Padding, if the span does not divide 128, lands in the last tile.
+    """
+    rows = span.start + torch.arange(span.num_rows)
+    n_tiles = -(-span.num_rows // TILE_SIZE)
+    tiles = torch.full((n_tiles * TILE_SIZE,), -1, dtype=torch.long)
+    tiles[:span.num_rows] = rows
+    return tiles.view(n_tiles, TILE_SIZE)
+
+
 @dataclasses.dataclass
 class TileLayout:
     """One permutation of the packed sequence and its derived constants.
@@ -179,7 +199,9 @@ class TileLayout:
 
 
 def build_tile_layout(spans: Sequence[TiledSpan], used: int, seq_len: int,
-                      device: torch.device | str = 'cpu') -> TileLayout:
+                      device: torch.device | str = 'cpu',
+                      tiler: Callable[[TiledSpan], torch.Tensor] = span_tiles
+                      ) -> TileLayout:
     """Builds the permutation for tiled spans; all other real rows are global.
 
     Args:
@@ -187,6 +209,11 @@ def build_tile_layout(spans: Sequence[TiledSpan], used: int, seq_len: int,
         used: Real rows [0, used); padding rows [used, seq_len) are excluded.
         seq_len: Packed sequence length.
         device: Device of the derived tensors.
+        tiler: Cuts one span into [n_tiles, 128] packed row ids. Defaults
+            to the 3D-box `span_tiles`; pass `contiguous_span_tiles` to
+            block the sequence in its own order, which is what methods
+            outside this project do and what an ablation of block shape
+            needs.
 
     Returns:
         The tile layout.
@@ -204,7 +231,7 @@ def build_tile_layout(spans: Sequence[TiledSpan], used: int, seq_len: int,
             raise ValueError(f'span {span} overlaps or exceeds used={used}')
         prev_stop = span.start + span.num_rows
         covered[span.start:prev_stop] = True
-        tiles.append(span_tiles(span))
+        tiles.append(tiler(span))
     n_ref_tiles = sum(t.shape[0] for t in tiles[:-1])
     video = torch.cat(tiles)
     global_rows = torch.nonzero(~covered).view(-1)

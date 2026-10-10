@@ -1,0 +1,42 @@
+# E5: the iso-TIME curve, not the iso-density point.
+#
+# At 16:9@37 with Sol calibrated to the same density (4.82% against our
+# 5%), Sol wins quality significantly: +0.82 dB PSNR on 11/11 clips and
+# +0.0229 SSIM on 10/11. But it buys that with 20.9 s of attention a
+# clip against Veda2's 9.9 s -- 2.11x. Equal density is not equal cost,
+# which is exactly the objection we raise against the external
+# comparison, so it has to be applied to ourselves.
+#
+# This ladder spends Veda2's budget up until its attention time reaches
+# Sol's, so the comparison becomes "same seconds, whose pixels are
+# better". If 0.0229 SSIM is still not recovered at matched time, the
+# compensation genuinely buys something we cannot buy with tiles and
+# that belongs in the paper as a limitation.
+# The prompts are the prompt-expansion output taken verbatim from the
+# preview site; the source clips were 10-15 s but every arm renders
+# latent_t 37, which is what makes the sparsity target hard.
+#
+# Nothing differs between the arms except the router: same sample cache,
+# same seed, same geometry, same turbo schedule and steps, same few-step
+# LoRA, same bf16 decode, and no dense_steps anywhere (no arm gets a
+# dense first step).
+root: weights/MiniMax-H3
+variant: FL2VA
+schedule: turbo
+num_steps: 8
+adapter: weights/turbo_lora/minimax_h3_turbo_v4_step600_ema.safetensors
+sample_cache: artifacts/samples/demo12
+seed: 0
+keep_ratio: 0.30
+offload_blocks: 30
+prefetch: 1
+mlp_chunk_rows: 8192
+decode_dtype: bf16
+sample_id: [
+  demo00_01M4GA5P, demo02_01M4G57X, demo03_01M4G3N3, demo04_01M4G1FK,
+  demo05_01M4G148, demo06_01M4G02G, demo07_01M4FWTA, demo08_01M4FVNY,
+  demo09_01M4FJEZ, demo10_01M4FDY7, demo11_01M4FAD6]
+geometry: ['16:9@37']
+attention: [veda]
+predictor: weights/veda/veda2_r16.safetensors
+out_dir: artifacts/demo12_compare/veda2d030_16x9

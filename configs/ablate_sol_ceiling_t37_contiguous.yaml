@@ -1,0 +1,37 @@
+# E1 on CONTIGUOUS blocks: does "more tiles beats compensation" depend on
+# the block SHAPE? Together with the 64-token run this brackets Sol's
+# geometry by moving one variable at a time:
+#
+#   ablate_sol_ceiling_t37             4x4x8 3D tile, 128 tokens  (baseline)
+#   ablate_sol_ceiling_t37_block64     4x4x4 3D tile,  64 tokens  (size)
+#   ablate_sol_ceiling_t37_contiguous  consecutive,   128 tokens  (shape)
+#
+# Sol is consecutive-64, which is both moves at once; a single run that
+# matched it would not say which move mattered.
+#
+# contiguous_tiles makes the permutation the identity on the target span,
+# so a mask over these blocks means "consecutive tokens" the way methods
+# outside this project mean it. tile_shape is then a formality.
+run_name: sol_ceiling_t37_contiguous
+checkpoint_root: weights/MiniMax-H3
+sample_cache: artifacts/samples/moviegen_holdout20
+geometries: ['16:9@37']
+variant: FL2VA
+tasks: [t2va]
+num_clips: 1
+steps: [0, 2, 5, 7]
+schedule: turbo
+num_steps: 8
+teacher_adapter: weights/turbo_lora/minimax_h3_turbo_v4_step600_ema.safetensors
+# No adopted plan for this geometry yet; one shape for every head. Set
+# `plan: plans/<geometry>.json` instead once a plan is in plans/.
+tile_shape: 4x4x8
+densities: [0.05, 0.1, 0.2]
+alphas: [0.5, 1.0, 2.0]
+query_tiles: 6
+oracle: Omega0
+out_dir: runs/sol_ceiling_t37_contiguous
+offload_blocks: 30
+prefetch: 1
+mlp_chunk_rows: 8192
+contiguous_tiles: true

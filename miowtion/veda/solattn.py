@@ -1642,6 +1642,11 @@ class RunConfig:
         teacher_adapter: Few-step LoRA merged into the teacher (turbo).
         plan: Tile plan json; None uses `tile_shape` for every head.
         tile_shape: Shape used when `plan` is None.
+        contiguous_tiles: Cut the sequence in its own order instead of
+            permuting it into 3D tiles, so a comparison against a method
+            that blocks the sequence as it lies moves one variable at a
+            time. `tile_shape` is then only a formality; the cut ignores
+            it.
         predictors: Bundles to add to the init probe, each written
             `name=path`. The first one's plans are used for the geometry,
             so the probe sees the tile shapes they were trained against.
@@ -1669,6 +1674,7 @@ class RunConfig:
     teacher_adapter: str | None = None
     plan: str | None = None
     tile_shape: str = '4x4x8'
+    contiguous_tiles: bool = False
     predictors: list[str] = dataclasses.field(default_factory=list)
     densities: list[float] = dataclasses.field(
         default_factory=lambda: [0.05, 0.1, 0.2])
@@ -1707,7 +1713,8 @@ def ablate_clip(model, cache, sample, geometry, schedule, tables,
     traj = trajectory.Trajectory(model, cache, sample, geometry, schedule,
                                  config.seed, device)
     veda_config = veda_attention.VedaConfig(
-        target_budget=veda_mask.Budget(ratio=max(config.densities)))
+        target_budget=veda_mask.Budget(ratio=max(config.densities)),
+        contiguous_tiles=config.contiguous_tiles)
     clip_tiling = veda_attention.ClipTiling(traj.layout, veda_config, device)
     ablation = config.ablation()
     records: list[Record] = []
