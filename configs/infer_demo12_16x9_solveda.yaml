@@ -1,0 +1,28 @@
+# Sol + Veda: the fused zero-order compensation from the ComfyUI node
+# (third_party/Veda-on-ComfyUI @ 3f9be82), run on the same 11 clips at the
+# same 5% budget as every other arm. veda is the control: same predictor,
+# same mask, same tiles, only the kernel differs.
+#
+# Note the selected blocks go through Sage INT8 inside that kernel while
+# the veda arm is BF16 throughout, so a quality gap here mixes precision
+# with compensation; E4 (veda_comp) is the arm that separates them.
+root: weights/MiniMax-H3
+variant: FL2VA
+schedule: turbo
+num_steps: 8
+adapter: weights/turbo_lora/minimax_h3_turbo_v4_step600_ema.safetensors
+sample_cache: artifacts/samples/demo12
+seed: 0
+keep_ratio: 0.05
+offload_blocks: 30
+prefetch: 1
+mlp_chunk_rows: 8192
+decode_dtype: bf16
+sample_id: [
+  demo00_01M4GA5P, demo02_01M4G57X, demo03_01M4G3N3, demo04_01M4G1FK,
+  demo05_01M4G148, demo06_01M4G02G, demo07_01M4FWTA, demo08_01M4FVNY,
+  demo09_01M4FJEZ, demo10_01M4FDY7, demo11_01M4FAD6]
+geometry: ['16:9@37']
+attention: [veda, veda_sol]
+predictor: weights/veda/veda2_r16.safetensors
+out_dir: artifacts/demo12_compare/solveda_16x9

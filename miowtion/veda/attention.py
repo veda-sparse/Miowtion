@@ -18,6 +18,7 @@ from miowtion.h3 import attention as h3_attention
 from miowtion.h3 import layout as h3_layout
 from miowtion.kernels import fa4
 from miowtion.kernels import reference
+from miowtion.kernels import sol_veda
 from miowtion.kernels import tile_gather_triton
 from miowtion.veda import heatmap
 from miowtion.veda import mask as veda_mask
@@ -72,6 +73,14 @@ class VedaConfig:
             compensation differs -- same tiles, same router, same kernel.
             Off by default; it costs a [rows, n_tiles] score matrix on
             top of the kernel, which is the cost the ablation measures.
+        fused_compensation: Use the Sol + Veda Triton kernel from
+            `third_party/Veda-on-ComfyUI` for the same zero-order term,
+            merged into one online softmax instead of computed around
+            the kernel. This is the arm that measures what the
+            compensation *costs* when implemented properly; note it
+            quantises the selected blocks to INT8, so a quality gap
+            against the plain arm mixes precision with compensation.
+            Mutually exclusive with `zero_order_compensation`.
         contiguous_tiles: Cut the sequence into blocks in its own order
             instead of permuting it into 3D tiles. Only for ablations
             against methods that block the sequence as it lies (Sol-Attn
@@ -97,6 +106,7 @@ class VedaConfig:
     tile_conditions: bool = False
     contiguous_tiles: bool = False
     zero_order_compensation: bool = False
+    fused_compensation: bool = False
     teacher_q_tiles: float = 1.0
     recall_every: int = 1
     dense_layers: frozenset[int] = frozenset()
@@ -109,6 +119,10 @@ class ClipTiling:
     def __init__(self, layout: h3_layout.PackedLayout,
                  config: VedaConfig, device: torch.device,
                  condition_spans: tuple[tiling.TiledSpan, ...] = ()):
+        if config.zero_order_compensation and config.fused_compensation:
+            raise ValueError(
+                'zero_order_compensation and fused_compensation compute the '
+                'same term; pick one, they are two implementations of it')
         """Initializes the cache.
 
         Args:
@@ -710,6 +724,11 @@ class SparseStudent:
                 logits[:, :tile_layout.n_video_tiles], tile_layout,
                 self.clip.blocks(tile_layout))
             block_mask = veda_mask.dense_block_mask(selection, tile_layout)
+        if self.clip.config.fused_compensation:
+            o_tiles = sol_veda.block_sparse_attention(
+                q_tiles, k_tiles, v_tiles, block_mask, tile_layout)
+            _scatter_(out, o_tiles, tile_layout, heads)
+            return
         compensate = self.clip.config.zero_order_compensation
         if self.use_fa4:
             result = fa4.block_sparse_attention(

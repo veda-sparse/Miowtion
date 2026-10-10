@@ -309,3 +309,26 @@ def test_summarize_predictor_weighs_by_heads_and_keeps_agree():
     assert out['recall'] == pytest.approx(0.8)
     assert out['agree'] == pytest.approx(0.75)
     assert out['kept_vs_ceiling'] == pytest.approx(0.8)
+
+
+def test_predictor_probe_feeds_the_optional_score_terms():
+    """A count term or a second-order head needs extra kwargs.
+
+    PredictorProbe was the third call site of LayerPredictor.forward and
+    the only one not passing them, so the holdout comparison died after
+    the model load with "log_count and count_term must be set together".
+    Bundles of different structure are the point of this script, so the
+    kwargs have to be built per bundle, not once for the run.
+    """
+    from miowtion.veda import predictor as veda_predictor
+
+    lay, qkv, base = _tiny_probe_case(['bf16'])
+    plain = veda_predictor.TileScorePredictor(1, 4, 32).to(torch.bfloat16)
+    rich = veda_predictor.TileScorePredictor(
+        1, 4, 32, count_term=True, second_order_rank=4).to(torch.bfloat16)
+    probe = quant.PredictorProbe(
+        base.clip, base.plan,
+        {'plain': plain.eval(), 'rich': rich.eval()}, 'plain',
+        dense_backend='math')
+    probe(*qkv, 0)
+    assert sorted({r.variant for r in probe.records}) == ['plain', 'rich']

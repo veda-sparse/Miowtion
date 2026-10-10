@@ -461,6 +461,7 @@ class PredictorProbe:
     def __call__(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
                  layer_index: int) -> torch.Tensor:
         from miowtion.veda import attention as veda_attention  # pylint: disable=import-outside-toplevel
+        from miowtion.veda import predictor as veda_predictor  # pylint: disable=import-outside-toplevel
         out, lse = h3_attention.dense_attention(
             q, k, v, self.clip.layout.used, return_lse=True,
             backend=self.dense_backend)
@@ -472,19 +473,41 @@ class PredictorProbe:
             rows = self._rows(tile_layout)
             chunk = veda_attention._chunk_heads(  # pylint: disable=protected-access
                 tile_layout, self.clip.config.collect_bytes)
+            # A bundle with a count term or a second-order head needs
+            # extra inputs, and bundles of different structure can be
+            # compared in one run, so the moments are pooled whenever any
+            # of them asks and the kwargs are built per bundle. Missing
+            # this is how the probe died with "log_count and count_term
+            # must be set together": it was the third call site of
+            # LayerPredictor.forward and the only one not passing them.
+            wants_second = any(p.second_order_rank
+                               for p in self.predictors.values())
             for heads in group.heads.split(chunk):
-                q_tiles, feats_q = veda_attention._gather_and_pool(  # pylint: disable=protected-access
-                    q, tile_layout, heads)
-                k_tiles, feats_k = veda_attention._gather_and_pool(  # pylint: disable=protected-access
-                    k, tile_layout, heads)
+                if wants_second:
+                    q_tiles, feats_q, sq_q = (
+                        veda_attention._gather_and_pool(  # pylint: disable=protected-access
+                            q, tile_layout, heads,
+                            veda_predictor.SECOND_RAW))
+                    k_tiles, feats_k, var_k = (
+                        veda_attention._gather_and_pool(  # pylint: disable=protected-access
+                            k, tile_layout, heads,
+                            veda_predictor.SECOND_CENTRAL))
+                else:
+                    q_tiles, feats_q = veda_attention._gather_and_pool(  # pylint: disable=protected-access
+                        q, tile_layout, heads)
+                    k_tiles, feats_k = veda_attention._gather_and_pool(  # pylint: disable=protected-access
+                        k, tile_layout, heads)
+                    sq_q = var_k = None
                 heat = heatmap.teacher_heat(
                     q_tiles, k_tiles,
                     veda_attention._gather_lse(lse, tile_layout, heads),  # pylint: disable=protected-access
                     tile_layout, rows)
                 del q_tiles, k_tiles
                 logits = {
-                    name: model.layers[layer_index](feats_q[:, rows],
-                                                    feats_k, heads)
+                    name: model.layers[layer_index](
+                        feats_q[:, rows], feats_k, heads,
+                        **veda_attention._extra_features(  # pylint: disable=protected-access
+                            model, tile_layout, sq_q, var_k, rows))
                     for name, model in self.predictors.items()}
                 ref = logits[self.reference].float()
                 norm = ref.pow(2).sum().sqrt()

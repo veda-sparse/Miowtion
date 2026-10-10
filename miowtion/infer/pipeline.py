@@ -31,8 +31,8 @@ from miowtion.veda import predictor as veda_predictor
 # 'veda_comp' is 'veda' with Sol's zero-order compensation switched on;
 # it exists so the end-to-end comparison (plan E4) differs from a plain
 # Veda run in exactly one thing.
-VEDA_MODES = ('veda', 'veda_comp')
-ATTENTION_MODES = ('dense', 'veda', 'veda_comp', 'sol',
+VEDA_MODES = ('veda', 'veda_comp', 'veda_sol')
+ATTENTION_MODES = ('dense', 'veda', 'veda_comp', 'veda_sol', 'sol',
                    'oracle_mass', 'oracle_max', 'oracle_mean')
 
 
@@ -151,6 +151,9 @@ def generate(model: h3_model.H3DiT, schedule, tables,
     if attention == 'veda_comp':
         veda_config = dataclasses.replace(
             veda_config, zero_order_compensation=True)
+    if attention == 'veda_sol':
+        veda_config = dataclasses.replace(
+            veda_config, fused_compensation=True)
     clip = (veda_attention.ClipTiling(traj.layout, veda_config, device)
             if tiled else None)
     steps = progress.Progress(f'generate {sample.id} ({attention})',

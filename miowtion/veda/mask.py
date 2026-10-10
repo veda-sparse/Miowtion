@@ -158,6 +158,14 @@ def select_video_blocks(scores: torch.Tensor, layout: tiling.TileLayout,
     if rows is None:
         rows = torch.arange(n_video, device=device)
     num_rows = rows.numel()
+    # `scores` must already be restricted to `rows`. Passing the full
+    # [H', n_tiles, .] logits with a shorter `rows` used to die deep
+    # inside a broadcast ("size of tensor a (330) must match b (341)"),
+    # which says nothing about which argument is wrong.
+    if scores.shape[1] != num_rows:
+        raise ValueError(
+            f'scores has {scores.shape[1]} query rows but rows has '
+            f'{num_rows}; index the query axis by `rows` before calling')
     indices, keeps = [], []
     for block in blocks:
         n_cols = block.stop - block.start

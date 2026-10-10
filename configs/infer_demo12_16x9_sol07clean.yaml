@@ -1,0 +1,29 @@
+# Four-way comparison on the 12 demo captions, 95% sparsity target, 5 s.
+# The prompts are the prompt-expansion output taken verbatim from the
+# preview site; the source clips were 10-15 s but every arm renders
+# latent_t 37, which is what makes the sparsity target hard.
+#
+# Nothing differs between the arms except the router: same sample cache,
+# same seed, same geometry, same turbo schedule and steps, same few-step
+# LoRA, same bf16 decode, and no dense_steps anywhere (no arm gets a
+# dense first step).
+root: weights/MiniMax-H3
+variant: FL2VA
+schedule: turbo
+num_steps: 8
+adapter: weights/turbo_lora/minimax_h3_turbo_v4_step600_ema.safetensors
+sample_cache: artifacts/samples/demo12
+seed: 0
+keep_ratio: 0.05
+offload_blocks: 30
+prefetch: 1
+mlp_chunk_rows: 8192
+decode_dtype: bf16
+sample_id: [
+  demo00_01M4GA5P, demo02_01M4G57X, demo03_01M4G3N3, demo04_01M4G1FK,
+  demo05_01M4G148, demo06_01M4G02G, demo07_01M4FWTA, demo08_01M4FVNY,
+  demo09_01M4FJEZ, demo10_01M4FDY7, demo11_01M4FAD6]
+geometry: ['16:9@37']
+attention: [sol]
+sol_tau: 0.7
+out_dir: artifacts/demo12_compare/sol07clean_16x9

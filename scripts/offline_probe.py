@@ -174,13 +174,14 @@ class _Probe:
             if layer_index == 0:
                 all_rows = torch.arange(tile_layout.n_video_tiles,
                                         device=q.device)
-                full = self.predictor.layers[layer_index](
-                    feats_q, feats_k, heads,
-                    **veda_attention._extra_features(
-                        self.predictor, tile_layout, sq_q, var_k))
+                # `logits` already covers every query tile, so there is
+                # nothing to recompute; and the query axis has to be
+                # indexed by `all_rows` before selecting, since it spans
+                # all n_tiles while the selection only ranges over the
+                # n_video video tiles.
                 sel_all = veda_mask.select_video_blocks(
-                    full[:, :, :tile_layout.n_video_tiles], tile_layout,
-                    blocks, all_rows)
+                    logits[:, all_rows, :tile_layout.n_video_tiles],
+                    tile_layout, blocks, all_rows)
                 dense_all = torch.zeros(
                     *sel_all.index.shape[:2], tile_layout.n_video_tiles,
                     dtype=torch.bool, device=q.device)

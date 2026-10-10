@@ -151,3 +151,17 @@ def test_shape_mismatches_raise():
         veda_attention.zero_order_compensation(
             q, torch.zeros(1, rows), q, q, q,
             torch.ones(1, 2, 3, dtype=torch.bool), layout)
+
+
+def test_the_two_compensation_implementations_are_exclusive():
+    """They compute the same term; running both would double it."""
+    from miowtion.h3 import layout as h3_layout
+    from miowtion.veda import mask as veda_mask
+
+    config = veda_attention.VedaConfig(
+        target_budget=veda_mask.Budget(ratio=0.05),
+        zero_order_compensation=True, fused_compensation=True)
+    with pytest.raises(ValueError, match='pick one'):
+        veda_attention.ClipTiling(
+            h3_layout.PackedLayout.__new__(h3_layout.PackedLayout),
+            config, torch.device('cpu'))

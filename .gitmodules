@@ -2,3 +2,6 @@
 	path = third_party/MiniMax-H3
 	url = https://github.com/MiniMax-AI/MiniMax-H3
 	shallow = true
+[submodule "third_party/Veda-on-ComfyUI"]
+	path = third_party/Veda-on-ComfyUI
+	url = https://github.com/veda-sparse/Veda-on-ComfyUI.git
