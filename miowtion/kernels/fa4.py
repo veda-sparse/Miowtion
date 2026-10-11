@@ -29,6 +29,12 @@ correctness if broken):
     them FA4's backward silently computes dense gradients, so they are
     always built when gradients are required.
 
+Architecture floor: sm_80, for every path here. The kernels are built on
+cp.async and the sm_80 MMA shapes, so sm_70 / sm_75 are not a slow path
+but no path at all -- `available()` is False there and
+`unavailable_reason()` says which operation is missing
+(docs/features/arch_support.md).
+
 q, k, v are tile-ordered [N, H', D] (seq-major), which is FA4's native
 [B, S, H, D] layout after adding a batch axis, so no transposes are needed.
 """
@@ -42,6 +48,7 @@ import threading
 
 import torch
 
+from miowtion.kernels import arch
 from miowtion.kernels import fa4_sm8x
 from miowtion.veda import tiling
 
@@ -130,10 +137,64 @@ def available(device: torch.device | None = None) -> bool:
     return major in _SPARSE_MAJOR_ARCHS
 
 
+def _label(device: torch.device | None) -> str:
+    """'sm_75 (Turing)' for a CUDA device, else the device itself."""
+    if device is not None and torch.device(device).type != 'cuda':
+        return str(device)
+    if not torch.cuda.is_available():
+        return 'cpu (no CUDA device)'
+    return arch.name(arch.capability(device if device is not None
+                                     else 'cuda'))
+
+
+def unavailable_reason(device: torch.device | None = None,
+                       dtype: torch.dtype | None = None) -> str | None:
+    """Why block sparsity is unavailable on `device`, or None when it is.
+
+    Callers that raise their own error (the Veda students, which can be
+    told to use the reference kernel instead) use this so the message
+    names the architecture and the missing operation rather than just
+    saying FA4 is absent.
+
+    Args:
+        device: The device the tensors are on; None asks about the
+            current CUDA device.
+        dtype: The tensor dtype, or None to skip the dtype check.
+
+    Returns:
+        A one-line reason, or None when `available(device)` is True.
+    """
+    if available(device):
+        return None
+    if not torch.cuda.is_available():
+        return 'no CUDA device'
+    if device is not None and torch.device(device).type != 'cuda':
+        return f'device {device} is not CUDA'
+    target = device if device is not None else 'cuda'
+    reason = arch.unsupported_reason('fa4.block_sparse_attention', target,
+                                     dtype)
+    if reason is not None:
+        return reason
+    if _modules() is None:
+        return 'the flash_attn.cute package is not importable'
+    return (_patch_error
+            or 'the CuTe kernels do not implement block sparsity on '
+               f'{arch.name(arch.capability(target))}')
+
+
 def dense_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
                     scale: float, return_lse: bool
                     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Dense attention. q, k, v: [S, H, D] -> out [S, H, D], lse [S, H]."""
+    """Dense attention. q, k, v: [S, H, D] -> out [S, H, D], lse [S, H].
+
+    Raises:
+        NotImplementedError: On an architecture or dtype the CuTe kernels
+            do not cover. `h3.attention.dense_attention` picks SDPA
+            instead when `dense_available` is False, so this is reached
+            only by `backend='fa4'` on a GPU that cannot run it, where
+            an explicit error beats a CuTe compile failure.
+    """
+    arch.require('fa4.dense_attention', q.device, q.dtype)
     with _CALL_LOCK:
         out = interface().flash_attn_func(q[None], k[None], v[None],
                                           softmax_scale=scale,
@@ -264,11 +325,14 @@ def block_sparse_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
         ValueError: If gradients are required for a subset of query tiles.
     """
     if not available(q.device):
-        reason = f' ({_patch_error})' if _patch_error else ''
+        # Name the missing operation, not just the arch: below sm_80
+        # there is no cp.async and no bf16 MMA, so no amount of patching
+        # gets the CuTe kernels there, whereas on a patched arch the
+        # cause is the patch having failed to install.
         raise NotImplementedError(
-            'FA4 block sparsity unavailable on sm'
-            f'{"".join(map(str, torch.cuda.get_device_capability(q.device)))}'
-            f'{reason}; refusing to fall back to dense attention')
+            f'FA4 block sparsity unavailable on {_label(q.device)}: '
+            f'{unavailable_reason(q.device, q.dtype)}; refusing to fall '
+            'back to dense attention')
     _, _, block_sparsity, iface, _ = _modules()
     needs_grad = torch.is_grad_enabled() and any(
         t.requires_grad for t in (q, k, v))

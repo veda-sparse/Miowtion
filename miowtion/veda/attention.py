@@ -505,8 +505,10 @@ class OracleStudent:
             raise ValueError(f'target must be one of {ORACLE_TARGETS}: '
                              f'{target!r}')
         if not fa4.available(clip.device) and not allow_reference_kernel:
-            raise RuntimeError('OracleStudent needs the FA4 block-sparse '
-                               'kernel; refusing to fall back silently')
+            raise RuntimeError(
+                f'OracleStudent needs the FA4 block-sparse kernel '
+                f'({fa4.unavailable_reason(clip.device)}); refusing to '
+                'fall back silently')
         self.clip = clip
         self.plan = plan
         self.target = target
@@ -685,8 +687,10 @@ class SparseStudent:
         # Ask about the device the clip is actually on: a CUDA machine
         # answers True for a CPU clip otherwise, and the kernel then dies.
         if not fa4.available(clip.device) and not allow_reference_kernel:
-            raise RuntimeError('SparseStudent needs the FA4 block-sparse '
-                               'kernel; refusing to fall back silently')
+            raise RuntimeError(
+                f'SparseStudent needs the FA4 block-sparse kernel '
+                f'({fa4.unavailable_reason(clip.device)}); refusing to '
+                'fall back silently')
         self.clip = clip
         self.plan = plan
         self.predictor = predictor

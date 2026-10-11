@@ -10,12 +10,25 @@ layer on long clips) only to reduce them to one value per 128x128 block.
 This kernel computes each block's QK^T in registers and writes a single
 fp32 heat value, so the cost is the QK^T FLOPs alone.
 
-Numerics mirror the reference: scores are rounded to bf16 before the max
-(done once on each row max, which is identical because rounding is
-monotonic), the scale is applied after the max, invalid keys are -inf and
-invalid query rows contribute nothing. Accumulation order differs from
-cuBLAS, so parity with the reference is to tolerance, not bitwise (see
-tests/gpu/test_kernels_gpu.py).
+Numerics mirror the reference: scores are rounded to the *input* dtype
+before the max (done once on each row max, which is identical because
+rounding is monotonic), the scale is applied after the max, invalid keys
+are -inf and invalid query rows contribute nothing. The rounding follows
+the input dtype because that is what the reference's `torch.bmm` returns;
+hard-coding bf16 there would silently change the comparison on an fp16
+run. Accumulation order differs from cuBLAS, so parity with the reference
+is to tolerance, not bitwise (see tests/gpu/test_kernels_gpu.py).
+
+Everything else is fp32: `tl.dot` accumulates in fp32 and the exponential
+is taken on fp32 operands, so fp16 inputs do not narrow the softmax. The
+one fp16 exposure is that rounding step, where an unscaled row max above
+65504 saturates to inf -- a post-scale logit of 5788 at head_dim 128,
+which real attention logits do not reach. The reference saturates at the
+same place, so parity is kept either way.
+
+Architecture floor: sm_75. The QK^T is a `tl.dot`, and Triton's NVIDIA
+backend no longer lowers it on Volta; bf16 inputs additionally need
+sm_80. See `kernels/arch.py` and docs/features/arch_support.md.
 
 Launch parameters were tuned on RTX 4090 (d=128, 56 heads, 38k tokens):
 4 warps and 16 key tiles per program run QK^T at ~169 TFLOPS, 0.47x the time
@@ -30,9 +43,12 @@ import math
 
 import torch
 
+from miowtion.kernels import arch
 from miowtion.veda import tiling
 
 _TILE = tiling.TILE_SIZE
+# Key of this kernel's entry in kernels/arch.py.
+_KERNEL = 'block_heat_triton.teacher_heat'
 # Key tiles handled by one program; each program loads its query tile once.
 _KEY_TILES_PER_PROGRAM = 16
 _NUM_WARPS = 4
@@ -55,11 +71,14 @@ def supports(q: torch.Tensor) -> bool:
     """The kernel is installed *and* can take these tensors.
 
     Same reason as tile_gather_triton.supports: `available()` says
-    nothing about the tensor, and `teacher_heat` raises on a head_dim it
-    does not implement.
+    nothing about the tensor, and `teacher_heat` raises on a head_dim or
+    an architecture it does not implement. `heatmap.teacher_heat` routes
+    on this, so a GPU below the floor takes the torch reference instead
+    of dying inside a Triton compile.
     """
     return (q.is_cuda and available() and q.shape[-1] in (64, 128)
-            and q.stride(-1) == 1)
+            and q.stride(-1) == 1
+            and arch.supported(_KERNEL, q.device, q.dtype))
 
 
 def available() -> bool:
@@ -103,7 +122,10 @@ def _kernel():
                 p = tl.exp(s * scale - lse[:, None])
                 agg = tl.sum(tl.sum(p, axis=1), axis=0)
             else:
-                row_max = tl.max(s, axis=1).to(tl.bfloat16).to(tl.float32)
+                # Round like the reference's bmm, i.e. to the input
+                # dtype, not to a fixed bf16.
+                row_max = tl.max(s, axis=1).to(
+                    q_ptr.dtype.element_ty).to(tl.float32)
                 agg = tl.exp(tl.max(row_max * scale - lse, axis=0))
             tl.store(out_ptr + h * stride_oh + r * stride_or + j, agg)
 
@@ -117,12 +139,21 @@ def teacher_heat(q: torch.Tensor, k: torch.Tensor, lse: torch.Tensor,
     """Same contract as heatmap.teacher_heat_reference.
 
     Raises:
-        ValueError: On an unknown reduction or an unsupported head_dim.
+        ValueError: On an unknown reduction, an unsupported head_dim, or
+            q and k in different dtypes (one `tl.dot` takes both).
+        NotImplementedError: On an architecture or dtype the kernel
+            cannot be compiled for; `heatmap.teacher_heat` reaches this
+            only when it was called directly, since it routes on
+            `supports`.
     """
     if reduce not in ('max', 'sum'):
         raise ValueError(f"reduce must be 'max' or 'sum': {reduce!r}")
     if q.shape[-1] not in (64, 128) or q.stride(-1) != 1 or k.stride(-1) != 1:
         raise ValueError('heat kernel needs contiguous head_dim 64 or 128')
+    if k.dtype != q.dtype:
+        raise ValueError(f'q is {q.dtype} but k is {k.dtype}; the QK^T is '
+                         'one tl.dot over both')
+    arch.require(_KERNEL, q.device, q.dtype)
     heads, n_tiles = q.shape[1], layout.n_tiles
     out = torch.empty(heads, q_tiles.numel(), n_tiles, dtype=torch.float32,
                       device=q.device)

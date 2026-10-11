@@ -10,7 +10,15 @@ tile's 128 rows once through the permutation and writes the gathered rows
 and, for q / k, the pooled features.
 
 Numerics: gathers and scatters are exact; max / min are exact; the mean sums
-in fp32 in a different order than torch (tolerance, not bitwise).
+in fp32 in a different order than torch (tolerance, not bitwise). The
+pooled features and both second moments are fp32 whatever the input dtype
+is, so an fp16 input narrows nothing here.
+
+Architecture floor: there is no `tl.dot` in these kernels, so fp16 and
+fp32 inputs run wherever Triton runs. bf16 inputs still need sm_80: the
+pooling widens each row to fp32, and the instruction that converts bf16
+to fp32 does not exist below it. See `kernels/arch.py` and
+docs/features/arch_support.md.
 """
 
 from __future__ import annotations
@@ -19,9 +27,13 @@ import functools
 
 import torch
 
+from miowtion.kernels import arch
 from miowtion.veda import tiling
 
 _TILE = tiling.TILE_SIZE
+# Keys of these kernels' entries in kernels/arch.py.
+_GATHER = 'tile_gather_triton.gather'
+_SCATTER = 'tile_gather_triton.scatter'
 
 
 @functools.cache
@@ -42,12 +54,14 @@ def supports(x: torch.Tensor) -> bool:
     """The kernels are installed *and* can take this tensor.
 
     `available()` alone is not enough to route a call here: on a CUDA
-    machine a CPU tensor, or a head_dim the kernels do not implement,
-    reaches `_check` and raises. Callers that have a fallback should ask
+    machine a CPU tensor, or a head_dim or architecture the kernels do
+    not implement, reaches `_check` and raises. Callers that have a
+    fallback (the torch gather / scatter in `veda.tiling`) should ask
     this instead.
     """
     return (x.is_cuda and available() and x.shape[-1] in (64, 128)
-            and x.stride(-1) == 1)
+            and x.stride(-1) == 1
+            and arch.supported(_GATHER, x.device, x.dtype))
 
 
 @functools.cache
@@ -123,9 +137,18 @@ def _heads(x: torch.Tensor, heads: torch.Tensor | None) -> torch.Tensor:
     return heads
 
 
-def _check(x: torch.Tensor) -> None:
+def _check(x: torch.Tensor, kernel: str) -> None:
+    """Shape, layout and architecture gate of one entry point.
+
+    Raises:
+        ValueError: On a head_dim or stride the kernels do not implement.
+        NotImplementedError: On an architecture or dtype they cannot be
+            compiled for. Callers with a fallback route on `supports`
+            and never see this.
+    """
     if x.shape[-1] not in (64, 128) or x.stride(-1) != 1:
         raise ValueError('tile kernels need contiguous head_dim 64 or 128')
+    arch.require(kernel, x.device, x.dtype)
 
 
 def gather_tiles(x: torch.Tensor, layout: tiling.TileLayout,
@@ -157,7 +180,7 @@ def gather_and_pool(x: torch.Tensor, layout: tiling.TileLayout,
 
 
 def _gather(x, layout, heads, pool, second=False):
-    _check(x)
+    _check(x, _GATHER)
     heads = _heads(x, heads)
     num_heads, dim = heads.numel(), x.shape[-1]
     out = torch.empty(layout.num_slots, num_heads, dim, dtype=x.dtype,
@@ -188,7 +211,7 @@ def scatter_tiles_(out: torch.Tensor, tiled: torch.Tensor,
                    layout: tiling.TileLayout,
                    heads: torch.Tensor | None) -> None:
     """Same contract as tiling.scatter_tiles_ (padding slots are dropped)."""
-    _check(out)
+    _check(out, _SCATTER)
     if out.shape[0] != layout.seq_len + 1:
         raise ValueError(f'scatter buffer needs {layout.seq_len + 1} rows')
     heads = _heads(out, heads)

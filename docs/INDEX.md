@@ -9,6 +9,7 @@
 | [features/veda_tiling.md](features/veda_tiling.md) | tile 排列（按头动态 tile 形状 + 按 tile 变长）、方案表 | CPU 测试通过 |
 | [features/veda_predictor_mask.md](features/veda_predictor_mask.md) | 打分器、预算与掩码规则、教师热力图、KL、recall | CPU 测试通过 |
 | [features/veda_kernel.md](features/veda_kernel.md) | FA4 CuTe 块稀疏整合（含 vendored 的 SM8x 补丁）、架构支持、测速结果 | SM89 已通过 GPU 测试；SM120 前向 + 反向已验证；SM90/100 待验证 |
+| [features/arch_support.md](features/arch_support.md) | 架构支持矩阵：每个 kernel （FA4 / Triton 热力图 / tile 排列 / 融合 elementwise / 融合补偿 / SDPA）的算力与 dtype 下限、决定下限的那条指令、sm_70 / sm_75 上还缺什么 | CPU 测试通过（能力矩阵用 monkeypatch 的算力钉住）；**sm_70 / sm_75 无硬件，GPU 路径未验证** |
 | [features/tile_search.md](features/tile_search.md) | oracle 评分、投票、每层 ≤2 种形状、搜索驱动 | 真实权重上 50 步 / 8 步搜索已跑通 |
 | [features/sol_ablation.md](features/sol_ablation.md) | Sol-Attn 消融：选块目标（输出误差贡献 Ω vs 注意力质量）与每行可变预算（z-score / σ 自适应 vs 固定 top-k）的离线验证、两道门槛 G1/G2、机理诊断 | 16:9@37 真实权重 67200 行已跑：**G1、G2 均未通过**，瓶颈是打分器准确度而非选块目标；t102 与 49 步基座待复跑 |
 | [features/veda2.md](features/veda2.md) | Veda2（stage1 冻结 backbone、只训 adaptor）：块质量目标、打分器补上块行数与二阶矩特征（低秩二阶头）、静态每头预算；以及为什么零阶补偿和「预测修正权重」都不进 | 16:9@37 真实权重 134400 行已量：对角二阶特征补回 27~46% 的 oracle 差距、每头预算再省 6%；在块质量这个决定 ε 的度量上，未训练的 veda2 已超过发布的 step600 打分器；1:1@37 ρ=0.05 上 5 条 clip 的三路视频与实测速度已出：**rank 16 + 融合池化后与 Veda1 等速（3.938 对 3.944 s/step）而质量更好，且完全 training-free**；画质待人工确认；训练已跑到 163 步并确认平台：净增益 +0.009 `retained`（§2.7），上限是结构不是优化；与 Sol / VSA / SLA 的定位与创新点分级见 §5.5（含两个明显空洞：没有共同基准的横向对比、「要不要加第二条便宜路径」没答案） |

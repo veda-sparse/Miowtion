@@ -11,6 +11,7 @@ import math
 import torch
 import torch.nn.functional as F
 
+from miowtion.kernels import arch
 from miowtion.kernels import fa4
 
 
@@ -43,6 +44,12 @@ def dense_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
         out: [S, H, D], zero on padding rows.
         lse: [S, H] fp32 natural-log LSE of q.k / sqrt(D) (0 on padding
             rows), or None.
+
+    Raises:
+        ValueError: On an unknown backend.
+        NotImplementedError: If the chosen CUDA backend cannot run on
+            this architecture and dtype (`kernels/arch.py`). 'math' runs
+            everywhere and is what the message points at.
     """
     seq_len, heads, head_dim = q.shape
     scale = 1.0 / math.sqrt(head_dim)
@@ -53,6 +60,14 @@ def dense_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
     if backend == 'fa4':
         out, lse = fa4.dense_attention(qr, kr, vr, scale, return_lse)
     elif backend == 'sdpa':
+        # Below sm_80 there is no bf16 fused SDPA kernel and no flash
+        # backend at all; PyTorch then either raises from inside the op
+        # or serves the call from the math backend, which expands
+        # [H, S, S]. Refuse with the arch named instead -- 300+ GiB at
+        # 38k tokens is not a fallback (see docs/pitfalls.md).
+        if q.is_cuda:
+            arch.require('h3.dense_attention.sdpa_lse' if return_lse
+                         else 'h3.dense_attention.sdpa', q.device, q.dtype)
         if return_lse:
             # The flash kernel returns LSE [B, H, S]; no public API does.
             out, lse = torch.ops.aten._scaled_dot_product_flash_attention(
