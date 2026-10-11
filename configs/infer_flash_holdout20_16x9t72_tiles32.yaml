@@ -1,0 +1,37 @@
+# The same four arms at latent_t 72, because the report says the
+# artifact gets worse with clip length: an absolute tile budget
+# does not scale with the sequence, so the same 10 tiles is a far
+# higher sparsity here than at t37.  That length dependence is a
+# prediction, and this is the arm that tests it.
+#
+# Issue #3 reproduction: 32 tiles per query row, the budget the reporters say does NOT flash.
+#
+# An absolute tile budget, not a ratio, because that is what the
+# node defaults to and it is the variable the reporters moved: 32
+# tiles is reported clean and 10 tiles is reported to produce a
+# one-frame brightness flash, for only 7% of the step time.
+#
+# Holdout 20 rather than the 12 demo captions, for two reasons.  The
+# demo prompts are multi-shot narratives, so at a low budget the arms
+# drift to a different cut and that swamps every temporal measurement
+# (docs/features/veda2.md 2.28); and twenty clips is the sample size a
+# paired comparison over clips actually needs.
+root: weights/MiniMax-H3
+variant: FL2VA
+schedule: turbo
+num_steps: 8
+adapter: weights/turbo_lora/minimax_h3_turbo_v4_step600_ema.safetensors
+sample_cache: artifacts/samples/moviegen_holdout20
+seed: 0
+offload_blocks: 30
+prefetch: 1
+mlp_chunk_rows: 8192
+decode_dtype: bf16
+geometry: ['16:9@72']
+keep_tiles: 32
+sample_id: [
+  holdout10s_0000, holdout10s_0001, holdout10s_0002, holdout10s_0003,
+  holdout10s_0004, holdout10s_0005, holdout10s_0006, holdout10s_0007]
+attention: [veda]
+predictor: weights/veda/veda2_r16.safetensors
+out_dir: artifacts/flash20_t72/tiles32

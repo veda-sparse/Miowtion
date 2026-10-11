@@ -24,6 +24,6 @@ decode_dtype: bf16
 geometry: ['16:9@37']
 sample_id: [
   holdout5s_0000, holdout5s_0001, holdout5s_0002, holdout5s_0003,
-  holdout5s_0004, holdout5s_0005, holdout5s_0006, holdout5s_0007]
+  holdout5s_0004]
 attention: [dense]
 out_dir: artifacts/flash20/dense
