@@ -1,0 +1,33 @@
+# Flicker vs the tile temporal extent, one clip, one variable.
+# A Veda query tile shares one key selection across all its rows, so the
+# attention pattern is piecewise constant in time and jumps at every tile
+# boundary. tt=1 is 4 RGB frames per decision, tt=8 is 32. Sol does not
+# flicker and its 64-token blocks sit inside a single frame (1008 tokens
+# here). The released plan is mostly tt=8.
+#
+# Outcome, docs/features/veda2.md 2.25: all four tt values fail the same
+# way (camera angle off from frame 0, cut at f88 instead of f96), so
+# 8x the temporal extent changes nothing and the budget changes
+# everything.  Kept because the null result is the point.
+#
+# plan_dir is command line only, so this config alone does not pin the
+# variable it exists to vary.  Run it as:
+#   python scripts/generate.py --config configs/infer_demo12_16x9_tt4.yaml \
+#       --plan-dir plans/uniform_tt4
+root: weights/MiniMax-H3
+variant: FL2VA
+schedule: turbo
+num_steps: 8
+adapter: weights/turbo_lora/minimax_h3_turbo_v4_step600_ema.safetensors
+sample_cache: artifacts/samples/demo12
+seed: 0
+keep_ratio: 0.05
+offload_blocks: 30
+prefetch: 1
+mlp_chunk_rows: 8192
+decode_dtype: bf16
+sample_id: [demo02_01M4G57X]
+geometry: ['16:9@37']
+attention: [veda]
+predictor: weights/veda/veda2_r16.safetensors
+out_dir: artifacts/demo12_compare/tt4_16x9
