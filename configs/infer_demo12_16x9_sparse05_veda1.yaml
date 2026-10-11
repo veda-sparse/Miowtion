@@ -1,0 +1,29 @@
+# Dense vs Veda1 vs Veda2 on the 12 demo captions from the preview site,
+# at 95% sparsity and 5 s. The captions are the prompt-expansion output
+# taken verbatim; the source clips were 10-15 s but every arm here renders
+# latent_t 37 (about 5 s), which is what makes 95% sparsity a hard case:
+# fewer tiles means the budget covers a larger share of each row, so a
+# router that ranks badly has nowhere to hide.
+#
+# Identical seed, prompt, geometry and schedule across arms. The only
+# thing that changes between the three configs is the router.
+root: weights/MiniMax-H3
+variant: FL2VA
+schedule: turbo
+num_steps: 8
+adapter: weights/turbo_lora/minimax_h3_turbo_v4_step600_ema.safetensors
+sample_cache: artifacts/samples/demo12
+seed: 0
+keep_ratio: 0.05
+offload_blocks: 30
+prefetch: 1
+mlp_chunk_rows: 8192
+decode_dtype: bf16
+sample_id: [
+  demo00_01M4GA5P, demo02_01M4G57X, demo03_01M4G3N3, demo04_01M4G1FK,
+  demo05_01M4G148, demo06_01M4G02G, demo07_01M4FWTA, demo08_01M4FVNY,
+  demo09_01M4FJEZ, demo10_01M4FDY7, demo11_01M4FAD6]
+geometry: ['16:9@37']
+attention: [veda]
+predictor: weights/veda/Minimax-H3-T2VA-Veda-8NFE-600Step-Preview/minimax_h3_t2va_veda_8nfe_600step_preview_fp8.safetensors
+out_dir: artifacts/demo12_compare/veda1_16x9
