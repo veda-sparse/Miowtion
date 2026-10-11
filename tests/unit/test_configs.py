@@ -123,3 +123,21 @@ def test_offline_probe_writes_every_series_it_counts():
         assert f"'{key}'" in payload, f'{key} is not written'
     log = source[source.index("progress.log(f'wrote {args.out}"):]
     assert 'payload.items()' in log, 'the log must read the payload'
+
+
+def test_dense_layers_reaches_the_veda_config():
+    """The reported fix for the one-frame flash has to be runnable.
+
+    `VedaConfig.dense_layers` has existed and been honoured in
+    attention.py from the start, but nothing wired it to the command
+    line, so the fix three users report for the brightness flash --
+    layers 0, 1 and 49 kept dense -- could not be reproduced from a
+    config at all. A flag that exists in the dataclass and not in the
+    parser is the same as not existing.
+    """
+    generate = _load_script('generate.py')
+    args = generate.parse_args([
+        '--root', 'weights/x', '--sample-cache', 'c', '--sample-id', 's',
+        '--geometry', '16:9@37', '--attention', 'veda',
+        '--out-dir', 'runs/x', '--dense-layers', '0', '1', '49'])
+    assert args.dense_layers == [0, 1, 49]

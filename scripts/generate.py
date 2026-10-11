@@ -120,6 +120,12 @@ def build_parser() -> argparse.ArgumentParser:
                         'routed fraction it actually reached')
     parser.add_argument('--dense-steps', type=int, nargs='*', default=[],
                         help='denoising steps that stay dense in veda runs')
+    parser.add_argument('--dense-layers', type=int, nargs='*', default=[],
+                        help='layers that stay dense in veda runs. '
+                        'VedaConfig has honoured this since the start but '
+                        'nothing could set it from a config, so the fix '
+                        'users report for the one-frame brightness flash '
+                        '(layers 0, 1 and 49 dense) could not be run')
     parser.add_argument('--offload-blocks', type=int, default=40)
     parser.add_argument('--prefetch', type=int, default=1)
     parser.add_argument('--mlp-chunk-rows', type=int, default=8192)
@@ -293,6 +299,7 @@ def _denoise_all(args, env, cache, jobs, devices, assigned) -> list[dict]:
             target_budget=_budget(args.keep_ratio, args.keep_tiles),
             ref_budget=_budget(args.ref_keep_ratio, args.ref_keep_tiles),
             tile_conditions=args.tile_conditions,
+            dense_layers=frozenset(args.dense_layers),
             collect_bytes=args.veda_collect_mib * 2**20)
         source = f'plans {args.plan_dir}, oracle masks (no predictor)'
     if set(pipeline.VEDA_MODES) & set(args.attention):
@@ -324,11 +331,13 @@ def _denoise_all(args, env, cache, jobs, devices, assigned) -> list[dict]:
         veda_config = veda_attention.VedaConfig(
             target_budget=target_budget, ref_budget=ref_budget,
             tile_conditions=args.tile_conditions,
+            dense_layers=frozenset(args.dense_layers),
             collect_bytes=args.veda_collect_mib * 2**20)
         progress.log(f'veda: {source}, target {_budget_text(target_budget)}, '
                      f'ref {(_budget_text(ref_budget) if ref_budget else "global")}, '
                      f'tile_conditions={args.tile_conditions}, dense steps '
-                     f'{args.dense_steps}')
+                     f'{args.dense_steps}, dense layers '
+                     f'{sorted(args.dense_layers)}')
     replicas = [(tch.model, tch.tables, predictor)]
     for device in devices[1:]:
         with progress.Timer(f'replicate the teacher on {device}'):
@@ -404,7 +413,8 @@ def _decode_and_compare(args, sample, geometry, results, decoder,
                'ref_keep_ratio': args.ref_keep_ratio,
                'ref_keep_tiles': args.ref_keep_tiles,
                'tile_conditions': args.tile_conditions,
-               'dense_steps': args.dense_steps, 'modes': {}}
+               'dense_steps': args.dense_steps,
+               'dense_layers': sorted(args.dense_layers), 'modes': {}}
     waveforms = {}
     for mode, result in results.items():
         frames[mode] = decoder.video(result.video_rows, geometry)
