@@ -1,0 +1,30 @@
+# E6: the budget rule, the last of the three axes that separate us from
+# Sol at a matched density.  E4 ruled out the compensation (negative end
+# to end) and S-4's 2x2 ruled out the block geometry, so if the gap has a
+# cause left it is that Sol lets each query row take as much budget as
+# its score distribution asks for while we give every row the same count.
+#
+# attention: [veda, veda_thresh] runs both arms in one process.  They are
+# iso-cost by construction, not by calibration: threshold_allowed solves
+# for the per-head tau that reproduces the top-k arm's total exactly, so
+# the only variable is how that total is spread across rows.
+root: weights/MiniMax-H3
+variant: FL2VA
+schedule: turbo
+num_steps: 8
+adapter: weights/turbo_lora/minimax_h3_turbo_v4_step600_ema.safetensors
+sample_cache: artifacts/samples/demo12
+seed: 0
+keep_ratio: 0.05
+offload_blocks: 30
+prefetch: 1
+mlp_chunk_rows: 8192
+decode_dtype: bf16
+sample_id: [
+  demo00_01M4GA5P, demo02_01M4G57X, demo03_01M4G3N3, demo04_01M4G1FK,
+  demo05_01M4G148, demo06_01M4G02G, demo07_01M4FWTA, demo08_01M4FVNY,
+  demo09_01M4FJEZ, demo10_01M4FDY7, demo11_01M4FAD6]
+geometry: ['16:9@37']
+attention: [veda, veda_thresh]
+predictor: weights/veda/veda2_r16.safetensors
+out_dir: artifacts/demo12_compare/e6_16x9
