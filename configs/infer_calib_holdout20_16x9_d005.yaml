@@ -1,0 +1,24 @@
+# Cost-curve calibration at density 0.05: the three Veda kernels in one process.
+#
+# Holdout 20 rather than the 12 demo captions, for two reasons.  The
+# demo prompts are multi-shot narratives, so at a low budget the arms
+# drift to a different cut and that swamps every temporal measurement
+# (docs/features/veda2.md 2.28); and twenty clips is the sample size a
+# paired comparison over clips actually needs.
+root: weights/MiniMax-H3
+variant: FL2VA
+schedule: turbo
+num_steps: 8
+adapter: weights/turbo_lora/minimax_h3_turbo_v4_step600_ema.safetensors
+sample_cache: artifacts/samples/moviegen_holdout20
+seed: 0
+offload_blocks: 30
+prefetch: 1
+mlp_chunk_rows: 8192
+decode_dtype: bf16
+geometry: ['16:9@37']
+keep_ratio: 0.05
+sample_id: [holdout5s_0000]
+attention: [veda, veda_comp, veda_sol]
+predictor: weights/veda/veda2_r16.safetensors
+out_dir: artifacts/isotime20/calib_d005
