@@ -62,3 +62,30 @@ def test_one_mode_from_two_arms_carries_its_arm(tmp_path):
 
     labels = _module()._clips(root)[('demo00_x', '16x9_t37')]
     assert sorted(labels) == ['dense', 'sol@dense', 'sol@sol07']
+
+
+def test_tile_phase_separates_aligned_flashes_from_spread_ones():
+    """The test that decides whether the routing's time grid is to blame.
+
+    A Veda query tile shares one key selection across its whole span,
+    so a routing-caused artifact can only appear at a tile boundary. If
+    flashes are spread uniformly instead, the time structure of the
+    routing is not what produces them.
+    """
+    from scripts import luma_flash
+
+    aligned = [0, 32, 64, 96, 128]
+    histogram, peak = luma_flash.tile_phase(aligned, 32, 160)
+    assert peak == 1.0
+    assert histogram.index(max(histogram)) == 0
+
+    spread = [1, 9, 17, 25, 33, 41, 49, 57]
+    _histogram, peak = luma_flash.tile_phase(spread, 32, 160)
+    assert peak <= 0.25
+
+
+def test_tile_phase_is_empty_without_a_period_or_flashes():
+    from scripts import luma_flash
+
+    assert luma_flash.tile_phase([4, 8], 1, 100) == ([], 0.0)
+    assert luma_flash.tile_phase([], 32, 100) == ([], 0.0)

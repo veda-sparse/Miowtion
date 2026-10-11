@@ -91,12 +91,47 @@ def flashes(luma: list[float]) -> tuple[list[dict], float]:
     return found, scale
 
 
+def tile_phase(frames: list[int], period: int, total: int
+               ) -> tuple[list[int], float]:
+    """Where flashes fall inside one query tile's span in time.
+
+    A Veda query tile shares one key selection across every row it
+    holds, so the selection is piecewise constant in time and can only
+    change at a tile boundary. If the flash is caused by the routing,
+    flash frames must pile up at one phase of that period; if they are
+    spread uniformly, the routing's time structure is not what is
+    producing them. This is the direct version of the periodicity test
+    in docs/features/veda2.md 2.22, which looked at frame differences
+    rather than at flashes.
+
+    Args:
+        frames: Frame indices of the flashes found.
+        period: RGB frames per query tile (4 per latent frame times the
+            tile's temporal extent).
+        total: Frames per clip, for the uniform null.
+
+    Returns:
+        The histogram over phase, and the fraction of flashes in the
+        fullest bin -- 1 / period under the null.
+    """
+    if period <= 1 or not frames:
+        return [], 0.0
+    histogram = [0] * period
+    for frame in frames:
+        histogram[frame % period] += 1
+    del total
+    return histogram, max(histogram) / len(frames)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--root', required=True)
     parser.add_argument('--reference', default='dense',
                         help='the arm every other one is differenced against')
     parser.add_argument('--ffmpeg', default='ffmpeg')
+    parser.add_argument('--tile-frames', type=int, default=0,
+                        help='RGB frames spanned by one query tile; '
+                        'reports where flashes fall inside that period')
     parser.add_argument('--out', default=None)
     args = parser.parse_args()
 
@@ -149,6 +184,18 @@ def main():
         worst = max(r['worst'] for r in group)
         print(f'{arm:<14}{geometry:<11}{len(group):>6}{len(hit):>14}'
               f'{total / len(group):>14.2f}{worst:>13.1f}')
+    if args.tile_frames > 1:
+        print(f'\nwhere the flashes fall inside one {args.tile_frames}-frame '
+              f'query tile (uniform would be '
+              f'{1 / args.tile_frames:.3f} in the fullest bin):')
+        print(f'{"arm":<14}{"flashes":>9}{"fullest bin":>13}{"phase":>8}')
+        for (arm, _geometry), group in sorted(by_arm.items()):
+            frames = [f['frame'] for r in group for f in r['flashes']]
+            histogram, peak = tile_phase(frames, args.tile_frames, 0)
+            if not histogram:
+                continue
+            print(f'{arm:<14}{len(frames):>9}{peak:>13.3f}'
+                  f'{histogram.index(max(histogram)):>8}')
     if args.out:
         os.makedirs(os.path.dirname(args.out) or '.', exist_ok=True)
         json.dump({'reference': args.reference, 'per_clip': rows,
