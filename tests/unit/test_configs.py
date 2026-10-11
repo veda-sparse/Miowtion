@@ -9,6 +9,7 @@ solattn.RunConfig, every `offline_*.yaml` into a ProbeConfig, and every
 other one into a TrainConfig.
 """
 
+import argparse
 import dataclasses
 import glob
 import importlib.util
@@ -141,3 +142,35 @@ def test_dense_layers_reaches_the_veda_config():
         '--geometry', '16:9@37', '--attention', 'veda',
         '--out-dir', 'runs/x', '--dense-layers', '0', '1', '49'])
     assert args.dense_layers == [0, 1, 49]
+
+
+def test_mode_configs_without_a_sweep_is_the_modes_asked_for():
+    generate = _load_script('generate.py')
+    from miowtion.veda import attention as veda_attention
+
+    config = veda_attention.VedaConfig()
+    args = argparse.Namespace(attention=['dense', 'veda'],
+                              keep_tiles_sweep=[])
+    assert generate._mode_configs(args, config) == [
+        ('dense', 'dense', config), ('veda', 'veda', config)]
+
+
+def test_mode_configs_sweeps_only_the_arms_that_have_a_budget():
+    """dense and sol have no tile budget.
+
+    Sweeping them would generate the identical clip several times under
+    different names, which reads as agreement between budgets in every
+    downstream table.
+    """
+    generate = _load_script('generate.py')
+    from miowtion.veda import attention as veda_attention
+
+    config = veda_attention.VedaConfig()
+    args = argparse.Namespace(attention=['dense', 'sol', 'veda'],
+                              keep_tiles_sweep=[32, 10])
+    got = generate._mode_configs(args, config)
+    assert [row[0] for row in got] == ['dense', 'sol', 'veda_t32', 'veda_t10']
+    assert [row[1] for row in got] == ['dense', 'sol', 'veda', 'veda']
+    assert got[2][2].target_budget.tiles == 32.0
+    assert got[3][2].target_budget.tiles == 10.0
+    assert got[0][2] is config and got[1][2] is config

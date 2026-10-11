@@ -120,6 +120,15 @@ def build_parser() -> argparse.ArgumentParser:
                         'routed fraction it actually reached')
     parser.add_argument('--dense-steps', type=int, nargs='*', default=[],
                         help='denoising steps that stay dense in veda runs')
+    parser.add_argument('--keep-tiles-sweep', type=int, nargs='*',
+                        default=[],
+                        help='run every veda mode once per tile budget in '
+                        'one process, writing <mode>_t<tiles>. Loading the '
+                        'weights, merging the LoRA and precomputing the '
+                        'AdaLN tables costs about as much as a whole 5 s '
+                        'generation, so a budget ladder launched as one '
+                        'process per budget spends most of its time on '
+                        'work it already did')
     parser.add_argument('--dense-layers', type=int, nargs='*', default=[],
                         help='layers that stay dense in veda runs. '
                         'VedaConfig has honoured this since the start but '
@@ -356,7 +365,8 @@ def _denoise_all(args, env, cache, jobs, devices, assigned) -> list[dict]:
             progress.log(f'[{device}] {sample.id} on {geometry.name}'
                          + (f' (plan {plan.geometry})' if plan else ''))
             modes = {}
-            for mode in args.attention:
+            for mode, base_mode, mode_config in _mode_configs(
+                    args, veda_config):
                 saved = os.path.join(out_dir, f'{mode}_latents.pt')
                 if os.path.exists(saved):
                     # Resume: a finished (sample, mode) of an earlier run.
@@ -365,10 +375,10 @@ def _denoise_all(args, env, cache, jobs, devices, assigned) -> list[dict]:
                     continue
                 modes[mode] = pipeline.generate(
                     model, tch.schedule, tables, cache, sample, geometry,
-                    args.seed, device, mode, plan, rank_predictor,
-                    veda_config, args.dense_steps, args.sol_tau)
+                    args.seed, device, base_mode, plan, rank_predictor,
+                    mode_config, args.dense_steps, args.sol_tau)
                 extra = ''
-                if mode == 'sol' and len(sol_kernel.DENSITY_CURVE) > 1:
+                if base_mode == 'sol' and len(sol_kernel.DENSITY_CURVE) > 1:
                     parts = []
                     for cand in sorted(sol_kernel.DENSITY_CURVE):
                         d = sol_kernel.DENSITY_CURVE[cand]
@@ -377,7 +387,7 @@ def _denoise_all(args, env, cache, jobs, devices, assigned) -> list[dict]:
                                  f'curve over {len(d)} calls -- '
                                  + ', '.join(parts))
                     sol_kernel.DENSITY_CURVE.clear()
-                if mode == 'sol' and sol_kernel.DENSITY_LOG:
+                if base_mode == 'sol' and sol_kernel.DENSITY_LOG:
                     log = sol_kernel.DENSITY_LOG
                     extra = (f', sol density {sum(log) / len(log):.4f} '
                              f'[{min(log):.4f}, {max(log):.4f}] over '
@@ -397,6 +407,40 @@ def _denoise_all(args, env, cache, jobs, devices, assigned) -> list[dict]:
         with torch.cuda.device(device):
             torch.cuda.empty_cache()
     return results
+
+
+def _mode_configs(args, veda_config):
+    """(label, mode, config) for every arm this run has to generate.
+
+    Without a sweep this is just the requested modes. With one, every
+    veda mode is repeated at each tile budget and labelled `<mode>_t<n>`,
+    which is what lets a budget ladder share one process: loading the
+    weights, merging the LoRA and precomputing the AdaLN tables costs
+    about as much as a whole short generation, so a ladder launched as
+    one process per rung spends most of its wall clock redoing that.
+
+    Args:
+        args: Parsed arguments.
+        veda_config: The config built from the scalar budget, used as is
+            when there is no sweep.
+
+    Returns:
+        One triple per arm, in a stable order.
+    """
+    if not args.keep_tiles_sweep:
+        return [(mode, mode, veda_config) for mode in args.attention]
+    out = []
+    for mode in args.attention:
+        if mode not in pipeline.VEDA_MODES:
+            # dense and sol have no tile budget, so sweeping them would
+            # generate the same clip several times under different names.
+            out.append((mode, mode, veda_config))
+            continue
+        for tiles in args.keep_tiles_sweep:
+            out.append((f'{mode}_t{tiles}', mode, dataclasses.replace(
+                veda_config, target_budget=veda_mask.Budget(
+                    tiles=float(tiles)))))
+    return out
 
 
 def _decode_and_compare(args, sample, geometry, results, decoder,
