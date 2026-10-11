@@ -89,3 +89,23 @@ def test_tile_phase_is_empty_without_a_period_or_flashes():
 
     assert luma_flash.tile_phase([4, 8], 1, 100) == ([], 0.0)
     assert luma_flash.tile_phase([], 32, 100) == ([], 0.0)
+
+
+def test_join_arms_rejects_an_arm_spec_without_a_title(tmp_path, monkeypatch):
+    """A clip missing an arm must not be joined with fewer panes.
+
+    A five-pane comparison that looks like a six-pane one is worse than
+    no comparison, so the script reports and skips rather than joining
+    whatever it found.
+    """
+    import subprocess
+    import sys
+
+    from scripts import join_arms
+
+    monkeypatch.setattr(sys, 'argv',
+                        ['join_arms.py', '--root', str(tmp_path),
+                         '--arm', 'nodelimiter'])
+    with pytest.raises(SystemExit, match='Title=label'):
+        join_arms.main()
+    del subprocess
