@@ -109,3 +109,24 @@ def test_join_arms_rejects_an_arm_spec_without_a_title(tmp_path, monkeypatch):
     with pytest.raises(SystemExit, match='Title=label'):
         join_arms.main()
     del subprocess
+
+
+def test_flash_grid_of_the_reproduction_is_17_latent_frames():
+    """The measured flash grid, pinned so a refactor cannot lose it.
+
+    Every sparse clip in the issue #3 reproduction flashes at frames
+    51, 119 and 187 and nowhere else systematically. Those are 68
+    frames apart, and 68 frames is 17 latent frames at the VAE's 4x
+    temporal ratio -- which is `vae_clip_length` in the video VAE's own
+    config. The arithmetic is the whole argument, so it is a test.
+    """
+    from scripts import luma_flash
+
+    observed = [51, 119, 187]
+    assert [f // 17 for f in observed] == [3, 7, 11]
+    assert all(f % 17 == 0 for f in observed)
+    # One event per 17 latent frames, i.e. 68 RGB frames.
+    assert [b - a for a, b in zip(observed, observed[1:])] == [68, 68]
+    histogram, peak = luma_flash.tile_phase(observed, 17, 243)
+    assert peak == 1.0
+    assert histogram.index(max(histogram)) == 0
