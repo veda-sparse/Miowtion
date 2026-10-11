@@ -129,6 +129,13 @@ def build_parser() -> argparse.ArgumentParser:
                         'generation, so a budget ladder launched as one '
                         'process per budget spends most of its time on '
                         'work it already did')
+    parser.add_argument('--dense-layers-sweep', type=str, nargs='*',
+                        default=[],
+                        help="one arm per comma-separated layer set, e.g. "
+                        "'0 1 49 0,1,49'. Which of the three layers in the "
+                        'reported fix actually carries it cannot be found '
+                        'without running them apart, and a process per set '
+                        'spends more time loading than generating')
     parser.add_argument('--dense-layers', type=int, nargs='*', default=[],
                         help='layers that stay dense in veda runs. '
                         'VedaConfig has honoured this since the start but '
@@ -427,19 +434,28 @@ def _mode_configs(args, veda_config):
     Returns:
         One triple per arm, in a stable order.
     """
-    if not args.keep_tiles_sweep:
+    sweeps = []
+    for tiles in args.keep_tiles_sweep:
+        sweeps.append((f't{tiles}', {'target_budget': veda_mask.Budget(
+            tiles=float(tiles))}))
+    for text in getattr(args, 'dense_layers_sweep', []):
+        layers = frozenset(int(x) for x in text.split(',') if x != '')
+        label = ('L' + '_'.join(str(x) for x in sorted(layers))
+                 if layers else 'Lnone')
+        sweeps.append((label, {'dense_layers': layers}))
+    if not sweeps:
         return [(mode, mode, veda_config) for mode in args.attention]
     out = []
     for mode in args.attention:
         if mode not in pipeline.VEDA_MODES:
-            # dense and sol have no tile budget, so sweeping them would
-            # generate the same clip several times under different names.
+            # dense and sol have neither a tile budget nor dense layers,
+            # so sweeping them would generate the same clip several
+            # times under different names.
             out.append((mode, mode, veda_config))
             continue
-        for tiles in args.keep_tiles_sweep:
-            out.append((f'{mode}_t{tiles}', mode, dataclasses.replace(
-                veda_config, target_budget=veda_mask.Budget(
-                    tiles=float(tiles)))))
+        for label, override in sweeps:
+            out.append((f'{mode}_{label}', mode,
+                        dataclasses.replace(veda_config, **override)))
     return out
 
 
@@ -458,7 +474,9 @@ def _decode_and_compare(args, sample, geometry, results, decoder,
                'ref_keep_tiles': args.ref_keep_tiles,
                'tile_conditions': args.tile_conditions,
                'dense_steps': args.dense_steps,
-               'dense_layers': sorted(args.dense_layers), 'modes': {}}
+               'dense_layers': sorted(args.dense_layers),
+               'dense_layers_sweep': list(args.dense_layers_sweep),
+               'modes': {}}
     waveforms = {}
     for mode, result in results.items():
         frames[mode] = decoder.video(result.video_rows, geometry)

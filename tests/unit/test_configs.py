@@ -174,3 +174,28 @@ def test_mode_configs_sweeps_only_the_arms_that_have_a_budget():
     assert got[2][2].target_budget.tiles == 32.0
     assert got[3][2].target_budget.tiles == 10.0
     assert got[0][2] is config and got[1][2] is config
+
+
+def test_mode_configs_sweeps_dense_layer_sets():
+    """Which of the three layers carries the fix needs them run apart."""
+    generate = _load_script('generate.py')
+    from miowtion.veda import attention as veda_attention
+
+    config = veda_attention.VedaConfig()
+    args = argparse.Namespace(attention=['veda'], keep_tiles_sweep=[],
+                              dense_layers_sweep=['0', '49', '0,1,49'])
+    got = generate._mode_configs(args, config)
+    assert [row[0] for row in got] == ['veda_L0', 'veda_L49', 'veda_L0_1_49']
+    assert got[0][2].dense_layers == frozenset({0})
+    assert got[2][2].dense_layers == frozenset({0, 1, 49})
+
+
+def test_an_empty_dense_layer_set_is_labelled_not_blank():
+    """The control arm has to be named, not left as a bare prefix."""
+    generate = _load_script('generate.py')
+    from miowtion.veda import attention as veda_attention
+
+    args = argparse.Namespace(attention=['veda'], keep_tiles_sweep=[],
+                              dense_layers_sweep=['', '0'])
+    got = generate._mode_configs(args, veda_attention.VedaConfig())
+    assert [row[0] for row in got] == ['veda_Lnone', 'veda_L0']

@@ -1,0 +1,38 @@
+# Issue #3: the budget rungs above the reporters clean point.
+#
+# An absolute tile budget, not a ratio, because that is what the
+# node defaults to and it is the variable the reporters moved: 32
+# tiles is reported clean and 10 tiles is reported to produce a
+# one-frame brightness flash, for only 7% of the step time.
+#
+# Our 32 tiles is 9.69% of the keys where theirs was 13.68% on a
+# different aspect, so both of our points sat below their clean
+# one and the budget threshold could not be read off them.  45,
+# 64 and 96 tiles are 13.6%, 19.4% and 29.1% here, which brackets
+# it and reaches the 20% our own ladder says tracks dense.
+#
+# Holdout 20 rather than the 12 demo captions, for two reasons.  The
+# demo prompts are multi-shot narratives, so at a low budget the arms
+# drift to a different cut and that swamps every temporal measurement
+# (docs/features/veda2.md 2.28); and twenty clips is the sample size a
+# paired comparison over clips actually needs.
+root: weights/MiniMax-H3
+variant: FL2VA
+schedule: turbo
+num_steps: 8
+adapter: weights/turbo_lora/minimax_h3_turbo_v4_step600_ema.safetensors
+sample_cache: artifacts/samples/moviegen_holdout20
+seed: 0
+offload_blocks: 30
+prefetch: 1
+mlp_chunk_rows: 8192
+decode_dtype: bf16
+geometry: ['16:9@37']
+keep_tiles: 32
+keep_tiles_sweep: [45, 64, 96]
+sample_id: [
+  holdout5s_0000, holdout5s_0001, holdout5s_0002, holdout5s_0003,
+  holdout5s_0004]
+attention: [veda]
+predictor: weights/veda/veda2_r16.safetensors
+out_dir: artifacts/flash20/budget
