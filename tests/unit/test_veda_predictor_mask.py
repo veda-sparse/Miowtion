@@ -470,3 +470,49 @@ def test_psd_roots_drop_the_null_space():
     # It is the identity on the range and kills the null space.
     torch.testing.assert_close(projector @ matrix, matrix, rtol=1e-4,
                                atol=1e-5)
+
+
+def test_threshold_rule_spends_the_same_total_unevenly():
+    """Sol's budget shape at our budget size.
+
+    The whole point of the comparison is that only the *shape* of the
+    allocation differs, so the per-head total has to be identical to the
+    top-k arm's -- otherwise a quality difference is just a density
+    difference wearing a different hat.
+    """
+    lay = _layout(target_grid=(16, 16, 16))
+    blocks = veda_mask.column_blocks(lay, veda_mask.Budget(ratio=0.3))
+    torch.manual_seed(0)
+    scores = torch.randn(4, lay.n_video_tiles, lay.n_tiles)
+
+    flat = veda_mask.select_video_blocks(scores, lay, blocks)
+    uneven = veda_mask.select_video_blocks(scores, lay, blocks,
+                                           rule='threshold')
+    per_row_flat = veda_mask.kept_tiles_per_row(flat)
+    per_row_uneven = veda_mask.kept_tiles_per_row(uneven)
+
+    # Same spend per head, to the tile.
+    assert torch.equal(per_row_flat.sum(-1), per_row_uneven.sum(-1))
+    # Top-k is flat to within the Bresenham remainder; the threshold is not.
+    assert per_row_flat.max() - per_row_flat.min() <= 1
+    assert per_row_uneven.max() - per_row_uneven.min() >= 3
+
+
+def test_threshold_rule_still_forces_the_diagonal():
+    lay = _layout(target_grid=(16, 16, 16))
+    blocks = veda_mask.column_blocks(lay, veda_mask.Budget(ratio=0.3))
+    torch.manual_seed(1)
+    scores = torch.randn(2, lay.n_video_tiles, lay.n_tiles)
+    sel = veda_mask.select_video_blocks(scores, lay, blocks,
+                                        rule='threshold')
+    got = veda_mask.dense_block_mask(sel, lay)
+    rows = torch.arange(lay.n_video_tiles)
+    assert bool(got[:, rows, rows].all())
+
+
+def test_select_video_blocks_rejects_an_unknown_rule():
+    lay = _layout()
+    blocks = veda_mask.column_blocks(lay, veda_mask.Budget(ratio=0.1))
+    scores = torch.randn(2, lay.n_video_tiles, lay.n_tiles)
+    with pytest.raises(ValueError, match='rule must be'):
+        veda_mask.select_video_blocks(scores, lay, blocks, rule='sol')

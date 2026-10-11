@@ -31,9 +31,13 @@ from miowtion.veda import predictor as veda_predictor
 # 'veda_comp' is 'veda' with Sol's zero-order compensation switched on;
 # it exists so the end-to-end comparison (plan E4) differs from a plain
 # Veda run in exactly one thing.
-VEDA_MODES = ('veda', 'veda_comp', 'veda_sol')
-ATTENTION_MODES = ('dense', 'veda', 'veda_comp', 'veda_sol', 'sol',
-                   'oracle_mass', 'oracle_max', 'oracle_mean')
+# 'veda_thresh' is 'veda' with Sol's per-row threshold deciding how the
+# budget is split across query tiles, at the same per-head total; it is
+# the third and last axis of the Sol comparison (budget rule), after
+# compensation and block geometry both came back negative.
+VEDA_MODES = ('veda', 'veda_comp', 'veda_sol', 'veda_thresh')
+ATTENTION_MODES = ('dense', 'veda', 'veda_comp', 'veda_sol', 'veda_thresh',
+                   'sol', 'oracle_mass', 'oracle_max', 'oracle_mean')
 
 
 @dataclasses.dataclass
@@ -154,6 +158,9 @@ def generate(model: h3_model.H3DiT, schedule, tables,
     if attention == 'veda_sol':
         veda_config = dataclasses.replace(
             veda_config, fused_compensation=True)
+    if attention == 'veda_thresh':
+        veda_config = dataclasses.replace(
+            veda_config, budget_rule='threshold')
     clip = (veda_attention.ClipTiling(traj.layout, veda_config, device)
             if tiled else None)
     steps = progress.Progress(f'generate {sample.id} ({attention})',

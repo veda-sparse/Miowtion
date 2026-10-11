@@ -134,10 +134,75 @@ class Selection:
     keep: torch.Tensor
 
 
+# How many times the cap below bound, i.e. a row wanted more tiles than the
+# threshold rule was allowed to give it. Read by the probe scripts: a rule
+# that saturates often is no longer the rule it claims to be.
+SATURATED = [0, 0]  # [rows that hit the cap, rows seen]
+
+
+def threshold_allowed(sorted_scores: torch.Tensor, valid: torch.Tensor,
+                      mean_k: torch.Tensor, cap: int) -> torch.Tensor:
+    """Sol's per-row threshold, recalibrated to our mean budget.
+
+    Sol-Attn routes a key block when its score clears `mean + tau * std`
+    of that query row's scores, so the number of blocks a row keeps is
+    decided by the data; our top-k gives every row the same number. The
+    two differ in the *shape* of the allocation, not in its mean -- which
+    is why a comparison at a matched mean density isolates exactly that
+    difference. Here tau is not a constant but is solved for per head so
+    that the realised mean equals `mean_k`: the kernel then costs the
+    same as the top-k arm it is compared against, to the tile.
+
+    Rows are standardised before the threshold is applied (z = (s - mean)
+    / std over that row's valid columns), which is what makes one tau
+    comparable across rows; a raw threshold would just reproduce top-k
+    with extra steps on rows whose scores are uniformly large.
+
+    Args:
+        sorted_scores: [H', R, C] row scores, descending along C, as
+            returned by topk. Forced columns carry +inf.
+        valid: [H', R, C] bool, False where the column is padding.
+        mean_k: [] float target mean kept columns per row.
+        cap: C, the largest number a row can be given.
+
+    Returns:
+        [H', R] int64 kept count per row, summing to `mean_k * R` per
+        head up to the tie at the threshold.
+    """
+    counts = valid.sum(-1, keepdim=True).clamp(min=2).float()
+    finite = torch.where(valid, sorted_scores.float(), 0.0)
+    # Forced (+inf) columns would poison mean/std, so they are excluded
+    # from the statistics and re-forced afterwards.
+    forced = torch.isinf(finite) & (finite > 0)
+    finite = torch.where(forced, 0.0, finite)
+    stats_n = (counts - forced.sum(-1, keepdim=True)).clamp(min=2)
+    mean = finite.sum(-1, keepdim=True) / stats_n
+    var = (torch.where(valid & ~forced, (finite - mean) ** 2, 0.0)
+           ).sum(-1, keepdim=True) / (stats_n - 1)
+    z = (sorted_scores.float() - mean) / var.sqrt().clamp(min=1e-12)
+    z = torch.where(valid, z, torch.tensor(_NEG_INF, device=z.device))
+    z = torch.where(forced, torch.tensor(_POS_INF, device=z.device), z)
+
+    heads, rows, _ = z.shape
+    total = int(round(float(mean_k) * rows))
+    total = max(1, min(total, z.shape[-1] * rows))
+    flat = z.reshape(heads, -1)
+    # The threshold is the total-th largest z of the whole head, so the
+    # head keeps exactly the budget it would have kept under top-k while
+    # being free to spend it unevenly across rows.
+    tau = flat.topk(total, dim=-1).values[:, -1:]
+    allowed = (z >= tau[:, :, None]).sum(-1)
+    SATURATED[0] += int((allowed >= cap).sum())
+    SATURATED[1] += heads * rows
+    return allowed.clamp(min=1)
+
+
 @torch.no_grad()
 def select_video_blocks(scores: torch.Tensor, layout: tiling.TileLayout,
                         blocks: list[ColumnBlock],
-                        rows: torch.Tensor | None = None) -> Selection:
+                        rows: torch.Tensor | None = None,
+                        rule: str = 'topk',
+                        cap_mult: float = 4.0) -> Selection:
     """Top-k over the video quadrant of `scores` (rules 2-7).
 
     Args:
@@ -148,10 +213,18 @@ def select_video_blocks(scores: torch.Tensor, layout: tiling.TileLayout,
         rows: [R] int64 video query tile ids; None means all n_video tiles.
             The Bresenham pattern and the diagonal follow the tile id, not
             the position within `rows`.
+        rule: 'topk' gives every row the same count (rules 3-4);
+            'threshold' spends the same per-head total unevenly, by
+            Sol-Attn's standardised per-row threshold. See
+            threshold_allowed().
+        cap_mult: 'threshold' only -- the largest multiple of the mean
+            budget one row may take. Saturation is counted in SATURATED.
 
     Returns:
         The selection for the R query tiles.
     """
+    if rule not in ('topk', 'threshold'):
+        raise ValueError(f"rule must be 'topk' or 'threshold': {rule!r}")
     heads = scores.shape[0]
     n_video = layout.n_video_tiles
     device = scores.device
@@ -189,11 +262,24 @@ def select_video_blocks(scores: torch.Tensor, layout: tiling.TileLayout,
                                         s.gather(-1, col)))
         budget = block.budget.per_row(block.real_tokens, n_cols)
         k_lo, k_hi, frac = split_budget(budget, n_cols)
+        if rule == 'threshold':
+            # The rule can hand a row more than the mean, so the topk has
+            # to be widened before it can be applied; `cap_mult` bounds
+            # how uneven the allocation is allowed to get.
+            k_hi = min(n_cols, max(k_hi, int(math.ceil(cap_mult * budget))))
         vals, idx = torch.topk(s, k_hi, dim=-1, sorted=True)
-        extra = bresenham_extra(n_video, frac, device).index_select(0, rows)
-        allowed = k_lo + extra.to(torch.long)
-        keep = (torch.arange(k_hi, device=device)[None, None, :]
-                < allowed[None, :, None]) & (vals > _NEG_INF)
+        if rule == 'threshold':
+            allowed = threshold_allowed(
+                vals, vals > _NEG_INF,
+                torch.tensor(budget, device=device), k_hi)
+            keep = (torch.arange(k_hi, device=device)[None, None, :]
+                    < allowed[:, :, None]) & (vals > _NEG_INF)
+        else:
+            extra = bresenham_extra(n_video, frac,
+                                    device).index_select(0, rows)
+            allowed = k_lo + extra.to(torch.long)
+            keep = (torch.arange(k_hi, device=device)[None, None, :]
+                    < allowed[None, :, None]) & (vals > _NEG_INF)
         indices.append(idx + block.start)
         keeps.append(keep)
     return Selection(torch.cat(indices, -1), torch.cat(keeps, -1))

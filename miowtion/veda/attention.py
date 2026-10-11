@@ -88,6 +88,15 @@ class VedaConfig:
             block size and the block shape at once, so attributing a
             difference to either needs each moved separately. No plan
             applies, every head gets the same contiguous cut.
+        budget_rule: 'topk' gives every query tile the same number of
+            key tiles; 'threshold' spends the same per-head total by
+            Sol-Attn's standardised per-row threshold, so a row whose
+            attention is diffuse takes more and a peaked row takes less.
+            This is the last of the three axes separating us from Sol
+            that had not been measured on our own path -- compensation
+            came out negative (E4) and block geometry came out neutral
+            (S-4), so if the matched-density gap has a cause left, it is
+            here. Iso-cost by construction: see mask.threshold_allowed.
         collect_bytes: Bound on one tile-ordered q / k / v / out copy; a
             head group is processed in chunks of heads under it. Heads are
             independent, so it changes only the launch count, never the
@@ -105,6 +114,7 @@ class VedaConfig:
     ref_budget: veda_mask.Budget | None = None
     tile_conditions: bool = False
     contiguous_tiles: bool = False
+    budget_rule: str = 'topk'
     zero_order_compensation: bool = False
     fused_compensation: bool = False
     teacher_q_tiles: float = 1.0
@@ -123,6 +133,9 @@ class ClipTiling:
             raise ValueError(
                 'zero_order_compensation and fused_compensation compute the '
                 'same term; pick one, they are two implementations of it')
+        if config.budget_rule not in ('topk', 'threshold'):
+            raise ValueError("budget_rule must be 'topk' or 'threshold': "
+                             f'{config.budget_rule!r}')
         """Initializes the cache.
 
         Args:
@@ -544,7 +557,8 @@ class OracleStudent:
                 heat = heat / counts[None, None, :]
             selection = veda_mask.select_video_blocks(
                 heat[:, :, :tile_layout.n_video_tiles], tile_layout,
-                self.clip.blocks(tile_layout), rows)
+                self.clip.blocks(tile_layout), rows,
+                rule=self.clip.config.budget_rule)
             block_mask = veda_mask.dense_block_mask(selection, tile_layout)
         if self.use_fa4:
             o_tiles = fa4.block_sparse_attention(q_tiles, k_tiles, v_tiles,
@@ -722,7 +736,8 @@ class SparseStudent:
             # Only video query tiles are selected; global rows are dense.
             selection = veda_mask.select_video_blocks(
                 logits[:, :tile_layout.n_video_tiles], tile_layout,
-                self.clip.blocks(tile_layout))
+                self.clip.blocks(tile_layout),
+                rule=self.clip.config.budget_rule)
             block_mask = veda_mask.dense_block_mask(selection, tile_layout)
         if self.clip.config.fused_compensation:
             o_tiles = sol_veda.block_sparse_attention(

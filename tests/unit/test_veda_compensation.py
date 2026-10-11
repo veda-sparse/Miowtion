@@ -165,3 +165,14 @@ def test_the_two_compensation_implementations_are_exclusive():
         veda_attention.ClipTiling(
             h3_layout.PackedLayout.__new__(h3_layout.PackedLayout),
             config, torch.device('cpu'))
+
+
+def test_clip_tiling_rejects_an_unknown_budget_rule():
+    """A typo in a config must stop the run, not silently route top-k."""
+    from miowtion.h3 import layout as h3_layout
+
+    config = veda_attention.VedaConfig(budget_rule='sol')
+    with pytest.raises(ValueError, match='budget_rule'):
+        veda_attention.ClipTiling(
+            h3_layout.PackedLayout.__new__(h3_layout.PackedLayout),
+            config, torch.device('cpu'))
