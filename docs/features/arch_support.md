@@ -47,7 +47,7 @@ bf16 的类型注解、一个 `tl.dot`、FA4 的 cp.async 流水，各自定下�
 | `block_heat_triton.teacher_heat` | sm_75 | QK^T 是一个 `tl.dot` | sm_80 | **sm_75** | sm_75 |
 | `tile_gather_triton.gather` / `.scatter` | sm_70 | 只有搬运与归约，**没有** `tl.dot` | sm_80 | **sm_70** | sm_70 |
 | `elementwise_triton`（RoPE / AdaLN / SwiGLU） | sm_80 | 为了与 eager 逐位相等，每个中间量都舍入到 bf16 | sm_80 | 未实现 | 未实现 |
-| `compensation_triton.compensate`（尚未入库，随融合补偿的工作一起提交） | sm_80 | 概率块被 cast 成 bf16 去做 `tl.dot` | sm_80 | 未实现 | 未实现 |
+| `compensation_triton.compensate` | sm_80 | 概率块被 cast 成 bf16 去做 `tl.dot`；但**先卡住的不是这个 cast**——`compensation_triton.attention` 的精确块走 `fa4.block_sparse_attention`，那条本身就是 sm_80 | sm_80 | 未实现 | 未实现 |
 | `sol_veda.block_sparse_attention`（融合 INT8） | sm_80 | 选中的块量化成 INT8（sm_75 起），但池化后的 summary 与在线 softmax 仍是 bf16（sm_80 起） | sm_80 | 未实现 | 未实现 |
 | `h3.attention.dense_attention` `backend='sdpa'` | sm_70 | PyTorch 的融合 SDPA kernel | sm_80 | sm_70 | sm_70 |
 | 同上，`return_lse=True` | sm_80 | 唯一返回 LSE 的是 flash 后端，它要求 sm_80 | sm_80 | sm_80 | 未实现（flash 后端不收 fp32） |
@@ -66,6 +66,16 @@ bf16 的类型注解、一个 `tl.dot`、FA4 的 cp.async 流水，各自定下�
   卡会自动走 torch 参考实现，而不是死在 Triton 编译里。
 - **tile 排列与池化（`tile_gather_triton`）在 sm_70 上用 fp16 就能跑**，因为里面没有
   `tl.dot`。bf16 仍然要 sm_80。
+- **融合补偿（`compensation_triton`）在 sm_7x 上不只差一个 cast。** 这条路径是
+  「FA4 跑精确块 + Triton 补偿被丢掉的块」，所以它的第一道门槛是 FA4 的 sm_80，
+  bf16 的 `tl.dot` 只是接下来会撞到的第二件事。换句话说**把 cast 改成 fp16 不会让
+  这条路径在 sm_75 上跑起来**：得先给它配一个能在 sm_75 上跑的精确块 kernel。
+- **融合的 Sol+Veda（INT8）自己就会报对的错**：`kernels/sol_veda.py` 的 `available()`
+  用 `get_device_capability()[0] >= 8` 设限，`unavailable_reason()` 返回
+  「needs SM80 or newer」，所以它在 Volta / Turing 上本来就是自描述的，不依赖
+  `arch.py`。`arch.REQUIREMENTS` 里仍然给它留了一条，只为了让矩阵是完整的一张表
+  （并说明为什么 sm_75 的 IMMA 不够：量化只用在选中的块上，summary 与在线 softmax
+  还是 bf16）。
 - **整模型仍然是 bf16 的**：`h3/model.py` 的 `_BF16` 与 `h3/weights.py` 把权重 dtype
   钉成 bf16。因此即使上面这些 kernel 的 fp16 路径都就位，**端到端跑在 sm_70 / sm_75 上
   还缺一步：把模型与权重加载的 dtype 参数化**。本次没有做这件事（见「待办」），因为
@@ -166,10 +176,12 @@ fp16 的指数范围比 bf16 小得多（最大 65504，bf16 约 3.4e38），所
 - 把模型 dtype 参数化（`h3/model.py` 的 `_BF16`、`h3/weights.py`、训练与 checkpoint
   路径），端到端的 fp16 才可能在 sm_7x 上跑起来。现在缺这一步，所以上面的 fp16 kernel
   路径只对单独调用这些 kernel 的场景（打分器训练的教师热力图、tile 搜索）有意义。
-- 若将来要在 sm_75 上跑融合补偿：`kernels/compensation_triton.py` 的
-  `probability.to(tl.bfloat16)` 要跟随输入 dtype（与热力图同一类改动）。该文件此刻还没
-  入库（由另一个 agent 在做），所以 `arch.py` 里它的那一条是**先声明、后到达**：等那个
-  提交落库，`tests/unit/test_kernels_arch.py` 的矩阵就已经在钉它了。
+- 若将来要在 sm_75 上跑融合补偿，**先要有一个能在 sm_75 上跑精确块的 kernel**（FA4
+  不行，见上），之后才轮到把 bf16 跟随输入 dtype。那一步有两处：
+  `kernels/compensation_triton.py` 的 `probability.to(tl.bfloat16)`（`_compensate_kernel`
+  里那个 `tl.dot`）与 `summaries()` 里 `kc` / `vc` 的 `dtype=torch.bfloat16`
+  （两个 kernel 的 `tl.store` 本来就跟随缓冲区的 `element_ty`，所以改分配处即可）。
+  同时 `arch.REQUIREMENTS` 里那一条要补上 fp16 的下限。
 - `elementwise_triton` 的 fp16 版本：改动是机械的（把 `_bf16` 的位运算舍入参数化），
   但它的价值全在"与 eager 逐位相等"，而那只能在 GPU 上验证，所以没做；sm_80 以下
   现在走 eager 链（`usable()` 返回 False）。
