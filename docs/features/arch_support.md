@@ -143,7 +143,11 @@ kernel，我们也不打算做一个。** 理由不是 FA4 缺 cp.async——那
   一笔很短的算术：稠密注意力走 cuBLAS / SDPA 吃 tensor core，而 Triton 的 fma 路径
   是 fp32 CUDA core，两者在这几代上差约 8 倍（V100 125 : 15.7 TFLOPS，T4 65 : 8.1），
   所以稀疏 kernel 相对稠密的耗时比约是 `密度 × 8`：**ρ=0.10 时只比稠密好 1.25 倍，
-  交叉点在 ρ≈0.12，再稠一点就不如直接跑稠密**。（规格书算术，没有这些卡可测。）
+  交叉点在 ρ≈0.12，再稠一点就不如直接跑稠密**。（算式里的两个吞吐是规格书，没有这些卡
+  可测；但**取 fp32 那一列这件事是实测的**：`probe_triton_floor.py --ops` 数了下降后的
+  PTX，sm_70 / sm_75 上一个 128x64x128 的 fp16 / bf16 dot 是 8192 条 `fma.rn.f32`、
+  一条 `fma.rn.f16x2` 都没有——Triton 为 fp32 累加器把操作数加宽了，所以**打包 fp16 的
+  那一列（T4 16.2 而不是 8.1）不适用**，比值不会减半。）
 - **融合的 Sol+Veda（INT8）自己就会报对的错**：`kernels/sol_veda.py` 的 `available()`
   用 `get_device_capability()[0] >= 8` 设限，`unavailable_reason()` 返回
   「needs SM80 or newer」，所以它在 Volta / Turing 上本来就是自描述的，不依赖
