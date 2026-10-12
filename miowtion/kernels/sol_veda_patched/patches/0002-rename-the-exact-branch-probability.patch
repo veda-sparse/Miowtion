@@ -1,0 +1,20 @@
+--- a/attention.py
++++ b/attention.py
+@@ -89,13 +89,13 @@
+                 next_max = tl.maximum(maximum, tl.max(score, 1))
+                 alpha = tl.exp2(tl.where(maximum == next_max, 0.,
+                                          maximum - next_max))
+-                probability = tl.where(valid[None, :],
+-                                       tl.exp2(score - next_max[:, None]), 0.)
++                exact_p = tl.where(valid[None, :],
++                                   tl.exp2(score - next_max[:, None]), 0.)
+                 value = tl.load(V + koff, mask=valid[:, None], other=0)
+                 acc = acc * alpha[:, None] + tl.dot(
+-                    probability.to(tl.float16), value.to(tl.float16),
++                    exact_p.to(tl.float16), value.to(tl.float16),
+                     out_dtype=tl.float16)
+-                denom = denom * alpha + tl.sum(probability, 1)
++                denom = denom * alpha + tl.sum(exact_p, 1)
+                 maximum = next_max
+     answer = acc / tl.where(denom > 0., denom, 1.)[:, None]
+     answer = tl.where(r[:, None] < qcount, answer, 0.)

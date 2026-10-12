@@ -2051,6 +2051,17 @@ H2 问过「同一个头里每行要不要各自的预算」，答案是不要�
   heat_kept 比较打分器初始化。初始化时各层参数同分布，所以一个 `LayerPredictor`
   就能代表全部 50 层，整轮只要一次教师 rollout
 - `configs/ablate_sol_veda2_t37.yaml`、`configs/ablate_sol_initprobe_t37.yaml`
+- `miowtion/kernels/sol_veda_patched/attention.py`（vendored，见 §2.33）
+  - `prepare(k, v, counts, tile)`：一趟算出 tile summary 与 INT8 K
+  - `launch(q, k, v, counts, selected, sage, tile)`：host 侧，tile 可变
+  - `LAUNCH` / `COLUMNS` / `ROWS` / `KEY_WIDTH` / `INT8` / `USE_REFERENCE`
+  - `_forward_reference`：上游发布的 kernel，改写版的对拍基准
+- `miowtion/kernels/compensation_triton.py`：exact 块交给 FA4 的那条路
+  - `summaries(k, v, counts)` / `compensate(o_kept, lse_kept, ...)`
+  - `attention(q, k, v, block_mask, layout)`：FA4 + 补偿，端到端
+- `scripts/regen_sol_veda_patch.py`：从 upstream + `patches/` 再生 vendored 文件
+- `scripts/bench_block_size.py --reference-tune --config wNsNCNMNWN`：
+  §2.33 的全部耗时；`scripts/prof_fused.py`：按阶段拆开一次调用
 
 ## 5. 为什么零阶补偿不进 Veda2
 
@@ -2183,6 +2194,12 @@ VSA 的 `O_c` 是一次真正的（池化上的）注意力，SLA 的是 O(N) �
 
 ## 6. 测试
 
+`tests/unit/test_sol_veda_patch.py`（CPU）：vendored 的 Sol+Veda kernel 等于
+upstream 加 `patches/` 逐字节；patch 序号连续；`compensate` 对 lse 形状不符和
+query tile 子集报错。
+
+`tests/gpu/test_sol_veda_gpu.py`：见 §2.33 的「正确性」。
+
 `tests/unit/test_veda_predictor_mask.py`：
 - 二阶池化对拍逐 tile 的 masked 统计量（rtol 1e-5）；拒绝未知的 `second`
 - **紧致 tile**（各行几乎相同）下方差仍非负且与直算一致——一遍恒等式在这里会丢掉几乎所有
@@ -2258,6 +2275,7 @@ VSA 的 `O_c` 是一次真正的（池化上的）注意力，SLA 的是 O(N) �
 | 2026-10-08 | 1×RTX PRO 6000 Blackwell（sm_120，未装 flash-attn-4） | 本次提交 | 16:9@37 真实权重 134400 行 / 约 40 min；§2 / §3.4 / §5 的全部数字 |
 | 2026-10-09 | 同上 | 本次提交 | 初始化探针（`--init-probe`，含发布的 step600 打分器与它自带的方案表）：§2.1 的三方对比，以及 1:1@37 ρ=0.05 上 5 条 clip 的 12000 行 |
 | 2026-10-09 | 同上，FA4 块稀疏已装（sm_120 vendored 补丁，`tests/gpu` 20 passed / 9 skipped） | 本次提交 | §2.2 的端到端：5 条 clip × 3 路真实生成、实测每步耗时、15 个单独视频加 5 个三路拼接视频 |
+| 2026-10-12 | 1×RTX PRO 6000 Blackwell（sm_120） | 本次提交 | §2.33 的全部耗时与误差；`tests/gpu/test_sol_veda_gpu.py` 6 passed（约 20 s），`tests/gpu` 全量见下文提交说明 |
 
 ## 2.27 块大小 64 对 128：调优之后 64 更贵，不调优结论是反的
 
@@ -2636,3 +2654,124 @@ layer 49 是 50 层里保留质量第 3 差的，但 layer 0 和 1 比中位数�
 ε 是数值量，按 AGENTS.md 1.5 与参考实现对拍（见 [sol_ablation](sol_ablation.md) §测试）。
 本 feature 不生成视频，不涉及 1.5.1 的人工可视化确认；**端到端画质要等待办 1 和 2 落地、
 真的训出一个 Veda2 打分器之后再做**。
+
+## 2.33 融合 kernel 提速 1.14~1.27×，而 2.26 里记在补偿头上的开销大半不是补偿
+
+2.26 给融合补偿留了一个区间（给 block-sparse kernel 加 1.44~1.85×），并且说
+「剩余差距衡量的是实现质量，不是方法」。这一节把那句话量化了：**在同一张卡上，
+补偿本身只值 +14%，剩下的全是 Triton。**
+
+全部数字：RTX PRO 6000 Blackwell（sm_120），seq 37376、56 头、head_dim 128、
+随机块掩码、空闲卡、`scripts/bench_block_size.py --reference-tune`，
+每个点 8 次调用取均值。两侧都调过自己的 launch 常数，否则就是在让补偿背 launch
+配置的账（2.27 的坑）。
+
+### 决定性的一次测量：把补偿摘掉，Triton 还是慢 1.74×
+
+上游自己带了一个**无补偿**的姊妹 kernel（`veda_comfy/kernels/sage/sparse_int8.py`，
+同样的 INT8 量化、同样的块稀疏走法、作者自己用 `tools/tune_int8.py` 调过）。
+在 ρ=0.0993 上：
+
+| kernel | 做的事 | 耗时 |
+|---|---|---|
+| FA4 CuTe 块稀疏（BF16） | 只有 exact 块 | **10.5 ms** |
+| 上游姊妹 INT8 Triton | 只有 exact 块 | **18.4 ms** |
+| 融合 Sol+Veda（出厂默认 w4 s1） | exact + 补偿 | 29.6 ms |
+
+**同样的工作量，Triton 比 CuTe 慢 1.74×，而这一项里没有一个补偿的 FLOP。**
+把融合 kernel 的掩码换成全 False（exact 走法无事可做）直接量到补偿那一半：
+**4.64 ms**，其中 host 侧 1.87、kernel 2.77。所以 2.26 表里那个 1.60× 的比值，
+分子分母都是 Triton，**它量的是「Triton 加补偿」对「Triton 不加补偿」**，
+而不是补偿在一个好 kernel 上的代价。
+
+### 于是分两条路走
+
+**路线 A：把融合 Triton kernel 本身改快。** 做了四件事（patch 0004）：
+
+1. **host 侧三趟合成一趟**（`prepare`）。原来的 `_summaries` 用
+   `masked_fill(...).sum(1)`，它会给 K 和 V 各物化一份副本——一次流式归约被写成
+   六趟，**3.9 ms**。改成一个 Triton kernel 后 **0.73 ms**；顺手把 K 的 INT8
+   量化也折进同一趟（行已经在寄存器里），再省 **0.56 ms**。INT8 输出与
+   `sage.quantize` **逐位相同**（含半 padding 的 tile），两个归约因为 fp32 求和
+   顺序不同，11776 个值里有 1 个差 1 个 bf16 ulp（`tests/gpu` 钉住）。
+2. **保留 tile 的列表预先压缩**（`_index_kernel`）。原来在 key 循环里用 min-scan
+   现找下一个保留 tile，于是循环的地址依赖同一次迭代里算出来的东西，
+   Triton 没有东西可以流水。压缩成升序索引表只要 **0.02 ms**。
+3. **exact 走法与 summary 走法交错**保持不变。两条干净的循环看起来更好，实测在
+   128 上贵 2%、在 64 上贵 17%：两半没有共享算子，交错让调度器能把 summary 的
+   bf16 gemm 盖在 exact 的 INT8 gemm 上。**这一条是上游写对了而我差点改坏的。**
+4. **launch 常数外露并实测**：`LAUNCH` / `COLUMNS` / `ROWS`（一个 program 负责的
+   query 行数）/ `KEY_WIDTH`（一个 exact 步吃掉的 key 数）。128 的最优是
+   w8 s2 C32 M128 W64，64 的最优是 w4 s1——**块大小换了最优配置也换**。
+
+**路线 B：exact 块交给 FA4，只把补偿写成 Triton**（`miowtion/kernels/
+compensation_triton.py`）。`veda/attention.py` 的 `zero_order_compensation` 已经
+给出了可以这么拆的恒等式（取 `ref = lse_kept`，kept 的分母恰好是 1），它缺的只是
+不要把 `[H, rows, N]` 的打分矩阵写进显存。一个 kernel，分数全程待在寄存器里。
+
+### 结果
+
+块 128（`fused` 列是本次的融合 kernel，`published` 列是上游 kernel 在**它自己的
+最优配置**上，两列的 host 侧各自对应）：
+
+| ρ | sdpa 稠密 | FA4 | **FA4 + Triton 补偿** | published（最优） | **fused（本次）** |
+|---|---|---|---|---|---|
+| 0.05 | 112.8 | 5.91 | **7.72**（1.31× FA4） | 13.43 | **10.58**（1.27× 快） |
+| 0.10 | 113.2 | 11.17 | **12.78**（**1.14×** FA4） | 19.18 | **16.81**（1.14× 快） |
+| 0.20 | 113.1 | 22.01 | **23.62**（1.07× FA4） | 31.09 | **29.66**（1.05× 快） |
+
+块 64（`MIOWTION_TILE_SIZE=64`，fused 用它自己的最优 w4 s1）：
+
+| ρ | FA4 | FA4 + Triton 补偿 | published（最优） | fused（本次） |
+|---|---|---|---|---|
+| 0.05 | 5.72 | 10.49 | 16.75 | **15.31**（1.09× 快） |
+| 0.10 | 11.27 | 16.16 | 24.29 | 24.28（持平） |
+| 0.20 | 23.32 | 27.98 | 39.49 | 42.18（**慢 7%**） |
+
+对出厂默认（w4 s1 C32 + torch host，也就是接这份节点时实际会跑到的配置）是
+**29.6 → 16.8 ms，1.76×**。
+
+**三个要记住的数**：
+
+* **补偿在一个好 kernel 上只值 +14%**（ρ=0.10，12.78 / 11.17），不是 2.26 的
+  1.60×。按 2.18 的分解折算到整步是 **+1~2%**，这下和用户在服务端量到的
+  **+1.96%** 落在同一个量级——**2.26 剩下的那 1.6~5 倍差距确实是实现质量，
+  而且现在有一半被收回来了。**
+* **路线 B 更准**：exact 块是 FA4 的 BF16，不是 INT8，所以它同时解掉了
+  `sol_veda.py` 开头那个「质量差异里混着精度」的保留。
+* **路线 A 到不了 1.15× FA4**，因为无补偿的 Triton exact 走法本身就是 1.74×。
+  这不是调优没做够：上游作者调过的姊妹 kernel 是同一个数。要在 Triton 里赢这个
+  循环需要 warp specialization 一级的东西，那是重写 FA4，不是改这个 kernel。
+
+### 试过而没有用的
+
+* **exact 块改回 BF16**（`INT8 = False`，省掉两次量化）：22.8 → 28.6 ms，**慢 25%**。
+  INT8 在这里是赚的，和 2.26 修正后的结论一致。
+* **把两条走法彻底分开成两个循环**：见上面第 3 条，128 上 −2%、64 上 −17%。
+* **更宽的 exact 步**（W=128）：s3 下 shared memory 要 140 KB（硬件 101 KB）直接
+  起不来；s1/s2 能跑但 19.1 ms，比 W=64 的 16.8 差。
+* **M=32 / M=128 / w8 / C=16 / C=64 的各种组合**：全扫过，128 上最好的就是
+  w8 s2 C32 M128 W64。
+* **补偿 kernel 用更宽的步**：C=128 要 5.5 ms，C=16 只要 2.25 ms——`[128, C]`
+  的分数块在和 `[128, 128]` 的累加器抢寄存器。
+
+### 正确性
+
+* `prepare` 的 INT8 输出对 `sage.quantize` **逐位相同**；两个归约 ≤1 bf16 ulp。
+* 全部 tile 都保留时（补偿为空），新旧 kernel 的输出**逐位相同**
+  （`torch.equal`）——交错之后两者访问 key tile 的顺序完全一致。
+* 真实掩码下两者差 **max abs 2.4e-4 / rel 4.2e-3**，而这份 kernel 自己对稠密的
+  误差是 1.2e-3（INT8），也就是说改写带来的偏移比它本身的量化噪声**小一个量级**。
+  来源是 online softmax 看到块的顺序，没有别的。
+* 密度 1.0 上对稠密：fused 1.2e-3（INT8），FA4 2e-4。
+* Triton 补偿对 `zero_order_compensation`（fp32 torch）：max abs 4.9e-4，
+  而补偿项本身是 0.279——**误差是修正量的 0.17%**。唯一的刻意差异是 bf16 的 summary。
+* `tests/gpu/test_sol_veda_gpu.py` 6 passed 把以上全部钉住。
+
+### 顺手发现的一个 reference bug（没改，文件被占用）
+
+`zero_order_compensation` 把 `valid_count` clamp 到 1 之后用 `drop = ~keep`，
+于是**全 padding 的 tile 也会往分母里加 `exp(-lse)`**：它没有质心也没有质量，
+`k_mean = 0`、`v_sum = 0`，但 `p̂ = exp(0 − ref)` 不是 0。新 kernel 显式排掉了
+`lengths == 0`。`miowtion/veda/attention.py` 在 workboard 上是别人认领的，所以
+**没动它**，差异写在 `compensate` 的注释里。谁接那个文件时顺手修一行即可。

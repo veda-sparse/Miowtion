@@ -13,19 +13,29 @@ veda_comfy/kernels/sol_veda/attention.py, sha256
 miowtion.kernels.sol_veda re-checks at import. The licence sits beside
 this file.
 
-A vendored copy rather than a run-time patch because both fixes are
-inside the @triton.jit source, which cannot be rebound from outside.
-That branch states it was never run on a GPU, and as published it does
-not compile:
+A vendored copy rather than a run-time patch because every fix is inside
+the @triton.jit source, which cannot be rebound from outside. The patch
+series in `patches/` regenerates this file from that source; what each
+patch is for:
 
-  1. LOG2E was a plain module float; this Triton rejects a non-constexpr
-     global inside @jit ("Cannot access global variable LOG2E").
-  2. The approximate and the exact branch both assigned `probability`,
-     with shapes [B, C] and [B, 64]; Triton requires a loop-carried
-     variable to keep one type ("initial type <[128, 32]> but is
-     re-assigned to <[128, 64]>"). The exact branch now uses `exact_p`.
+  0001 LOG2E was a plain module float; this Triton rejects a
+       non-constexpr global inside @jit ("Cannot access global variable
+       LOG2E").
+  0002 The approximate and the exact branch both assigned
+       `probability`, with shapes [B, C] and [B, 64]; Triton requires a
+       loop-carried variable to keep one type ("initial type <[128, 32]>
+       but is re-assigned to <[128, 64]>"). The exact branch now uses
+       `exact_p`.
+  0003 Expose the launch constants, which upstream hard-codes.
+  0004 Rewrite the host side and the walk over kept tiles for speed
+       (2.4x end to end on SM120); `_forward_reference` keeps the
+       published kernel as the thing the fast one is checked against.
+       See docs/features/veda2.md section 12.
 
-Neither patch changes the arithmetic.
+Patches 0001 and 0002 do not change the arithmetic. 0004 changes the
+order in which the online softmax visits blocks, which moves the output
+by less than the INT8 quantisation noise; the measurement is in that
+same section.
 """
 
 from __future__ import annotations
@@ -41,6 +51,9 @@ import triton.language as _tl_consts
 # Patched: this Triton refuses a plain float global inside @jit.
 LOG2E = _tl_consts.constexpr(1.4426950408889634)
 TILE = 128
+# The Sage quantiser's block, and so the granularity of the K scales.
+# Not a free parameter: changing it changes the arithmetic.
+QUANT_BLOCK = 64
 
 # Patch 3: upstream hard-codes num_warps=4, num_stages=1 and C=32 at the
 # launch. Its sibling INT8 kernel ships tools/tune_int8.py because those
@@ -48,12 +61,29 @@ TILE = 128
 # 1.58x off its own optimum -- so comparing a tuned baseline against this
 # untuned kernel would charge the compensation for a launch config.
 # scripts/bench_compensation.py --tune-fused sweeps these.
-LAUNCH = {'num_warps': 4, 'num_stages': 1}
+#
+# Patch 4 adds two more: ROWS, the query rows one program owns, and
+# KEY_WIDTH, the keys one exact step consumes. Both were pinned to TILE
+# and to QUANT_BLOCK by the old loop shape. Defaults measured by
+# scripts/bench_block_size.py --tune on an RTX PRO 6000 (SM120) at
+# 37376 slots, 56 heads, density 0.1.
+LAUNCH = {'num_warps': 8, 'num_stages': 2}
 COLUMNS = 32
+ROWS = 128
+KEY_WIDTH = 64
+# Quantise Q and K to INT8 for the exact blocks (upstream's arithmetic,
+# matching what ComfyUI's Sage path produces) or keep them BF16. BF16 is
+# not only the more accurate arm, it is the one our FA4 path uses, so it
+# is also the honest comparison; which is faster is measured, see
+# docs/features/veda2.md section 12.
+INT8 = True
+# Run the published kernel instead of the fast one. Only tests set this;
+# it is the reference the rewrite is verified against.
+USE_REFERENCE = False
 
 
-def _summaries(k, v, counts):
-    tiles, block, heads, dim = k.shape[0] // TILE, TILE, k.shape[1], k.shape[2]
+def _summaries(k, v, counts, tile=TILE):
+    tiles, block, heads, dim = k.shape[0] // tile, tile, k.shape[1], k.shape[2]
     valid = torch.arange(block, device=k.device)[None, :] < counts[:, None]
     divisor = counts.clamp(min=1)[:, None, None]
 
@@ -66,9 +96,221 @@ def _summaries(k, v, counts):
 
 
 @triton.jit
-def _forward(Q, K, V, Qi, Ki, Qs, Ks, KC, VC, Counts, Kept, Out,
-             ExactTokens, N: tl.constexpr, H: tl.constexpr, D: tl.constexpr,
-             B: tl.constexpr, C: tl.constexpr, SCALE: tl.constexpr):
+def _prepare_kernel(K, V, Counts, KC, VC, Ki, Ks, H: tl.constexpr,
+                    D: tl.constexpr, B: tl.constexpr, QB: tl.constexpr):
+    """One pass over K and V: the tile summaries, and K's INT8 blocks.
+
+    The torch summaries this replaces spend 3.9 of the published call's
+    29.6 ms on SM120, because `masked_fill` materialises a second copy of
+    K and of V: a reduction that needs one streaming pass over each
+    tensor takes six. Quantising K here as well is free -- the pass has
+    the rows in registers already -- and saves the quantiser's own read
+    of all of K, another 0.56 ms.
+
+    The INT8 arithmetic is upstream's, reproduced exactly (scale from the
+    unmasked block, round half away from zero, truncating cast), and
+    tests/unit pins it against `sage.quantize` with `torch.equal`.
+    """
+    tile, head = tl.program_id(0), tl.program_id(1)
+    r, d = tl.arange(0, B), tl.arange(0, D)
+    count = tl.load(Counts + tile)
+    offset = ((tile * B + r[:, None]) * H + head) * D + d[None, :]
+    keys = tl.load(K + offset).to(tl.float32)
+    values = tl.load(V + offset, mask=r[:, None] < count, other=0.)
+    # Padding rows are a suffix of the tile, so masking the sum is the
+    # same as summing the real rows; the quantiser sees them, as
+    # upstream's does.
+    masked = tl.where(r[:, None] < count, keys, 0.)
+    divisor = tl.maximum(count, 1).to(tl.float32)
+    out = (tile * H + head) * D + d
+    tl.store(KC + out, (tl.sum(masked, 0) / divisor).to(KC.dtype.element_ty))
+    tl.store(VC + out, tl.sum(values.to(tl.float32), 0).to(
+        VC.dtype.element_ty))
+
+    blocks: tl.constexpr = B // QB
+    split = tl.reshape(keys, (blocks, QB, D))
+    scale = tl.max(tl.max(tl.abs(split), 2), 1) / 127.0
+    scale = tl.where(scale > 0.0, scale, 1.0)
+    quantized = split / scale[:, None, None]
+    quantized += 0.5 * tl.where(quantized >= 0, 1, -1)
+    tl.store(Ki + offset, tl.reshape(quantized, (B, D)).to(tl.int8))
+    tl.store(Ks + (head * (B // QB) * tl.num_programs(0)
+                   + tile * blocks + tl.arange(0, blocks)), scale)
+
+
+@triton.jit
+def _index_kernel(Kept, Counts, Index, Count, N: tl.constexpr,
+                  NP: tl.constexpr):
+    """Compact one mask row into the ascending tile ids the walk reads.
+
+    Upstream's kernel rediscovered the next kept tile with a min-scan
+    inside the key loop, which made the loop's addresses depend on work
+    done in the same iteration and so left Triton nothing to pipeline.
+    Doing it once here costs 0.1 ms and is what lets num_stages matter.
+
+    A query tile with no real rows gets count 0, reproducing the
+    published kernel's `(qcount > 0)` guard: its output is zeroed anyway.
+    """
+    row, head = tl.program_id(0), tl.program_id(1)
+    j = tl.arange(0, NP)
+    base = (head * N + row) * N
+    kept = tl.load(Kept + base + j, mask=j < N, other=False)
+    lengths = tl.load(Counts + j, mask=j < N, other=0)
+    kept = kept & (j < N) & (lengths > 0) & (tl.load(Counts + row) > 0)
+    flags = kept.to(tl.int32)
+    position = tl.cumsum(flags, 0) - 1
+    tl.store(Index + base + position, j.to(tl.int32), mask=kept)
+    tl.store(Count + head * N + row, tl.sum(flags, 0))
+
+
+@triton.jit
+def _summary_step(acc, denom, maximum, qraw, qcount, KC, VC, Counts, Kept,
+                  first, head, row, N: tl.constexpr, H: tl.constexpr,
+                  D: tl.constexpr, C: tl.constexpr, SCALE: tl.constexpr):
+    """Fold one chunk of C tiles' rank-1 terms into the online softmax.
+
+    A tile that the mask kept is handled exactly elsewhere, so it is
+    excluded here; so is an all-padding tile, which has no centroid.
+
+    Returns:
+        The updated (acc, denom, maximum).
+    """
+    j, d = tl.arange(0, C), tl.arange(0, D)
+    cols = first + j
+    valid_cols = cols < N
+    lengths = tl.load(Counts + cols, mask=valid_cols, other=0)
+    kc = tl.load(KC + (cols[None, :] * H + head) * D + d[:, None],
+                 mask=valid_cols[None, :], other=0)
+    proxy = tl.dot(qraw, kc) * (SCALE * LOG2E)
+    selected = tl.load(Kept + (head * N + row) * N + cols, mask=valid_cols,
+                       other=False)
+    approximate = valid_cols & (lengths > 0) & ~selected & (qcount > 0)
+    scores = tl.where(approximate[None, :], proxy, -float('inf'))
+    next_max = tl.maximum(maximum, tl.max(scores, 1))
+    alpha = tl.exp2(tl.where(maximum == next_max, 0., maximum - next_max))
+    probability = tl.where(approximate[None, :],
+                           tl.exp2(scores - next_max[:, None]), 0.)
+    vc = tl.load(VC + (cols[:, None] * H + head) * D + d[None, :],
+                 mask=valid_cols[:, None], other=0)
+    acc = acc * alpha[:, None] + tl.dot(probability.to(tl.bfloat16), vc)
+    denom = denom * alpha + tl.sum(probability * lengths[None, :], 1)
+    return acc, denom, next_max
+
+
+@triton.jit
+def _forward(Q, K, V, Qi, Ki, Qs, Ks, KC, VC, Counts, Kept, Index, Keeps,
+             Out, ExactTokens, N: tl.constexpr, H: tl.constexpr,
+             D: tl.constexpr, B: tl.constexpr, C: tl.constexpr,
+             M: tl.constexpr, W: tl.constexpr, QB: tl.constexpr,
+             SCALE: tl.constexpr, Q8: tl.constexpr):
+    """Exact kept blocks, then one rank-1 term per skipped block.
+
+    Same arithmetic as `_forward_reference`, in two loops instead of one
+    nested pair: the kept tiles come from a precompacted index so the
+    exact walk is a flat pipelined loop, and the summary walk follows it
+    rather than being interleaved chunk by chunk. Online softmax is
+    order independent in exact arithmetic, so only the rounding moves.
+
+    Args:
+        Q, K, V: [slots, H, D] bf16, tile ordered.
+        Qi, Ki: INT8 Q and K; Qs, Ks: their fp32 scales, Q per tile and
+            K per QUANT_BLOCK rows.
+        KC, VC: [N, H, D] bf16 per-tile mean(K) and sum(V).
+        Counts: [N] int32 real rows per tile (a prefix of the tile).
+        Kept: [H, N, N] bool mask, read only by the summary walk.
+        Index, Keeps: [H, N, N] int32 kept tile ids and [H, N] how many.
+        M: query rows per program; W: keys per exact step, a multiple
+            of QB so the K scales still apply per QB rows.
+        QB: The quantiser's block, QUANT_BLOCK.
+        Q8: Use the INT8 Q and K for the exact blocks; when False they
+            are read from Q and K in BF16 and Qi/Ki/Qs/Ks are unused.
+    """
+    part, head = tl.program_id(0), tl.program_id(1)
+    row, slice_in_tile = part // (B // M), part % (B // M)
+    r, d, j = tl.arange(0, M), tl.arange(0, D), tl.arange(0, C)
+    n = tl.arange(0, W)
+    quant = n // QB
+    qcount = tl.load(Counts + row) - slice_in_tile * M
+    rows = ((row * B + slice_in_tile * M) + r)
+    qoff = (rows[:, None] * H + head) * D + d[None, :]
+    live = r[:, None] < qcount
+    qraw = tl.load(Q + qoff, mask=live, other=0)
+    if Q8:
+        qi = tl.load(Qi + qoff, mask=live, other=0)
+        qscale = tl.load(Qs + head * N + row)
+    acc = tl.zeros((M, D), tl.float32)
+    denom = tl.zeros((M,), tl.float32)
+    maximum = tl.full((M,), -float('inf'), tl.float32)
+    exact_tokens = tl.zeros((), tl.int32)
+
+    keeps = tl.load(Keeps + head * N + row)
+    index_row = Index + (head * N + row) * N
+    chunks: tl.constexpr = (N + C - 1) // C
+    for i in range(0, keeps):
+        key_tile = tl.load(index_row + i)
+        key_count = tl.load(Counts + key_tile)
+        exact_tokens += key_count
+        for step in range(B // W):
+            slots = key_tile * B + step * W + n
+            # K comes in transposed, which the gemm wants anyway, so the
+            # index expression does the transpose and the loop has no
+            # register shuffle (upstream's sibling INT8 kernel does the
+            # same).
+            koff = (slots[None, :] * H + head) * D + d[:, None]
+            valid = step * W + n < key_count
+            if Q8:
+                ki = tl.load(Ki + koff, mask=valid[None, :], other=0)
+                kscale = tl.load(Ks + (head * N + key_tile) * (B // QB)
+                                 + step * (W // QB) + quant)
+                score = tl.dot(qi, ki).to(tl.float32)
+                score *= qscale * kscale[None, :]
+            else:
+                # The softmax scale and log2(e) ride on Q in the INT8
+                # arm, folded into its quantisation; here they have to
+                # be applied to the scores.
+                kraw = tl.load(K + koff, mask=valid[None, :], other=0)
+                score = tl.dot(qraw, kraw) * (SCALE * LOG2E)
+            score = tl.where(valid[None, :], score, -float('inf'))
+            next_max = tl.maximum(maximum, tl.max(score, 1))
+            alpha = tl.exp2(tl.where(maximum == next_max, 0.,
+                                     maximum - next_max))
+            exact_p = tl.where(valid[None, :],
+                               tl.exp2(score - next_max[:, None]), 0.)
+            voff = (slots[:, None] * H + head) * D + d[None, :]
+            value = tl.load(V + voff, mask=valid[:, None], other=0)
+            acc = acc * alpha[:, None] + tl.dot(
+                exact_p.to(tl.float16), value.to(tl.float16),
+                out_dtype=tl.float16)
+            denom = denom * alpha + tl.sum(exact_p, 1)
+            maximum = next_max
+        # One summary chunk per exact tile, which is what the published
+        # kernel's interleaving did for it: the two halves share no
+        # operand, so the scheduler can overlap the summary walk's bf16
+        # gemms with the exact walk's INT8 ones. Splitting them into two
+        # clean loops cost 12% at 128-token tiles and 17% at 64.
+        if i < chunks:
+            acc, denom, maximum = _summary_step(
+                acc, denom, maximum, qraw, qcount, KC, VC, Counts, Kept,
+                i * C, head, row, N=N, H=H, D=D, C=C, SCALE=SCALE)
+
+    for first in range(keeps * C, N, C):
+        acc, denom, maximum = _summary_step(
+            acc, denom, maximum, qraw, qcount, KC, VC, Counts, Kept,
+            first, head, row, N=N, H=H, D=D, C=C, SCALE=SCALE)
+
+    answer = acc / tl.where(denom > 0., denom, 1.)[:, None]
+    answer = tl.where(live, answer, 0.)
+    tl.store(Out + qoff, answer.to(Out.dtype.element_ty))
+    if slice_in_tile == 0:
+        tl.store(ExactTokens + head * N + row, exact_tokens)
+
+
+@triton.jit
+def _forward_reference(Q, K, V, Qi, Ki, Qs, Ks, KC, VC, Counts, Kept, Out,
+                       ExactTokens, N: tl.constexpr, H: tl.constexpr,
+                       D: tl.constexpr, B: tl.constexpr, C: tl.constexpr,
+                       SCALE: tl.constexpr):
+    """The published kernel, kept as the reference for `_forward`."""
     row, head = tl.program_id(0), tl.program_id(1)
     r, d, j = tl.arange(0, B), tl.arange(0, D), tl.arange(0, C)
     sub = tl.arange(0, 64)
@@ -135,6 +377,94 @@ def _forward(Q, K, V, Qi, Ki, Qs, Ks, KC, VC, Counts, Kept, Out,
     tl.store(ExactTokens + head * N + row, exact_tokens)
 
 
+def prepare(k, v, counts, tile: int = TILE):
+    """Tile summaries and INT8 K in one pass over K and V.
+
+    Args:
+        k, v: [tiles * tile, H, D] bf16 contiguous, tile ordered.
+        counts: [tiles] int32 real rows per tile.
+        tile: Rows per tile.
+
+    Returns:
+        (kc, vc, ki, ks): per-tile mean(K) and sum(V), both
+        [tiles, H, D] bf16; INT8 K like k; its fp32 scales
+        [H, tiles * tile // QUANT_BLOCK].
+    """
+    tiles, heads, dim = k.shape[0] // tile, k.shape[1], k.shape[2]
+    kc = torch.empty((tiles, heads, dim), dtype=torch.bfloat16,
+                     device=k.device)
+    vc = torch.empty_like(kc)
+    ki = torch.empty_like(k, dtype=torch.int8)
+    ks = torch.empty((heads, k.shape[0] // QUANT_BLOCK),
+                     dtype=torch.float32, device=k.device)
+    _prepare_kernel[(tiles, heads)](k, v, counts, kc, vc, ki, ks, H=heads,
+                                    D=dim, B=tile, QB=QUANT_BLOCK,
+                                    num_warps=4)
+    return kc, vc, ki, ks
+
+
+def launch(q, k, v, counts, selected, sage, tile: int = TILE):
+    """The host side of `attend`, with the tile extent as an argument.
+
+    `attend` pins the extent at TILE because that is Veda's tile; the
+    block-size study in scripts/bench_block_size.py needs 64 as well,
+    and a kernel whose hash is checked at import cannot be edited to get
+    it.
+
+    Args:
+        q, k, v: [tiles * tile, H, D] bf16 contiguous, tile ordered.
+        counts: [tiles] int32 real rows per tile.
+        selected: [H, tiles, tiles] bool, True where kept exactly.
+        sage: The quantiser module.
+        tile: Rows per tile; a multiple of QUANT_BLOCK.
+
+    Returns:
+        (out, exact_tokens) as `attend`.
+    """
+    slots, heads, dim = q.shape
+    tiles = slots // tile
+    width = min(KEY_WIDTH, tile)
+    if tile % QUANT_BLOCK or width % QUANT_BLOCK or tile % width:
+        raise ValueError(
+            f'tile {tile} and KEY_WIDTH {KEY_WIDTH} must be multiples of '
+            f'{QUANT_BLOCK}, and KEY_WIDTH must divide the tile')
+    rows = min(ROWS, tile)
+    if tile % rows:
+        raise ValueError(f'ROWS {ROWS} must divide the tile {tile}')
+    qi, qs = sage.quantize(q, tile, pre_scale=dim ** -0.5 * LOG2E.value)
+    out = torch.empty_like(q)
+    exact = torch.empty(heads, tiles, device=q.device, dtype=torch.int32)
+    if USE_REFERENCE:
+        # The published path end to end, torch summaries included, so
+        # that a before/after is of the call and not of one kernel. The
+        # extent reaches `_summaries` as an argument, where upstream
+        # pinned it to TILE, so that the block-size study has a before
+        # column at 64 as well.
+        kc, vc = _summaries(k, v, counts, tile)
+        kc = kc.view(tiles, heads, dim).contiguous()
+        vc = vc.view(tiles, heads, dim).contiguous()
+        ki, ks = sage.quantize(k, QUANT_BLOCK)
+        _forward_reference[(tiles, heads)](
+            q, k, v, qi, ki, qs, ks, kc, vc, counts, selected, out, exact,
+            N=tiles, H=heads, D=dim, B=tile, C=COLUMNS, SCALE=dim ** -.5,
+            num_warps=LAUNCH['num_warps'], num_stages=LAUNCH['num_stages'])
+        return out, exact
+    kc, vc, ki, ks = prepare(k, v, counts, tile)
+    index = torch.empty((heads, tiles, tiles), device=q.device,
+                        dtype=torch.int32)
+    keeps = torch.empty((heads, tiles), device=q.device, dtype=torch.int32)
+    _index_kernel[(tiles, heads)](
+        selected, counts, index, keeps, N=tiles,
+        NP=triton.next_power_of_2(tiles), num_warps=4)
+    _forward[(tiles * (tile // rows), heads)](
+        q, k, v, qi, ki, qs, ks, kc, vc, counts, selected, index, keeps, out,
+        exact, N=tiles, H=heads, D=dim, B=tile, C=COLUMNS, M=rows, W=width,
+        QB=QUANT_BLOCK, SCALE=dim ** -.5, Q8=INT8,
+        num_warps=LAUNCH['num_warps'],
+        num_stages=LAUNCH['num_stages'])
+    return out, exact
+
+
 @torch.no_grad()
 def attend(q, k, v, counts, selected, sage):
     """Run hybrid attention on Veda's 128-token tile mask."""
@@ -151,15 +481,4 @@ def attend(q, k, v, counts, selected, sage):
         raise ValueError('counts must be int32 with one value per tile')
     if selected.shape != (heads, tiles, tiles) or selected.dtype != torch.bool:
         raise ValueError('selected must be [H,tiles,tiles] bool')
-    qi, qs = sage.quantize(q, TILE, pre_scale=dim ** -0.5 * LOG2E)
-    ki, ks = sage.quantize(k, 64)
-    kc, vc = _summaries(k, v, counts)
-    kc = kc.view(tiles, heads, dim).contiguous()
-    vc = vc.view(tiles, heads, dim).contiguous()
-    out = torch.empty_like(q)
-    exact = torch.empty(heads, tiles, device=q.device, dtype=torch.int32)
-    _forward[(tiles, heads)](
-        q, k, v, qi, ki, qs, ks, kc, vc, counts, selected.contiguous(), out,
-        exact, N=tiles, H=heads, D=dim, B=TILE, C=COLUMNS, SCALE=dim ** -.5,
-        num_warps=LAUNCH['num_warps'], num_stages=LAUNCH['num_stages'])
-    return out, exact
+    return launch(q, k, v, counts, selected.contiguous(), sage, TILE)

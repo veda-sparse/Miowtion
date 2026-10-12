@@ -1,0 +1,14 @@
+--- a/attention.py
++++ b/attention.py
+@@ -13,7 +13,10 @@
+ import triton
+ import triton.language as tl
+ 
+-LOG2E = 1.4426950408889634
++import triton.language as _tl_consts
++
++# Patched: this Triton refuses a plain float global inside @jit.
++LOG2E = _tl_consts.constexpr(1.4426950408889634)
+ TILE = 128
+ 
+ 

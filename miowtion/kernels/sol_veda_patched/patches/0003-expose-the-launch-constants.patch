@@ -1,0 +1,58 @@
+--- a/attention.py
++++ b/attention.py
+@@ -3,6 +3,29 @@
+ The implementation is adapted from the project's validated Miowtion Sol
+ kernel. Veda supplies the learned block mask; Sage quantisation is used for
+ selected blocks and pooled BF16 K/V summaries approximate skipped blocks.
++
++VENDORED AND PATCHED. Do not edit; regenerate with
++scripts/regen_sol_veda_patch.py.
++
++Source: third_party/Veda-on-ComfyUI @ 3f9be82 (branch dev/veda-sol, MIT),
++veda_comfy/kernels/sol_veda/attention.py, sha256
++47affe24a193e8b5ba614152fdf96d317d784624813040e099441c3ec3e026b4, which
++miowtion.kernels.sol_veda re-checks at import. The licence sits beside
++this file.
++
++A vendored copy rather than a run-time patch because both fixes are
++inside the @triton.jit source, which cannot be rebound from outside.
++That branch states it was never run on a GPU, and as published it does
++not compile:
++
++  1. LOG2E was a plain module float; this Triton rejects a non-constexpr
++     global inside @jit ("Cannot access global variable LOG2E").
++  2. The approximate and the exact branch both assigned `probability`,
++     with shapes [B, C] and [B, 64]; Triton requires a loop-carried
++     variable to keep one type ("initial type <[128, 32]> but is
++     re-assigned to <[128, 64]>"). The exact branch now uses `exact_p`.
++
++Neither patch changes the arithmetic.
+ """
+ 
+ from __future__ import annotations
+@@ -19,7 +42,16 @@
+ LOG2E = _tl_consts.constexpr(1.4426950408889634)
+ TILE = 128
+ 
++# Patch 3: upstream hard-codes num_warps=4, num_stages=1 and C=32 at the
++# launch. Its sibling INT8 kernel ships tools/tune_int8.py because those
++# constants are GPU-specific -- on SM120 the shipped INT8 default is
++# 1.58x off its own optimum -- so comparing a tuned baseline against this
++# untuned kernel would charge the compensation for a launch config.
++# scripts/bench_compensation.py --tune-fused sweeps these.
++LAUNCH = {'num_warps': 4, 'num_stages': 1}
++COLUMNS = 32
+ 
++
+ def _summaries(k, v, counts):
+     tiles, block, heads, dim = k.shape[0] // TILE, TILE, k.shape[1], k.shape[2]
+     valid = torch.arange(block, device=k.device)[None, :] < counts[:, None]
+@@ -128,6 +160,6 @@
+     exact = torch.empty(heads, tiles, device=q.device, dtype=torch.int32)
+     _forward[(tiles, heads)](
+         q, k, v, qi, ki, qs, ks, kc, vc, counts, selected.contiguous(), out,
+-        exact, N=tiles, H=heads, D=dim, B=TILE, C=32, SCALE=dim ** -.5,
+-        num_warps=4, num_stages=1)
++        exact, N=tiles, H=heads, D=dim, B=TILE, C=COLUMNS, SCALE=dim ** -.5,
++        num_warps=LAUNCH['num_warps'], num_stages=LAUNCH['num_stages'])
+     return out, exact
