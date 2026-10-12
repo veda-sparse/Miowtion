@@ -9,25 +9,40 @@ which of our kernels asked for what. This module makes the floor a
 declaration the entry points check up front, so the error names the
 architecture, the kernel and the specific operation that is missing.
 
-The floors come from the hardware, not from measurement here (see
-docs/features/arch_support.md for the per-kernel table and for what is
-unverified):
+Two different questions decide a floor, and conflating them is how the
+first version of this table got two entries wrong (docs/pitfalls.md):
 
-  * fp16 tensor cores (HMMA) exist from sm_70 (Volta) on.
-  * INT8 tensor cores (IMMA) exist from sm_75 (Turing) on; Volta has
-    none, so an INT8 `tl.dot` cannot be lowered there.
-  * bf16 exists from sm_80 (Ampere) on -- both the BMMA tensor-core path
-    and the `cvt` instructions that convert bf16 to fp32. sm_70 / sm_75
-    therefore cannot even *load and widen* a bf16 tensor in a kernel, let
-    alone multiply one, which is why a bf16-annotated kernel is not a
-    "slow but correct" path below sm_80: it does not lower at all.
-  * `cp.async` (and so FlashAttention's pipelined tile loads) is sm_80 on.
+  1. *Can the toolchain build it?* Measured, not recalled:
+     `scripts/probe_triton_floor.py` compiles each kernel shape ahead of
+     time for a target capability and reads the lowering back out of the
+     PTX. Triton 3.4 compiles fp16 / bf16 / fp32 `tl.dot` for sm_70 and
+     up, and refuses an INT8 `tl.dot` below sm_80 outright (it fails
+     inside TritonGPUAccelerateMatmul, even though Turing has IMMA in
+     hardware).
+  2. *Does it reach a tensor core?* Also from that probe's PTX: `mma`
+     first appears at sm_80. On sm_70 and sm_75 every `tl.dot` lowers to
+     CUDA-core `fma`, so a Triton kernel there is not "a bit slower", it
+     is off the tensor-core path entirely -- which for the heat kernel
+     makes it *slower than the torch reference it exists to replace*,
+     because cuBLAS still reaches the tensor cores.
+
+So a kernel's gate is the higher of the two, and `Requirement` records
+the compile floor separately when they differ, so nobody re-derives the
+distinction from the gate alone.
+
+The hardware facts the rest of the table rests on:
+
+  * fp16 tensor cores (HMMA) exist from sm_70 on, INT8 (IMMA) from
+    sm_75 on -- but see above: Triton 3.4 emits neither below sm_80.
+  * `cp.async` (and so FlashAttention's pipelined tile loads) is sm_80
+    on, which is dtype-independent and is what keeps every FA4 path off
+    sm_7x.
   * fp8 arithmetic is sm_89 on; TMA descriptors are sm_90 on.
-  * Triton's NVIDIA backend dropped the Volta `mma.m8n8k4` lowering that
-    `tl.dot` needs on sm_70; sm_75 keeps the mma16816 path. So sm_70 has
-    fp16 tensor cores that Triton can no longer target, and every Triton
-    kernel here that calls `tl.dot` has an sm_75 floor rather than an
-    sm_70 one.
+  * bf16 tensor cores and the `cvt.f32.bf16` instruction are sm_80 on.
+    Triton nevertheless compiles a bf16 load-widen-reduce kernel for
+    sm_70, so it must emit the conversion some other way; the bf16
+    floors below are therefore a deliberate refusal (nothing has ever
+    run that emulation on 7.x silicon) and not a compiler limit.
 
 `require()` raises rather than silently selecting another path
 (AGENTS.md 1.4). Callers that *have* a fallback ask `supported()` first
@@ -53,8 +68,13 @@ BF16 = (8, 0)
 CP_ASYNC = (8, 0)
 FP8 = (8, 9)
 TMA = (9, 0)
-# Triton's NVIDIA backend no longer lowers `tl.dot` for Volta.
-TRITON_DOT = (7, 5)
+# What Triton 3.4 does, from scripts/probe_triton_floor.py (AOT compile
+# for a target capability, lowering read out of the PTX):
+# a float `tl.dot` builds from sm_70 on, reaches an `mma` only from
+# sm_80 on, and an INT8 `tl.dot` does not build below sm_80 at all.
+TRITON_COMPILES = (7, 0)
+TRITON_MMA = (8, 0)
+TRITON_INT8_DOT = (8, 0)
 
 _ARCH_NAMES = {
     7: 'Volta/Turing',
@@ -109,12 +129,18 @@ class Requirement:
 
     Attributes:
         kernel: The name used in error messages, 'module.function' form.
-        floor: Capability floor that holds for every dtype.
-        floor_reason: The operation that sets `floor`, phrased so the
-            message says what is missing and not just that it is.
+        floor: The gate: the capability below which this kernel is not
+            used, for every dtype.
+        floor_reason: What sets `floor`, phrased so the message says what
+            is missing and not just that it is.
         dtype_floors: Per-dtype floor and reason, on top of `floor`. A
             dtype absent from this mapping is not implemented by the
             kernel at all.
+        compile_floor: Where the toolchain can still *build* this kernel,
+            when that is below the gate. Set it whenever the two differ,
+            so a later reader can see that the gate is our policy (the
+            kernel would lose to its own fallback) and not a compiler
+            error they could go and fix.
     """
 
     kernel: str
@@ -122,26 +148,33 @@ class Requirement:
     floor_reason: str
     dtype_floors: Mapping[torch.dtype, tuple[tuple[int, int], str]] = (
         dataclasses.field(default_factory=dict))
+    compile_floor: tuple[int, int] | None = None
 
 
-# bf16 and fp16 in a Triton kernel that multiplies them with tl.dot. The
-# fp16 floor is Triton's dot lowering (7, 5), not the hardware's (7, 0).
+# Every dtype of a Triton kernel that multiplies with tl.dot shares one
+# floor: the dot compiles from sm_70 on but only reaches an `mma` from
+# sm_80 on, and below that it is CUDA-core `fma`.
+_MMA_DOT = 'tensor-core tl.dot (sm_7x lowers it to CUDA-core fma)'
 _TRITON_DOT_DTYPES = {
-    torch.bfloat16: (BF16, 'bf16 tl.dot (no BMMA, and no cvt.f32.bf16)'),
-    torch.float16: (TRITON_DOT,
-                    "fp16 tl.dot (Triton dropped Volta's mma.m8n8k4)"),
-    # fp32 keeps working because `tl.dot` takes fp32 operands; it is
-    # listed so that routing on `supported()` does not change for a
-    # caller that was already passing fp32.
-    torch.float32: (TRITON_DOT, 'fp32 tl.dot'),
+    torch.bfloat16: (TRITON_MMA, _MMA_DOT),
+    torch.float16: (TRITON_MMA, _MMA_DOT),
+    # fp32 is listed so routing does not change for a caller that was
+    # already passing it.
+    torch.float32: (TRITON_MMA, _MMA_DOT),
 }
-# A Triton kernel that only moves and reduces elements. bf16 is still
-# sm_80: the widening to fp32 is a cvt instruction that does not exist
-# below it. fp32 and fp16 are plain ALU work on every supported arch.
+# A Triton kernel that only moves and reduces elements: no tl.dot, so
+# no tensor core is involved and sm_70 is as good at it as sm_80. bf16
+# is held at sm_80 by choice, not by the compiler -- Triton does build
+# the bf16 widening for sm_70 (without cvt.f32.bf16, so by some
+# emulation), but no 7.x card has ever run it here and the fallback
+# (`veda.tiling`'s torch gather) is known good.
 _TRITON_MOVE_DTYPES = {
-    torch.bfloat16: (BF16, 'bf16 load/convert (no cvt.f32.bf16)'),
-    torch.float16: (FP16_MMA, 'fp16 load/convert'),
-    torch.float32: (FP16_MMA, 'fp32 load/convert'),
+    torch.bfloat16: (BF16,
+                     'bf16 hardware conversion; Triton compiles an '
+                     'emulation for sm_7x that we have never run, so '
+                     'this is a refusal, not a compiler limit'),
+    torch.float16: (TRITON_COMPILES, 'fp16 load/convert'),
+    torch.float32: (TRITON_COMPILES, 'fp32 load/convert'),
 }
 
 REQUIREMENTS: dict[str, Requirement] = {
@@ -167,18 +200,27 @@ REQUIREMENTS: dict[str, Requirement] = {
         }),
     'block_heat_triton.teacher_heat': Requirement(
         kernel='block_heat_triton.teacher_heat',
-        floor=TRITON_DOT,
-        floor_reason="the kernel's QK^T is a tl.dot",
-        dtype_floors=_TRITON_DOT_DTYPES),
+        floor=TRITON_MMA,
+        floor_reason=(
+            "the kernel's QK^T is a tl.dot, and below sm_80 Triton "
+            'lowers that to CUDA-core fma: the fused kernel would then '
+            'be about 2x slower than the chunked torch reference it '
+            'exists to replace, because cuBLAS still reaches the '
+            'tensor cores there. It compiles from sm_70; this floor is '
+            'the point below which it stops being worth calling'),
+        dtype_floors=_TRITON_DOT_DTYPES,
+        compile_floor=TRITON_COMPILES),
     'tile_gather_triton.gather': Requirement(
         kernel='tile_gather_triton.gather',
-        floor=FP16_MMA,
-        floor_reason='Triton itself (the kernel has no tl.dot)',
+        floor=TRITON_COMPILES,
+        floor_reason=('Triton itself (the kernel has no tl.dot, so no '
+                      'tensor core and no sm_80 floor)'),
         dtype_floors=_TRITON_MOVE_DTYPES),
     'tile_gather_triton.scatter': Requirement(
         kernel='tile_gather_triton.scatter',
-        floor=FP16_MMA,
-        floor_reason='Triton itself (the kernel has no tl.dot)',
+        floor=TRITON_COMPILES,
+        floor_reason=('Triton itself (the kernel has no tl.dot, so no '
+                      'tensor core and no sm_80 floor)'),
         dtype_floors=_TRITON_MOVE_DTYPES),
     'elementwise_triton': Requirement(
         kernel='elementwise_triton',
@@ -189,8 +231,11 @@ REQUIREMENTS: dict[str, Requirement] = {
     'compensation_triton.compensate': Requirement(
         kernel='compensation_triton.compensate',
         floor=BF16,
-        floor_reason=('the probability block is cast to bf16 for its '
-                      'tl.dot against the value summaries'),
+        floor_reason=('the exact blocks of this path go through '
+                      'fa4.block_sparse_attention, which is sm_80 by way '
+                      'of cp.async; the bf16 cast of the probability '
+                      "block before its tl.dot is only the next thing "
+                      'in the way'),
         dtype_floors={torch.bfloat16: (BF16, 'bf16 tl.dot')}),
     'h3.dense_attention.sdpa': Requirement(
         kernel="h3.attention.dense_attention backend='sdpa'",
@@ -217,10 +262,13 @@ REQUIREMENTS: dict[str, Requirement] = {
         }),
     'sol_veda.block_sparse_attention': Requirement(
         kernel='sol_veda.block_sparse_attention',
-        floor=BF16,
-        floor_reason=('the fused kernel quantises the selected blocks to '
-                      'INT8 (sm_75 and up) but keeps the pooled summaries '
-                      'and the online softmax in bf16 (sm_80 and up)'),
+        floor=TRITON_INT8_DOT,
+        floor_reason=('Triton 3.4 refuses an INT8 tl.dot below sm_80 '
+                      'outright (it fails in TritonGPUAccelerateMatmul) '
+                      'even though Turing has IMMA, so the quantised '
+                      'exact-block arm cannot be built there at all; the '
+                      'bf16 summaries and online softmax would be the '
+                      'next obstacle'),
         dtype_floors={torch.bfloat16: (BF16, 'bf16 online softmax')}),
 }
 

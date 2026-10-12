@@ -50,10 +50,14 @@ _MATRIX = [
     ('fa4.block_sparse_attention', _AMPERE, torch.bfloat16, True),
     ('fa4.dense_attention', _TURING, torch.float16, False),
     ('fa4.dense_attention', _ADA, torch.float16, True),
-    # The heat kernel's QK^T is a tl.dot: sm_75 in fp16, sm_80 in bf16.
+    # The heat kernel's QK^T is a tl.dot. It compiles from sm_70, but
+    # below sm_80 Triton lowers the dot to CUDA-core fma and the kernel
+    # loses to the torch reference, so the gate is sm_80 in every dtype
+    # (measured: scripts/probe_triton_floor.py).
     ('block_heat_triton.teacher_heat', _VOLTA, torch.float16, False),
-    ('block_heat_triton.teacher_heat', _TURING, torch.float16, True),
+    ('block_heat_triton.teacher_heat', _TURING, torch.float16, False),
     ('block_heat_triton.teacher_heat', _TURING, torch.bfloat16, False),
+    ('block_heat_triton.teacher_heat', _AMPERE, torch.float16, True),
     ('block_heat_triton.teacher_heat', _AMPERE, torch.bfloat16, True),
     # The tile permutation has no tl.dot, so fp16 runs on Volta; bf16
     # still needs the sm_80 convert instruction.
@@ -96,8 +100,8 @@ def test_the_error_names_arch_kernel_and_operation(on_arch, kernel,
     assert kernel.split('.')[0] in reason
     # The reason has to say what is missing, not only that something is.
     assert any(word in reason for word in
-               ('MMA', 'mma', 'tl.dot', 'cp.async', 'cvt', 'SDPA',
-                'INT8', 'bitwise'))
+               ('MMA', 'mma', 'fma', 'tl.dot', 'cp.async', 'cvt',
+                'conversion', 'SDPA', 'INT8', 'bitwise'))
 
 
 def test_unsupported_dtype_is_distinguished_from_an_old_arch(on_arch):
@@ -115,6 +119,38 @@ def test_dtype_is_optional(on_arch):
                                    device) is None
     assert arch.unsupported_reason('fa4.block_sparse_attention',
                                    device) is not None
+
+
+def test_a_compile_floor_is_only_set_when_it_is_below_the_gate():
+    """`compile_floor` exists to mark a gate that is policy, not a limit.
+
+    Setting it equal to the gate would say "the compiler stops here"
+    twice and hide the distinction the field was added for.
+    """
+    for need in arch.REQUIREMENTS.values():
+        if need.compile_floor is None:
+            continue
+        assert need.compile_floor < need.floor, need.kernel
+        # A policy gate has to say why it is above the compile floor.
+        assert 'compiles' in need.floor_reason, need.kernel
+
+
+def test_the_heat_kernel_gate_is_about_tensor_cores_not_compiling():
+    # The first version of this table claimed Triton could not compile a
+    # dot below sm_75 at all. It can; what it cannot do below sm_80 is
+    # reach a tensor core, which is a different (and weaker) statement.
+    need = arch.REQUIREMENTS['block_heat_triton.teacher_heat']
+    assert need.compile_floor == (7, 0)
+    assert need.floor == (8, 0)
+    assert 'fma' in need.floor_reason
+
+
+def test_the_int8_arm_cannot_be_built_below_sm80():
+    # Stronger than the bf16 argument: Turing has IMMA, Triton 3.4 still
+    # refuses the INT8 dot, so there is nothing to gate on policy here.
+    need = arch.REQUIREMENTS['sol_veda.block_sparse_attention']
+    assert need.compile_floor is None
+    assert 'INT8' in need.floor_reason and 'sm_80' in need.floor_reason
 
 
 def test_every_requirement_dtype_meets_the_kernel_floor():

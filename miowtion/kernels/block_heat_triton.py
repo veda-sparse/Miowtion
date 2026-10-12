@@ -26,9 +26,14 @@ one fp16 exposure is that rounding step, where an unscaled row max above
 which real attention logits do not reach. The reference saturates at the
 same place, so parity is kept either way.
 
-Architecture floor: sm_75. The QK^T is a `tl.dot`, and Triton's NVIDIA
-backend no longer lowers it on Volta; bf16 inputs additionally need
-sm_80. See `kernels/arch.py` and docs/features/arch_support.md.
+Architecture floor: sm_80, and it is a judgement rather than a compile
+error. The QK^T is a `tl.dot`, which Triton compiles from sm_70 on but
+only lowers to a tensor core from sm_80 on; below that it is CUDA-core
+`fma`, which makes this kernel about 2x *slower* than the chunked torch
+reference it exists to replace -- cuBLAS still reaches the tensor cores
+there. So `supports()` is False on sm_7x and `heatmap.teacher_heat`
+takes the reference. See `kernels/arch.py` (`compile_floor`),
+docs/features/arch_support.md and scripts/probe_triton_floor.py.
 
 Launch parameters were tuned on RTX 4090 (d=128, 56 heads, 38k tokens):
 4 warps and 16 key tiles per program run QK^T at ~169 TFLOPS, 0.47x the time

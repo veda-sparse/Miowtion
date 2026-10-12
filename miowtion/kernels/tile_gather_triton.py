@@ -14,10 +14,12 @@ in fp32 in a different order than torch (tolerance, not bitwise). The
 pooled features and both second moments are fp32 whatever the input dtype
 is, so an fp16 input narrows nothing here.
 
-Architecture floor: there is no `tl.dot` in these kernels, so fp16 and
-fp32 inputs run wherever Triton runs. bf16 inputs still need sm_80: the
-pooling widens each row to fp32, and the instruction that converts bf16
-to fp32 does not exist below it. See `kernels/arch.py` and
+Architecture floor: sm_70. There is no `tl.dot` in these kernels, so no
+tensor core is involved and fp16 / fp32 run wherever Triton runs. bf16
+is held at sm_80 by choice, not by the compiler: Triton does build the
+bf16 widening for sm_70 (without the `cvt.f32.bf16` that first exists at
+sm_80, so by some emulation), but no 7.x card has ever run it here and
+the fallback in `veda.tiling` is known good. See `kernels/arch.py` and
 docs/features/arch_support.md.
 """
 

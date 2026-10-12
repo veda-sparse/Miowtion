@@ -19,20 +19,68 @@ bf16 的类型注解、一个 `tl.dot`、FA4 的 cp.async 流水，各自定下�
 
 ## 设计与不变量
 
-### 硬件事实（下限的来源）
+### 一个下限其实是两个问题
+
+初版这张表把两件事混成了一件，于是有两条写错了（见「踩坑记录」）。必须分开问：
+
+1. **工具链能不能编出来。** 这件事现在是**实测**的，不是回忆：
+   `scripts/probe_triton_floor.py` 用 `triton.compile` + `GPUTarget('cuda', cap, 32)`
+   为目标算力做 AOT 编译（只要 ptxas，不要卡），再从 `compiled.asm['ptx']` 把下降结果
+   读出来。
+2. **能不能落到 tensor core 上。** 同一次编译的 PTX 里看 `mma` 出现在哪一代。
+
+实测（Triton 3.4.0，`tl.dot` 128x64x128，64x64x64 结果相同）：
+
+| 算力 | fp16 dot | bf16 dot | fp32 dot | int8 dot | bf16 搬运/加宽 |
+|---|---|---|---|---|---|
+| 7.0 | `fma` | `fma` | `fma` | **编译失败** | 能编 |
+| 7.5 | `fma` | `fma` | `fma` | **编译失败** | 能编 |
+| 8.0 / 8.6 / 8.9 / 12.0 | `m16n8k16` | `m16n8k16` | `m16n8k8` | `m16n8k32` | 能编 |
+| 9.0 | `wgmma` | `wgmma` | `wgmma` | `wgmma` | 能编 |
+
+三条结论，每一条都和"想当然"的版本不同：
+
+- **浮点 `tl.dot` 从 7.0 就能编**。所谓"Triton 删掉了 Volta 的 `mma.m8n8k4`"是错的。
+- **但 7.0 和 7.5 都到不了 tensor core**，两者一律下降成 CUDA core 的 `fma`；
+  `mma.sync` 要到 8.0 才出现。所以在 sm_7x 上，一个带 `tl.dot` 的 Triton kernel
+  不是"慢一点"，而是整个离开了 tensor core 这条路。
+- **int8 `tl.dot` 在 7.0 / 7.5 上根本编不出来**（四种形状都失败在
+  `TritonGPUAccelerateMatmul`）。Turing 硬件有 IMMA，Triton 3.4 就是不发它。这比
+  "IMMA 不够用"强得多：量化的精确块那条臂在 sm_7x 上**不存在编译结果**。
+
+**AOT 能编 ≠ 在那代硅上跑对。** 上面每一格都只是工具链的回答；bf16 在 sm_7x 上靠某种
+软件转换编了出来，但没有任何一张 7.x 的卡真的跑过它（见「验证记录」）。
+
+### 硬件事实（另一半依据）
 
 | 能力 | 最低算力 | 说明 |
 |---|---|---|
-| fp16 tensor core（HMMA） | sm_70 | Volta 就有 |
-| INT8 tensor core（IMMA） | sm_75 | Volta **没有**，所以 Volta 上无法下降一个 INT8 `tl.dot` |
-| bf16（BMMA 与 `cvt.f32.bf16`） | sm_80 | sm_70 / sm_75 **连把 bf16 读上来加宽成 fp32 都做不到**，不是"慢一点"，是编译不出来 |
-| `cp.async` | sm_80 | FlashAttention 的流水化 tile 装载依赖它 |
+| fp16 tensor core（HMMA） | sm_70 | Volta 就有，但 Triton 3.4 在 8.0 以下不发 |
+| INT8 tensor core（IMMA） | sm_75 | Turing 有，但 Triton 3.4 在 8.0 以下不发 |
+| bf16 tensor core 与 `cvt.f32.bf16` | sm_80 | Triton 仍然能为 sm_70 编出 bf16 的加宽，所以本表里 bf16 的下限是**我们主动拒绝**，不是编译限制 |
+| `cp.async` | sm_80 | FlashAttention 的流水化 tile 装载依赖它；与 dtype 无关，是 FA4 在 sm_7x 上没有任何路径的原因 |
 | fp8 运算 | sm_89 | |
 | TMA 描述符 | sm_90 | |
-| Triton 的 `tl.dot` | sm_75 | Triton 的 NVIDIA 后端已经不再生成 Volta 的 `mma.m8n8k4`，所以 sm_70 有 fp16 tensor core 但 Triton 用不上 |
 
-最后一条是整件事里最违反直觉的地方：**sm_70 的障碍不是 dtype，是 Triton 自己**。
-把 kernel 改成 fp16 并不能让它回到 Volta。
+### 一条 gate 取两者的较高者
+
+`arch.py` 的 `Requirement.floor` 是**实际的 gate**，`compile_floor` 在两者不同时记下
+"工具链其实能编到哪"。这样后来的人一眼能看出某条 gate 是**我们的取舍**（kernel 在那里
+会输给自己的 fallback），而不是一个他可以去修的编译错误。
+
+热力图 kernel 就是这种情况：它从 sm_70 就能编，但在 sm_7x 上只有 CUDA core 的 `fma`，
+而它要替代的 torch 参考实现**仍然能通过 cuBLAS 吃到 tensor core**。按规格书算一笔
+（16:9@37 的工作点：38k slots、56 头、d=128，每层 20.7 TFLOP，中间分数 162 GB）：
+
+| 卡 | 融合 kernel（`fma`） | 参考实现（cuBLAS TC + HBM 往返） | 比值 |
+|---|---|---|---|
+| V100 | 1.32 s | 0.62 s | 2.1x **慢** |
+| T4 | 2.56 s | 1.42 s | 1.8x **慢** |
+| RTX 2080 Ti | 1.54 s | 0.78 s | 2.0x **慢** |
+
+这是规格书算术，不是实测（没有这些卡）。但方向足够清楚：**在 sm_7x 上把热力图路由进
+融合 kernel 是一次反向优化**，所以 gate 留在 sm_80，`supports()` 在那以下返回 False，
+`heatmap.teacher_heat` 自动走参考实现。
 
 ### 每个 kernel 的下限
 
@@ -44,11 +92,11 @@ bf16 的类型注解、一个 `tl.dot`、FA4 的 cp.async 流水，各自定下�
 |---|---|---|---|---|---|
 | `fa4.dense_attention` | sm_80 | cp.async + sm_80 MMA 形状 | sm_80 | sm_80 | 未实现 |
 | `fa4.block_sparse_attention` | sm_80 | 同上；vendored 的 `fa4_sm8x` 补丁打在 SM80 kernel 上，继承同一个下限 | sm_80 | sm_80 | 未实现 |
-| `block_heat_triton.teacher_heat` | sm_75 | QK^T 是一个 `tl.dot` | sm_80 | **sm_75** | sm_75 |
-| `tile_gather_triton.gather` / `.scatter` | sm_70 | 只有搬运与归约，**没有** `tl.dot` | sm_80 | **sm_70** | sm_70 |
+| `block_heat_triton.teacher_heat` | sm_80（**能编到 7.0**，见上：gate 是取舍不是编译限制） | QK^T 是一个 `tl.dot`，8.0 以下下降成 CUDA core 的 `fma` | sm_80 | sm_80 | sm_80 |
+| `tile_gather_triton.gather` / `.scatter` | sm_70 | 只有搬运与归约，**没有** `tl.dot`，所以不涉及 tensor core | sm_80（主动拒绝：Triton 能编，但没有 7.x 的卡跑过那套软件转换） | **sm_70** | sm_70 |
 | `elementwise_triton`（RoPE / AdaLN / SwiGLU） | sm_80 | 为了与 eager 逐位相等，每个中间量都舍入到 bf16 | sm_80 | 未实现 | 未实现 |
 | `compensation_triton.compensate` | sm_80 | 概率块被 cast 成 bf16 去做 `tl.dot`；但**先卡住的不是这个 cast**——`compensation_triton.attention` 的精确块走 `fa4.block_sparse_attention`，那条本身就是 sm_80 | sm_80 | 未实现 | 未实现 |
-| `sol_veda.block_sparse_attention`（融合 INT8） | sm_80 | 选中的块量化成 INT8（sm_75 起），但池化后的 summary 与在线 softmax 仍是 bf16（sm_80 起） | sm_80 | 未实现 | 未实现 |
+| `sol_veda.block_sparse_attention`（融合 INT8） | sm_80 | **Triton 3.4 在 8.0 以下拒绝 int8 `tl.dot`**（失败在 `TritonGPUAccelerateMatmul`），Turing 有 IMMA 也没用；bf16 的 summary 与在线 softmax 只是下一道障碍 | sm_80 | 未实现 | 未实现 |
 | `h3.attention.dense_attention` `backend='sdpa'` | sm_70 | PyTorch 的融合 SDPA kernel | sm_80 | sm_70 | sm_70 |
 | 同上，`return_lse=True` | sm_80 | 唯一返回 LSE 的是 flash 后端，它要求 sm_80 | sm_80 | sm_80 | 未实现（flash 后端不收 fp32） |
 | `kernels.reference.block_sparse_attention` | 无 | 纯 torch，CPU 也能跑 | 任意 | 任意 | 任意 |
@@ -61,21 +109,32 @@ bf16 的类型注解、一个 `tl.dot`、FA4 的 cp.async 流水，各自定下�
   `fa4.unavailable_reason()` 会说出缺的是哪一条。想在这两种卡上跑稀疏注意力，只有
   `kernels/reference.py` 这条 token 粒度的 torch 路径，由调用方显式用
   `allow_reference_kernel=True` 选中——它对真实长度的 clip 慢到不可用，是测试用的。
-- **打分器的教师热力图（`block_heat_triton`）在 sm_75 上用 fp16 可以跑**，sm_70 不行
-  （Triton 的 `tl.dot`）。`heatmap.teacher_heat` 用 `supports()` 路由，所以够不到下限的
-  卡会自动走 torch 参考实现，而不是死在 Triton 编译里。
-- **tile 排列与池化（`tile_gather_triton`）在 sm_70 上用 fp16 就能跑**，因为里面没有
-  `tl.dot`。bf16 仍然要 sm_80。
+- **打分器的教师热力图（`block_heat_triton`）在 sm_7x 上我们不路由进去**，尽管它能编：
+  8.0 以下 Triton 只给 CUDA core 的 `fma`，按上面那笔算术它比 torch 参考实现慢约 2 倍，
+  而参考实现靠 cuBLAS 仍然吃到 tensor core。`heatmap.teacher_heat` 用 `supports()` 路由，
+  所以这两代卡上自动走参考实现——**功能上不缺这一块，只是没有加速**。
+  （这条取代了本文件初版的说法「sm_75 + fp16 可以跑」：能跑，但跑了更慢。）
+- **tile 排列与池化（`tile_gather_triton`）在 sm_70 上用 fp16 就能跑**，而且这里的
+  "能跑"是实打实的：kernel 里没有 `tl.dot`，所以 tensor core 这件事根本不参与，sm_70
+  在搬运与归约上不比 sm_80 吃亏。bf16 仍然挡在 sm_80，但那是**主动拒绝**：Triton 能为
+  sm_70 编出 bf16 的加宽，只是没有卡跑过它，而 fallback（`veda.tiling` 的 torch gather）
+  是已知好的。放开它只需要把 `_TRITON_MOVE_DTYPES` 里 bf16 的下限改成 `(7, 0)`。
 - **融合补偿（`compensation_triton`）在 sm_7x 上不只差一个 cast。** 这条路径是
   「FA4 跑精确块 + Triton 补偿被丢掉的块」，所以它的第一道门槛是 FA4 的 sm_80，
   bf16 的 `tl.dot` 只是接下来会撞到的第二件事。换句话说**把 cast 改成 fp16 不会让
   这条路径在 sm_75 上跑起来**：得先给它配一个能在 sm_75 上跑的精确块 kernel。
+  而且那个替代 kernel **不能是 Triton 写的**，否则它只有 CUDA core 的 `fma`。
+  一笔很短的算术：稠密注意力走 cuBLAS / SDPA 吃 tensor core，而 Triton 的 fma 路径
+  是 fp32 CUDA core，两者在这几代上差约 8 倍（V100 125 : 15.7 TFLOPS，T4 65 : 8.1），
+  所以稀疏 kernel 相对稠密的耗时比约是 `密度 × 8`：**ρ=0.10 时只比稠密好 1.25 倍，
+  交叉点在 ρ≈0.12，再稠一点就不如直接跑稠密**。（规格书算术，没有这些卡可测。）
 - **融合的 Sol+Veda（INT8）自己就会报对的错**：`kernels/sol_veda.py` 的 `available()`
   用 `get_device_capability()[0] >= 8` 设限，`unavailable_reason()` 返回
   「needs SM80 or newer」，所以它在 Volta / Turing 上本来就是自描述的，不依赖
-  `arch.py`。`arch.REQUIREMENTS` 里仍然给它留了一条，只为了让矩阵是完整的一张表
-  （并说明为什么 sm_75 的 IMMA 不够：量化只用在选中的块上，summary 与在线 softmax
-  还是 bf16）。
+  `arch.py`。`arch.REQUIREMENTS` 里仍然给它留了一条，只为了让矩阵是完整的一张表，
+  并且现在那一条给出的是更强的理由：**Triton 3.4 在 8.0 以下连 int8 `tl.dot` 都编不
+  出来**（实测），所以这条臂在 sm_7x 上不是"IMMA 不够"而是没有编译结果；bf16 的
+  summary 与在线 softmax 只是下一道障碍。
 - **整模型仍然是 bf16 的**：`h3/model.py` 的 `_BF16` 与 `h3/weights.py` 把权重 dtype
   钉成 bf16。因此即使上面这些 kernel 的 fp16 路径都就位，**端到端跑在 sm_70 / sm_75 上
   还缺一步：把模型与权重加载的 dtype 参数化**。本次没有做这件事（见「待办」），因为
@@ -137,12 +196,19 @@ fp16 的指数范围比 bf16 小得多（最大 65504，bf16 约 3.4e38），所
 
 ## 踩坑记录
 
-- **以为 sm_70 / sm_75 的唯一障碍是 bf16。** 实际上有三个互相独立的障碍，dtype 只是
-  其中一个：(1) FA4 要 cp.async，和 dtype 无关，所以 sm_7x 上**没有任何** FA4 路径；
-  (2) Triton 的 NVIDIA 后端不再为 Volta 生成 `tl.dot`，所以 sm_70 上换 fp16 也救不了
-  带 `tl.dot` 的 kernel；(3) sm_80 以下没有 `cvt.f32.bf16`，所以一个 bf16 的 kernel
-  在那里**不是慢路径而是编译不出来**。对策：能力表按**操作**声明，不按 dtype 声明，
-  报错里也说操作名。
+- **以为 sm_70 / sm_75 的唯一障碍是 bf16。** 障碍不止一个、也不都在 dtype 上：
+  FA4 要的是 cp.async（与 dtype 无关，所以 sm_7x 上**没有任何** FA4 路径），Triton 的
+  `tl.dot` 在 8.0 以下拿不到 tensor core，int8 `tl.dot` 在 8.0 以下干脆编不出来。
+  对策：能力表按**操作**声明，不按 dtype 声明，报错里也说操作名。
+- **初版这张表里关于 Triton 的两条是凭回忆写的，而且两条都错了。** 一条说"Triton 删掉
+  了 Volta 的 `mma.m8n8k4`，所以 `tl.dot` 的下限是 7.5"——其实 7.0 就能编，而 7.5 也
+  **拿不到** tensor core，真正的分界是 8.0；另一条说"8.0 以下没有 `cvt.f32.bf16`，所以
+  bf16 kernel 编不出来"——Triton 照样为 7.0 编出了 bf16 的加宽。两条错误的方向还相反：
+  一条把门槛抬高了（7.0 其实能编），一条把理由说死了（bf16 其实能编，是我们选择不用）。
+  **代价**：整张 sm_7x 的表都建在这两条上，而它们本来一分钟就能测出来。对策：
+  `scripts/probe_triton_floor.py` 做 AOT 编译并把下降结果（`mma` 形状还是 `fma`）打出来
+  ——**不要只看编译成功与否**，"能编"和"能用"在这里差 8 倍算力；`Requirement` 里
+  `floor` 与 `compile_floor` 分开记，让"我们的取舍"与"工具链的限制"不再混为一谈。
 - **教师热力图里硬编码的 bf16 舍入。** `.to(tl.bfloat16)` 原本只是为了对齐参考实现的
   bmm 输出 dtype；一旦输入换成 fp16，它就变成一个参考实现没有的额外舍入，而数值对拍
   只会"稍微差一点"，不会报错。对策：舍入跟随 `q_ptr.dtype.element_ty`，并用一个逐位
@@ -156,17 +222,23 @@ fp16 的指数范围比 bf16 小得多（最大 65504，bf16 约 3.4e38），所
 
 | 日期 | 机器 | commit | 结果 |
 |---|---|---|---|
-| 2026-10-12 | 仅 CPU（无 CUDA、无 triton） | 本次提交 | `pytest tests/unit` 724 passed / 12 skipped；新增 `test_kernels_arch.py` 51 passed / 12 skipped |
+| 2026-10-12 | 仅 CPU（无 CUDA、无 triton） | e09076f | `pytest tests/unit` 724 passed / 12 skipped；新增 `test_kernels_arch.py` 51 passed / 12 skipped |
+| 2026-10-12 | 有 Triton、**不用 GPU**（AOT 编译只要 ptxas） | fa897fe | `scripts/probe_triton_floor.py`：7 个算力 × 4 种 dtype × 2 种 kernel 形状的编译结果与下降指令，见上面那张实测表 |
+| 2026-10-12 | 仅 CPU | 本次提交 | 按实测结果改掉两条错的下限、分出 `compile_floor` 并加测；`pytest tests/unit` 763 passed / 12 skipped |
 
-**sm_70 / sm_75 的 GPU 路径全部未验证（GPU 未验证）。** 项目没有这两种卡，本次改动
-也没有在任何 GPU 上跑过。具体地，下面这些结论目前只有"读代码 + 硬件文档"的依据：
+**sm_70 / sm_75 上没有跑过任何东西（GPU 未验证）。** 项目没有这两种卡。工具链层面的
+问题（能不能编、下降成什么）现在是实测的；下面这些仍然只有"规格书 + 读代码"的依据：
 
-1. `block_heat_triton` 在 **sm_75 + fp16** 上能编译并跑出与参考实现一致的结果
-   （容差同 bf16）。需要一张 T4 / RTX 20xx 跑 `pytest tests/gpu -m gpu`。
+1. `block_heat_triton` 在 sm_7x 上**比参考实现慢约 2 倍**这笔规格书算术
+   （`fma` 对 cuBLAS tensor core）。它是现在把 gate 留在 sm_80 的唯一理由，所以如果
+   有人拿到 T4 / RTX 20xx，值得实测一次：万一实际是"差不多快"，gate 就应该下移到
+   `TRITON_COMPILES`，而 `compile_floor` 正是为这个可能性记下来的。
 2. `tile_gather_triton` 在 **sm_70 / sm_75 + fp16** 上能跑。
-3. Triton 确实在 sm_70 上拒绝 `tl.dot`。这是本表里唯一一条依据"上游已移除 Volta MMA
-   下降"的推断，没有在 Volta 上跑过；如果实测发现 Triton 仍能生成，`arch.TRITON_DOT`
-   应从 `(7, 5)` 放回 `(7, 0)`，`_MATRIX` 里对应的两行会立刻变红。
+3. ~~Triton 确实在 sm_70 上拒绝 `tl.dot`~~ —— **已测，而且结论是反的**：浮点
+   `tl.dot` 从 7.0 就能编，7.0 / 7.5 都只到 `fma`，int8 `tl.dot` 在两者上都编不出来
+   （`scripts/probe_triton_floor.py`，fa897fe）。AOT 编译只需要 ptxas，所以这一条不再
+   欠硬件。仍然欠硬件的是：那套 bf16 的软件转换在 7.x 硅上**跑得对不对**（本表因此
+   把 bf16 的下限保留在 sm_80，并明确写成"主动拒绝"）。
 4. sm_75 上 PyTorch 的 memory-efficient SDPA 能否作为 `return_lse` 的替代路径
    （它返回 logsumexp，但行数会补齐到 32 的倍数、语义未核对）。**没有实现**，因为无法
    验证；现在是显式报错。
