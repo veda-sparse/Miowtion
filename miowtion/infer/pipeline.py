@@ -35,9 +35,10 @@ from miowtion.veda import predictor as veda_predictor
 # budget is split across query tiles, at the same per-head total; it is
 # the third and last axis of the Sol comparison (budget rule), after
 # compensation and block geometry both came back negative.
-VEDA_MODES = ('veda', 'veda_comp', 'veda_sol', 'veda_thresh')
-ATTENTION_MODES = ('dense', 'veda', 'veda_comp', 'veda_sol', 'veda_thresh',
-                   'sol', 'oracle_mass', 'oracle_max', 'oracle_mean')
+VEDA_MODES = ('veda', 'veda_comp', 'veda_sol', 'veda_tcomp', 'veda_thresh')
+ATTENTION_MODES = ('dense', 'veda', 'veda_comp', 'veda_sol', 'veda_tcomp',
+                   'veda_thresh', 'sol', 'oracle_mass', 'oracle_max',
+                   'oracle_mean')
 
 
 @dataclasses.dataclass
@@ -158,6 +159,9 @@ def generate(model: h3_model.H3DiT, schedule, tables,
     if attention == 'veda_sol':
         veda_config = dataclasses.replace(
             veda_config, fused_compensation=True)
+    if attention == 'veda_tcomp':
+        veda_config = dataclasses.replace(
+            veda_config, triton_compensation=True)
     if attention == 'veda_thresh':
         veda_config = dataclasses.replace(
             veda_config, budget_rule='threshold')

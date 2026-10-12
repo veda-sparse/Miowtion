@@ -16,6 +16,7 @@ import torch
 
 from miowtion.h3 import attention as h3_attention
 from miowtion.h3 import layout as h3_layout
+from miowtion.kernels import compensation_triton
 from miowtion.kernels import fa4
 from miowtion.kernels import reference
 from miowtion.kernels import sol_veda
@@ -81,6 +82,16 @@ class VedaConfig:
             quantises the selected blocks to INT8, so a quality gap
             against the plain arm mixes precision with compensation.
             Mutually exclusive with `zero_order_compensation`.
+        triton_compensation: The same zero-order term as
+            `zero_order_compensation`, computed by
+            `kernels/compensation_triton` next to FA4 instead of in
+            torch around it. Same arithmetic, same BF16 precision, and
+            the only one of the three that is affordable: measurement
+            puts it at 1.14x FA4's block-sparse time at density 0.1,
+            where the torch form costs a flat 19.5 s per clip and the
+            INT8 fused kernel costs 2.2x per unit density. An
+            equal-time comparison can only include a compensated arm
+            through this one.
         contiguous_tiles: Cut the sequence into blocks in its own order
             instead of permuting it into 3D tiles. Only for ablations
             against methods that block the sequence as it lies (Sol-Attn
@@ -117,6 +128,7 @@ class VedaConfig:
     budget_rule: str = 'topk'
     zero_order_compensation: bool = False
     fused_compensation: bool = False
+    triton_compensation: bool = False
     teacher_q_tiles: float = 1.0
     recall_every: int = 1
     dense_layers: frozenset[int] = frozenset()
@@ -129,10 +141,14 @@ class ClipTiling:
     def __init__(self, layout: h3_layout.PackedLayout,
                  config: VedaConfig, device: torch.device,
                  condition_spans: tuple[tiling.TiledSpan, ...] = ()):
-        if config.zero_order_compensation and config.fused_compensation:
+        chosen = [name for name in ('zero_order_compensation',
+                                    'fused_compensation',
+                                    'triton_compensation')
+                  if getattr(config, name)]
+        if len(chosen) > 1:
             raise ValueError(
-                'zero_order_compensation and fused_compensation compute the '
-                'same term; pick one, they are two implementations of it')
+                f'{" and ".join(chosen)} compute the same term; pick one, '
+                'they are implementations of it')
         if config.budget_rule not in ('topk', 'threshold'):
             raise ValueError("budget_rule must be 'topk' or 'threshold': "
                              f'{config.budget_rule!r}')
@@ -753,6 +769,11 @@ class SparseStudent:
             block_mask = veda_mask.dense_block_mask(selection, tile_layout)
         if self.clip.config.fused_compensation:
             o_tiles = sol_veda.block_sparse_attention(
+                q_tiles, k_tiles, v_tiles, block_mask, tile_layout)
+            _scatter_(out, o_tiles, tile_layout, heads)
+            return
+        if self.clip.config.triton_compensation:
+            o_tiles = compensation_triton.attention(
                 q_tiles, k_tiles, v_tiles, block_mask, tile_layout)
             _scatter_(out, o_tiles, tile_layout, heads)
             return

@@ -227,3 +227,30 @@ def test_an_empty_tile_does_not_inflate_the_denominator():
     assert torch.allclose(got.float(), want.float(), atol=1e-5), (
         'an empty tile changed the output depending on whether it was '
         'selected, so it is carrying weight it does not have')
+
+
+def test_the_three_compensation_implementations_are_exclusive():
+    """They compute the same term; running two would double it."""
+    from miowtion.h3 import layout as h3_layout
+
+    pairs = [('zero_order_compensation', 'fused_compensation'),
+             ('zero_order_compensation', 'triton_compensation'),
+             ('fused_compensation', 'triton_compensation')]
+    for first, second in pairs:
+        config = veda_attention.VedaConfig(**{first: True, second: True})
+        with pytest.raises(ValueError, match='pick one'):
+            veda_attention.ClipTiling(
+                h3_layout.PackedLayout.__new__(h3_layout.PackedLayout),
+                config, torch.device('cpu'))
+
+
+def test_veda_tcomp_is_a_veda_mode_that_sets_the_triton_flag():
+    """An equal-time comparison can only afford this implementation."""
+    import dataclasses as dc
+
+    from miowtion.infer import pipeline
+
+    assert 'veda_tcomp' in pipeline.VEDA_MODES
+    assert 'veda_tcomp' in pipeline.ATTENTION_MODES
+    config = veda_attention.VedaConfig()
+    assert dc.replace(config, triton_compensation=True).triton_compensation
