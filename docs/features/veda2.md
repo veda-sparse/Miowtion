@@ -2830,3 +2830,48 @@ compensation_triton.py`）。`veda/attention.py` 的 `zero_order_compensation` �
 `k_mean = 0`、`v_sum = 0`，但 `p̂ = exp(0 − ref)` 不是 0。新 kernel 显式排掉了
 `lengths == 0`。`miowtion/veda/attention.py` 在 workboard 上是别人认领的，所以
 **没动它**，差异写在 `compensate` 的注释里。谁接那个文件时顺手修一行即可。
+
+## 2.34 sm_7x 上没有 tensor core 可用：Triton 的下限是「能编译」而不是「能加速」
+
+接 sm_7x 支持这条线之前先量了一次 Triton 自己的下限，因为
+`kernels/arch.py` 的 `TRITON_DOT = (7, 5)` 和它的理由（「Triton 砍掉了 Volta 的
+`mma.m8n8k4`」）都没有被量过，而整张 sm_7x 的表压在这个假设上。
+
+`scripts/probe_triton_floor.py` 用 AOT 编译量（给定目标 capability，只要 ptxas，
+**不需要设备、不占用别人的卡**），Triton 3.4.0，`tl.dot` 形状 128x64x128
+（也就是融合 kernel 真正用的形状，64x64x64 结论相同）：
+
+| capability | fp16 dot | bf16 dot | fp32 dot | int8 dot | bf16 搬运 |
+|---|---|---|---|---|---|
+| 7.0 | **fma** | **fma** | **fma** | **编译失败** | ok |
+| 7.5 | **fma** | **fma** | **fma** | **编译失败** | ok |
+| 8.0 / 8.6 / 8.9 / 12.0 | m16n8k16 | m16n8k16 | m16n8k8 | m16n8k32 | ok |
+| 9.0 | wgmma | wgmma | wgmma | wgmma | ok |
+
+三条都和之前写下的不一样：
+
+1. **sm_70 没有被 Triton 砍掉**：fp16 / bf16 / fp32 的 `tl.dot` 都能为 cuda:70
+   编译出来。我（和 `arch.py` 的理由）记错了。
+2. **但 7.0 和 7.5 都拿不到 tensor core**：两者都降级成 `fma`，走 CUDA core。
+   `mma.sync` 从 8.0 才出现。所以 `(7, 5)` 这个下限最误导的地方不是它挡住了
+   7.0，而是它**暗示 7.5 没问题**。
+3. **INT8 的 `tl.dot` 在 7.0/7.5 上根本编译不出来**，四种形状（16x16x32、
+   32x32x64、64x64x64、128x64x128）全失败，挂在 `TritonGPUAccelerateMatmul`。
+   Turing 硬件有 IMMA，Triton 3.4 不往那儿发射。**所以「Turing 有 IMMA，量化那条
+   路可以留着」是错的**——那也是我写下的。
+
+`_TRITON_MOVE_DTYPES` 把 bf16 的搬运 kernel 也压在 8.0（理由是没有
+`cvt.f32.bf16`），而实测它在 7.0 上编译得出来，Triton 显然用别的指令做了加宽。
+
+### 对 sm_7x 这条路意味着什么
+
+**exact 块的 kernel 在 sm_7x 上只能是 fp16 且只能跑在 CUDA core 上。**
+稀疏省下的 FLOP 还在，但吞吐少了 tensor core 的那一档，而**稠密回退路径
+（torch sdpa）在 Turing 上是能用上 tensor core 的**。按公开规格（T4：fp16
+tensor 65 TFLOP/s，fp16 CUDA core 16.2；2080 Ti：108 / 26.9）粗算，ρ=0.10 时
+块稀疏对稠密回退的优势从名义上的 10× 收到 **约 2×**，并且在 **ρ≈0.2** 附近翻号，
+稠密反而更快。**这部分是规格推算，不是实测**：手上没有 Turing 卡。
+
+所以 sm_7x 上可以写一个正确的 fp16 块稀疏 kernel，它也确实比稠密快一点，
+但它买到的是 2× 而不是一个数量级，而且 ρ 稍高就是负收益。这个结论改变的是
+「要不要为 sm_7x 写 kernel」的优先级，而不是能不能写。
