@@ -6,6 +6,7 @@ the end-to-end arm (plan E4) is that nothing but the compensation
 differs from a plain Veda run.
 """
 
+import dataclasses
 import math
 
 import pytest
@@ -176,3 +177,53 @@ def test_clip_tiling_rejects_an_unknown_budget_rule():
         veda_attention.ClipTiling(
             h3_layout.PackedLayout.__new__(h3_layout.PackedLayout),
             config, torch.device('cpu'))
+
+
+def test_an_empty_tile_does_not_inflate_the_denominator():
+    """A tile with no real key must carry no weight at all.
+
+    The mean over a tile divides by its count, so the count is clamped
+    to one to avoid dividing by zero -- but that clamp must not reach
+    the denominator. An empty tile's k_mean and v_sum are both zero, so
+    its numerator term vanishes on its own while its denominator term
+    would be exp(-lse) times one: a positive weight for a tile holding
+    nothing, which shrinks every row's output.
+
+    No `span_tiles` layout can produce an empty tile, since a
+    ceil-divided 3D box always holds at least one real token, so this
+    is built by hand.
+    """
+    torch.manual_seed(0)
+    heads, dim, n_tiles = 2, 16, 3
+    rows = n_tiles * tiling.TILE_SIZE
+    layout = _layout(n_tiles, tiling.TILE_SIZE)
+    counts = layout.valid_count.clone()
+    counts[-1] = 0                        # the tile that holds nothing
+    layout = dataclasses.replace(layout, valid_count=counts)
+
+    q = torch.randn(rows, heads, dim).to(torch.bfloat16)
+    k = torch.randn(rows, heads, dim).to(torch.bfloat16)
+    v = torch.randn(rows, heads, dim).to(torch.bfloat16)
+    k = k * (torch.arange(rows)[:, None, None]
+             < counts.repeat_interleave(tiling.TILE_SIZE)[:, None, None])
+    v = v * (torch.arange(rows)[:, None, None]
+             < counts.repeat_interleave(tiling.TILE_SIZE)[:, None, None])
+    mask = torch.zeros(heads, n_tiles, n_tiles, dtype=torch.bool)
+    mask[:, :, 0] = True                  # every row keeps tile 0 only
+
+    kept, lse = reference.block_sparse_attention(
+        q, k, v, mask, counts, return_lse=True)
+    got = veda_attention.zero_order_compensation(
+        kept, lse, q, k, v, mask, layout)
+
+    # Tile 2 holds nothing, so the answer must equal the one computed
+    # with that tile kept rather than dropped -- in both readings it
+    # contributes no key, and only a wrong denominator can tell them
+    # apart.
+    kept_all = mask.clone()
+    kept_all[:, :, -1] = True
+    want = veda_attention.zero_order_compensation(
+        kept, lse, q, k, v, kept_all, layout)
+    assert torch.allclose(got.float(), want.float(), atol=1e-5), (
+        'an empty tile changed the output depending on whether it was '
+        'selected, so it is carrying weight it does not have')

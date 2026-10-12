@@ -631,7 +631,15 @@ def zero_order_compensation(
             f'block_mask is {tuple(block_mask.shape)}, expected '
             f'{(n_heads, n_rows // tiling.TILE_SIZE, n_tiles)}')
     scale = head_dim ** -0.5
-    counts = tile_layout.valid_count.to(torch.float32).clamp(min=1.0)
+    real_counts = tile_layout.valid_count.to(torch.float32)
+    # The clamp exists only so the mean does not divide by zero. It must
+    # not reach the denominator: an empty tile contributes no key, so its
+    # weight there is its real count of zero, and clamping it to one adds
+    # a spurious exp(-lse) to every row's denominator. No `span_tiles`
+    # layout can produce an empty tile -- a ceil-divided 3D box always
+    # holds at least one real token -- so this is unreachable today and
+    # wrong anyway.
+    counts = real_counts.clamp(min=1.0)
     # Padding slots are zeroed by the gather, so a sum over all 128 slots
     # of a tile is a sum over its real rows.
     k_mean = (k_tiles.float().view(n_tiles, tiling.TILE_SIZE, n_heads,
@@ -658,7 +666,7 @@ def zero_order_compensation(
                            torch.zeros_like(ref))
         p_hat = torch.exp(s_hat - safe[..., None]) * drop     # [H', C, N]
         num = torch.einsum('hcn,nhd->chd', p_hat, v_sum)
-        den = torch.einsum('hcn,n->hc', p_hat, counts)
+        den = torch.einsum('hcn,n->hc', p_hat, real_counts)
         out[start:stop] = ((o_kept[start:stop].float() + num)
                            / (1.0 + den).transpose(0, 1)[..., None]
                            ).to(o_kept.dtype)
