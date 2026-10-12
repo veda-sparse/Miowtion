@@ -152,6 +152,14 @@ def build_parser() -> argparse.ArgumentParser:
                         choices=sorted(_DECODE_DTYPES),
                         help='video VAE weight dtype (bf16 is 3.2x faster '
                         'than fp32 at 51.3 dB against it)')
+    parser.add_argument('--no-decode', action='store_true',
+                        help='stop after denoising, leaving the latents. A '
+                        'calibration run wants the per-step attention '
+                        'seconds and not the video, and the 2.4B video '
+                        'decoder is what makes such a run expensive -- '
+                        'three of four calibration runs were killed in the '
+                        'decoder after the timings they existed for had '
+                        'already been produced')
     parser.add_argument('--decode-only', action='store_true',
                         help='decode <mode>_latents.pt of an earlier run '
                         '(without it, existing latents are reused and only '
@@ -265,6 +273,16 @@ def main():
                     for mode in args.attention} for _, _, out_dir in jobs]
     else:
         results = _denoise_all(args, env, cache, jobs, devices, assigned)
+    if args.no_decode:
+        for (sample, geometry, out_dir), modes in zip(jobs, results):
+            for mode, result in modes.items():
+                progress.log(
+                    f'{sample.id} {geometry.name} {mode}: attention '
+                    f'{sum(result.attention_seconds[1:]):.2f} s, step '
+                    f'{sum(result.step_seconds[1:]):.2f} s '
+                    '(excluding step 0)')
+        progress.log(f'--no-decode: latents are under {args.out_dir}')
+        return
     summaries: list[dict | None] = [None] * len(jobs)
 
     def decode_work(rank: int, device: torch.device) -> None:

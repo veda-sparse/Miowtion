@@ -199,3 +199,19 @@ def test_an_empty_dense_layer_set_is_labelled_not_blank():
                               dense_layers_sweep=['', '0'])
     got = generate._mode_configs(args, veda_attention.VedaConfig())
     assert [row[0] for row in got] == ['veda_Lnone', 'veda_L0']
+
+
+def test_no_decode_and_decode_only_are_both_available():
+    """A calibration run wants timings, not video.
+
+    Three of four calibration runs were killed inside the 2.4B video
+    decoder *after* producing the attention seconds they existed for,
+    so the expensive half has to be skippable.
+    """
+    generate = _load_script('generate.py')
+    common = ['--root', 'weights/x', '--sample-cache', 'c',
+              '--sample-id', 's', '--geometry', '16:9@37',
+              '--attention', 'veda', '--out-dir', 'runs/x']
+    assert generate.parse_args(common + ['--no-decode']).no_decode
+    assert not generate.parse_args(common).no_decode
+    assert generate.parse_args(common + ['--decode-only']).decode_only

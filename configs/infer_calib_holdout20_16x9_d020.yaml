@@ -5,6 +5,10 @@
 # drift to a different cut and that swamps every temporal measurement
 # (docs/features/veda2.md 2.28); and twenty clips is the sample size a
 # paired comparison over clips actually needs.
+# veda_sol is deliberately not in this calibration: another agent
+# has uncommitted edits to the fused kernel, so a cost curve taken
+# now would describe a kernel that is mid-edit and about to
+# change.  Its curve is measured separately once that work lands.
 root: weights/MiniMax-H3
 variant: FL2VA
 schedule: turbo
@@ -19,6 +23,6 @@ decode_dtype: bf16
 geometry: ['16:9@37']
 keep_ratio: 0.20
 sample_id: [holdout5s_0000]
-attention: [veda, veda_comp, veda_sol]
+attention: [veda, veda_comp]
 predictor: weights/veda/veda2_r16.safetensors
 out_dir: artifacts/isotime20/calib_d020
