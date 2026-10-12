@@ -75,6 +75,31 @@ def _compile(kernel, signature, constexprs, capability: int):
     return None, _lowering(compiled.asm.get('ptx', ''))
 
 
+def _ops(ptx: str) -> str:
+    """The arithmetic instruction mix, commonest first."""
+    import collections                                    # noqa: PLC0415
+    counts = collections.Counter(
+        line.strip().split()[0] for line in ptx.split('\n')
+        if line.strip().startswith(('fma', 'mma', 'mul.f', 'add.f', 'cvt.rn',
+                                    'wgmma')))
+    return ', '.join(f'{name} x{n}' for name, n in counts.most_common(4))
+
+
+def _compile_ptx(kernel, signature, constexprs, capability: int) -> str:
+    """The PTX for `kernel` at `capability`, or '' if it does not build."""
+    import triton                                         # noqa: PLC0415
+    from triton.backends.compiler import GPUTarget        # noqa: PLC0415
+    from triton.compiler.compiler import ASTSource        # noqa: PLC0415
+    try:
+        source = ASTSource(fn=kernel, signature=signature,
+                           constexprs=constexprs)
+        return triton.compile(
+            source, target=GPUTarget('cuda', capability, 32)).asm.get('ptx',
+                                                                      '')
+    except Exception:                                     # noqa: BLE001
+        return ''
+
+
 def _lowering(ptx: str) -> str:
     """The tensor-core shape in `ptx`, or `fma` when there is none."""
     for line in ptx.split('\n'):
@@ -91,6 +116,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--shape', type=int, nargs=3, default=(64, 64, 64),
                         metavar=('M', 'N', 'K'))
+    parser.add_argument('--ops', action='store_true',
+                        help='the arithmetic instruction mix of the dot, '
+                             'which says whether the fma fallback is fp32 '
+                             'or packed fp16 -- that factor of two decides '
+                             'whether a sparse kernel beats dense at all')
     args = parser.parse_args()
     try:
         import triton                                     # noqa: PLC0415
@@ -127,6 +157,19 @@ def main() -> int:
                 notes.setdefault((in_dtype, 'move', why), []).append(
                     capability)
         print(f'{capability:<5}' + ''.join(f'{c:<{width}}' for c in cells))
+    if args.ops:
+        print('\ninstruction mix of the dot (is the fallback fp32 or '
+              'packed fp16?):')
+        for in_dtype, out_dtype in DTYPES[:2]:
+            for capability in (70, 75, 80):
+                ptx = _compile_ptx(
+                    dot_kernel,
+                    {'A': f'*{in_dtype}', 'B': f'*{in_dtype}',
+                     'Out': f'*{out_dtype}', 'M': 'constexpr',
+                     'N': 'constexpr', 'K': 'constexpr'},
+                    {'M': rows, 'N': cols, 'K': depth}, capability)
+                print(f'  {in_dtype} sm_{capability}: '
+                      f'{_ops(ptx) if ptx else "FAIL"}')
     print('\nint8 dot by shape (is the failure the arch or the shape?):')
     for shape in ((16, 16, 32), (32, 32, 64), (64, 64, 64), (128, 64, 128)):
         line = f'  {shape[0]}x{shape[1]}x{shape[2]:<4}'
