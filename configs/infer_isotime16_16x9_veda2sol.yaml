@@ -1,0 +1,49 @@
+# Equal-time comparison: Sol against Veda1 / Veda2, each with and
+# without Sol's zero-order compensation, all at the SAME attention
+# seconds rather than the same density.  A user picks a runtime, not a
+# sparsity, and the arms cost very different amounts per unit density,
+# so the densities differ by 5x and that spread is the result.
+#
+# The budget is 15.8 s, and it is set by what the arms can actually
+# reach rather than chosen.  Sol's own cheapest calibrated point is
+# 11.89 s at tau 0.7, but the fused compensated arm's fixed cost alone
+# is 11.93 s, so at Sol's own budget it could only run at zero density.
+# 15.8 s is the cheapest budget that fits every arm, and Sol is
+# recalibrated to tau 0.4 to spend it (measured: tau 0.7 -> 11.89 s,
+# 0.5 -> 14.37, 0.3 -> 17.28, 0.2 -> 18.69).
+#
+# Densities come from each arm's measured cost curve
+# (scripts/iso_time_budget.py, three densities each, max residual
+# 0.04 s):
+#   veda      6.06 s + 34.60 s * d  ->  28.2%
+#   veda_sol 11.93 s + 76.11 s * d  ->   5.1%
+#   veda_comp 25.58 s + 34.59 s * d ->  INFEASIBLE at any budget here
+# The unfused compensation is therefore absent: its fixed cost is 1.6x
+# the whole budget.  That is a property of our torch implementation,
+# not of the method -- the fused arm is the one that prices the method.
+#
+# 16 single-shot MovieGen bench captions.  Multi-shot prompts drift to
+# a different cut at low budget and that swamps every temporal
+# measurement, which is why the flash was invisible on the demo set
+# (docs/features/veda2.md 2.28).
+root: weights/MiniMax-H3
+variant: FL2VA
+schedule: turbo
+num_steps: 8
+adapter: weights/turbo_lora/minimax_h3_turbo_v4_step600_ema.safetensors
+sample_cache: artifacts/samples/moviegen_video_bench
+seed: 0
+offload_blocks: 30
+prefetch: 1
+mlp_chunk_rows: 8192
+decode_dtype: bf16
+geometry: ['16:9@37']
+sample_id: [
+  moviegen_0000, moviegen_0002, moviegen_0004, moviegen_0006,
+  moviegen_0008, moviegen_0010, moviegen_0012, moviegen_0014,
+  moviegen_0016, moviegen_0018, moviegen_0020, moviegen_0022,
+  moviegen_0024, moviegen_0026, moviegen_0028, moviegen_0030]
+attention: [veda_sol]
+keep_ratio: 0.051
+predictor: weights/veda/veda2_r16.safetensors
+out_dir: artifacts/isotime16/veda2sol

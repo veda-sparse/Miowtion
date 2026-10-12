@@ -1,20 +1,29 @@
 # Equal-time comparison: Sol against Veda1 / Veda2, each with and
 # without Sol's zero-order compensation, all at the SAME attention
 # seconds rather than the same density.  A user picks a runtime, not a
-# sparsity, and the arms do not cost the same per unit density, so the
-# densities differ and that spread is the result.
+# sparsity, and the arms cost very different amounts per unit density,
+# so the densities differ by 5x and that spread is the result.
 #
-# Time budget: Sol's own 11.89 s at this geometry, measured clean on an
-# idle card (no density probe inside the timed region).
+# The budget is 15.8 s, and it is set by what the arms can actually
+# reach rather than chosen.  Sol's own cheapest calibrated point is
+# 11.89 s at tau 0.7, but the fused compensated arm's fixed cost alone
+# is 11.93 s, so at Sol's own budget it could only run at zero density.
+# 15.8 s is the cheapest budget that fits every arm, and Sol is
+# recalibrated to tau 0.4 to spend it (measured: tau 0.7 -> 11.89 s,
+# 0.5 -> 14.37, 0.3 -> 17.28, 0.2 -> 18.69).
 #
 # Densities come from each arm's measured cost curve
-# (scripts/iso_time_budget.py): veda is 6.08 s + 34.53 s * d, so 11.89 s
-# buys 16.8%.  The unfused compensation arm is not here at all: its
-# fixed cost alone is 25.62 s, which is 2.2x the entire budget, so no
-# density fits it -- the +Sol arms have to be the fused kernel.
+# (scripts/iso_time_budget.py, three densities each, max residual
+# 0.04 s):
+#   veda      6.06 s + 34.60 s * d  ->  28.2%
+#   veda_sol 11.93 s + 76.11 s * d  ->   5.1%
+#   veda_comp 25.58 s + 34.59 s * d ->  INFEASIBLE at any budget here
+# The unfused compensation is therefore absent: its fixed cost is 1.6x
+# the whole budget.  That is a property of our torch implementation,
+# not of the method -- the fused arm is the one that prices the method.
 #
-# 16 single-shot MovieGen bench captions.  Multi-shot prompts drift to a
-# different cut at low budget and that swamps every temporal
+# 16 single-shot MovieGen bench captions.  Multi-shot prompts drift to
+# a different cut at low budget and that swamps every temporal
 # measurement, which is why the flash was invisible on the demo set
 # (docs/features/veda2.md 2.28).
 root: weights/MiniMax-H3
@@ -35,6 +44,6 @@ sample_id: [
   moviegen_0016, moviegen_0018, moviegen_0020, moviegen_0022,
   moviegen_0024, moviegen_0026, moviegen_0028, moviegen_0030]
 attention: [veda]
-keep_ratio: 0.168
+keep_ratio: 0.282
 predictor: weights/veda/Minimax-H3-T2VA-Veda-8NFE-600Step-Preview/minimax_h3_t2va_veda_8nfe_600step_preview_fp8.safetensors
 out_dir: artifacts/isotime16/veda1
