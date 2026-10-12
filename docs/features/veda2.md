@@ -2833,9 +2833,15 @@ compensation_triton.py`）。`veda/attention.py` 的 `zero_order_compensation` �
 
 ## 2.34 sm_7x 上没有 tensor core 可用：Triton 的下限是「能编译」而不是「能加速」
 
-接 sm_7x 支持这条线之前先量了一次 Triton 自己的下限，因为
-`kernels/arch.py` 的 `TRITON_DOT = (7, 5)` 和它的理由（「Triton 砍掉了 Volta 的
-`mma.m8n8k4`」）都没有被量过，而整张 sm_7x 的表压在这个假设上。
+接 sm_7x 支持这条线之前先量了一次 Triton 自己的下限，因为当时
+`kernels/arch.py` 写的是 `TRITON_DOT = (7, 5)`，而它的理由（「Triton 砍掉了 Volta 的
+`mma.m8n8k4`」）从没被量过，整张 sm_7x 的表却压在这个假设上。
+
+> **这一节描述的是当时的状态。** 实测之后 `arch.py` 已经改掉了：现在是
+> `TRITON_COMPILES = (7, 0)` / `TRITON_MMA = (8, 0)` / `TRITON_INT8_DOT = (8, 0)`
+> 三个常量（`618b91f`），而且 `Requirement` 多了 `compile_floor`，用来把
+> 「我们的策略」和「编译器的限制」分开。当前状态看
+> [arch_support](arch_support.md)。
 
 `scripts/probe_triton_floor.py` 用 AOT 编译量（给定目标 capability，只要 ptxas，
 **不需要设备、不占用别人的卡**），Triton 3.4.0，`tl.dot` 形状 128x64x128
