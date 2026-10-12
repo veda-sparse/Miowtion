@@ -14,8 +14,12 @@ bf16 的类型注解、一个 `tl.dot`、FA4 的 cp.async 流水，各自定下�
 都是调用方显式选择的。
 
 本次工作的直接动因是 sm_70（Volta，V100）与 sm_75（Turing，T4 / RTX 20xx）。
-**项目里没有这两种卡**，所以下面每一条都标明了它的来源：硬件事实、读代码得到的结论，
-还是未经验证的推断。
+**项目里没有这两种卡**，所以下面每一条都标明了它的来源：硬件事实、AOT 编译实测、
+规格书算术，还是未经验证的推断。
+
+**结论先写在这里：这两代卡上用稠密注意力，稀疏没有能回本的 kernel**（为什么见
+「结论」一节）。本文档存在的价值因此不是"怎么在 sm_7x 上跑 Veda"，而是让任何人在
+五分钟内看出这件事、并且看出它卡在哪条指令上。
 
 ## 设计与不变量
 
@@ -104,11 +108,23 @@ bf16 的类型注解、一个 `tl.dot`、FA4 的 cp.async 流水，各自定下�
 
 ### 结论：sm_70 / sm_75 上现在能做什么
 
+**一句话的指导：在 sm_70 / sm_75 上跑稠密注意力。这两代卡上没有任何能回本的稀疏
+kernel，我们也不打算做一个。** 理由不是 FA4 缺 cp.async——那只是**第一个**撞到的东西，
+而且听起来像"绕过去就有快路径"。真正的原因在下面那张实测表里：**Triton 在 8.0 以下拿
+不到 tensor core**，所有 `tl.dot` 都是 CUDA core 的 `fma`（int8 的更是连编都编不出来）。
+于是任何在 sm_7x 上重写的块稀疏 kernel 都要用 1/8 的算力去换密度带来的 FLOP 节省，
+按 `密度 × 8` 算，ρ=0.10 只比稠密好 1.25 倍、ρ≈0.12 就打平——**省下来的 FLOP 还不够
+补上离开 tensor core 的损失**。稀疏在这里不是"难做"，是"不划算"。
+
+下面是逐项的细节。
+
 - **稀疏注意力的快路径（FA4）在 sm_70 / sm_75 上不存在**，而且不是 dtype 的问题：
   CuTe kernel 建在 cp.async 和 sm_80 的 MMA 形状上。`fa4.available()` 在那里是 False，
-  `fa4.unavailable_reason()` 会说出缺的是哪一条。想在这两种卡上跑稀疏注意力，只有
-  `kernels/reference.py` 这条 token 粒度的 torch 路径，由调用方显式用
-  `allow_reference_kernel=True` 选中——它对真实长度的 clip 慢到不可用，是测试用的。
+  `fa4.unavailable_reason()` 会说出缺的是哪一条。但**不要把 cp.async 当成那道墙本身**
+  （见上）：即使有人把精确块换成一个不用 cp.async 的 kernel，只要它是 Triton 写的，
+  它就在 CUDA core 上。想在这两种卡上跑稀疏注意力，只有 `kernels/reference.py` 这条
+  token 粒度的 torch 路径，由调用方显式用 `allow_reference_kernel=True` 选中——它对真实
+  长度的 clip 慢到不可用，是测试用的。
 - **打分器的教师热力图（`block_heat_triton`）在 sm_7x 上我们不路由进去**，尽管它能编：
   8.0 以下 Triton 只给 CUDA core 的 `fma`，按上面那笔算术它比 torch 参考实现慢约 2 倍，
   而参考实现靠 cuBLAS 仍然吃到 tensor core。`heatmap.teacher_heat` 用 `supports()` 路由，
