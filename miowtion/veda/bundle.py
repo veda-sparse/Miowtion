@@ -198,14 +198,15 @@ def load(path: str, device: torch.device | str = 'cpu') -> Bundle:
             tensors do not match the predictor the metadata describes.
     """
     metadata = read_metadata(path)
-    with safe_open(path, framework='pt', device='cpu') as f:
-        tensors = {k: f.get_tensor(k) for k in f.keys()}
     stored = metadata.get('dtype', _LEGACY_DTYPE)
     if stored not in DTYPES:
         raise ValueError(f'{path}: unknown storage dtype {stored!r}')
-    model = veda_predictor.TileScorePredictor(int(metadata['num_layers']),
-                                              int(metadata['num_heads']),
-                                              int(metadata['head_dim']))
+    # Avoid an initialized fp32 copy plus a second dequantized state dict.
+    # At release size those temporaries can exceed a CPU preparation budget.
+    with torch.device('meta'):
+        model = veda_predictor.TileScorePredictor(int(metadata['num_layers']),
+                                                  int(metadata['num_heads']),
+                                                  int(metadata['head_dim']))
     resident = DTYPES[stored]
     if stored == 'float8_e4m3fn':
         # The parameters come back in bf16: `LayerPredictor.embed` reads
@@ -215,30 +216,87 @@ def load(path: str, device: torch.device | str = 'cpu') -> Bundle:
         # the bundle keeps is exactly the rounding, so its effect on the
         # top-k is measurable against the bf16 export of the same step.
         resident = torch.bfloat16
-        scales = {k[:-len(_SCALE_SUFFIX)]: v for k, v in tensors.items()
-                  if k.endswith(_SCALE_SUFFIX)}
-        values = {k: v for k, v in tensors.items()
-                  if not k.endswith(_SCALE_SUFFIX)}
-        missing = sorted(set(values) - set(scales))
-        if missing:
-            raise ValueError(f'{path}: fp8 tensors without a '
-                             f'{_SCALE_SUFFIX} scale: {missing}')
-        tensors = {k: _dequantize_fp8(v, scales[k], resident)
-                   for k, v in values.items()}
     # Before the load, not after: load_state_dict copies into the existing
     # parameter, so an fp32 module would silently upcast a bf16 file back to
     # fp32 and hold twice the memory the bundle was exported to save.
-    model = model.to(resident)
+    model = model.to(resident).to_empty(device=device)
     shape = (f'{metadata["num_layers"]} layers x {metadata["num_heads"]} '
              f'heads x {metadata["head_dim"]}')
-    try:
-        model.load_state_dict(tensors, strict=True)
-    except RuntimeError as error:
-        raise ValueError(f'{path}: predictor weights do not match the '
-                         f'{shape} the metadata declares: {error}') from error
+    parameters = dict(model.named_parameters())
+    with safe_open(path, framework='pt', device='cpu') as f, torch.no_grad():
+        keys = set(f.keys())
+        values = {k for k in keys if not k.endswith(_SCALE_SUFFIX)}
+        if stored == 'float8_e4m3fn':
+            scales = {k[:-len(_SCALE_SUFFIX)] for k in keys
+                      if k.endswith(_SCALE_SUFFIX)}
+            if values - scales:
+                raise ValueError(f'{path}: fp8 tensors without a '
+                                 f'{_SCALE_SUFFIX} scale: '
+                                 f'{sorted(values - scales)}')
+            if scales - values:
+                raise ValueError(f'{path}: extra fp8 scales')
+        elif values != keys:
+            raise ValueError(f'{path}: scales in a non-fp8 bundle')
+        if values != set(parameters):
+            raise ValueError(f'{path}: predictor weights do not match the '
+                             f'{shape} the metadata declares')
+        for key, parameter in parameters.items():
+            value = f.get_tensor(key)
+            if value.dtype != DTYPES[stored]:
+                raise ValueError(f'{path}: stored dtype mismatch: {key}')
+            if stored == 'float8_e4m3fn':
+                scale = f.get_tensor(key + _SCALE_SUFFIX)
+                if scale.shape != (parameter.shape[0],):
+                    raise ValueError(f'{path}: invalid per-head scale: {key}')
+                value = _dequantize_fp8(value, scale, resident)
+            if parameter.shape != value.shape:
+                raise ValueError(f'{path}: predictor weights do not match '
+                                 f'the {shape} the metadata declares: {key}')
+            parameter.copy_(value)
     plans = veda_plan.PlanTable(
         [veda_plan.TilePlan.from_json(p)
          for p in json.loads(metadata['plans']).values()])
-    return Bundle(predictor=model.to(device).eval(), plans=plans,
+    return Bundle(predictor=model.eval(), plans=plans,
                   keep_ratio=float(metadata['keep_ratio']),
                   metadata=metadata)
+
+
+def validate_contents(path: str) -> dict:
+    """Checks every stored tensor and fp8 scale without a resident predictor.
+
+    Used by CPU preparation in constrained containers. This validates the
+    artifact; it does not claim a full-model CUDA load or kernel execution.
+    """
+    metadata = read_metadata(path)
+    stored = metadata.get('dtype', _LEGACY_DTYPE)
+    if stored not in DTYPES:
+        raise ValueError(f'unsupported storage dtype: {stored}')
+    layers, heads, dim = (int(metadata[k]) for k in
+                          ('num_layers', 'num_heads', 'head_dim'))
+    expected = {f'layers.{i}.proj_{part}' for i in range(layers)
+                for part in ('q', 'k')}
+    keys_expected = set(expected)
+    if stored == 'float8_e4m3fn':
+        keys_expected |= {k + _SCALE_SUFFIX for k in expected}
+    with safe_open(path, framework='pt', device='cpu') as stream:
+        if set(stream.keys()) != keys_expected:
+            raise ValueError('predictor tensor/scale key set mismatch')
+        for key in sorted(expected):
+            value = stream.get_tensor(key)
+            if value.shape != (heads, 3 * dim, dim):
+                raise ValueError(f'predictor shape mismatch: {key}')
+            if value.dtype != DTYPES[stored]:
+                raise ValueError(f'predictor dtype mismatch: {key}')
+            if stored == 'float8_e4m3fn':
+                scale = stream.get_tensor(key + _SCALE_SUFFIX)
+                if (scale.dtype != torch.float32 or scale.shape != (heads,)
+                        or not torch.isfinite(scale).all() or (scale <= 0).any()):
+                    raise ValueError(f'invalid predictor scale: {key}')
+                decoded = _dequantize_fp8(value, scale, torch.bfloat16)
+            else:
+                decoded = value
+            if not torch.isfinite(decoded).all():
+                raise ValueError(f'nonfinite predictor values: {key}')
+    return {'parameters': layers * 2 * heads * 3 * dim * dim,
+            'parameter_tensors': len(expected), 'stored_dtype': stored,
+            'decoded_dtype': 'bfloat16' if stored == 'float8_e4m3fn' else stored}

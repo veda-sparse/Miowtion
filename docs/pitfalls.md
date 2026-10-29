@@ -108,3 +108,14 @@
 | `bf16+smoothk` 不是恒等 | 先把 `x - mean` 落回 bf16 再量化，把减法自己丢掉的位算在平滑头上；真实硬件里这一步在 fp32 累加器里 | `fake_quantize` 全程 fp32，最后才 `.to(x.dtype)` | [quant_scoring](features/quant_scoring.md) |
 | fp8 bundle 在单测里没有"减半" | safetensors 的 header 在玩具尺寸下比权重还大 | 阈值放到 0.75；真实尺寸上才是 550,635,792 → 275,415,648 字节 | [quant_scoring](features/quant_scoring.md) |
 | 多卡生成时两张卡在第一步就挂，报 `flash_attn.cute.interface has no attribute flash_attn_func` | 每卡一个线程同时首次 import FA4；`functools.cache` 执行期间不持锁，而 SM8x 补丁手工把模块塞进 `sys.modules`，绕过 import lock，别的线程拿到半初始化的模块 | `fa4._IMPORT_LOCK` 串行化 `_modules()`；单测用假的 `_import_modules` 钉并发度为 1 | [veda_kernel](features/veda_kernel.md) |
+
+## Sparse LoRA
+
+| 现象 | 原因 | 对策 | 链接 |
+|---|---|---|---|
+| 冻结 backbone 后早层 LoRA 没有梯度 | 推理排列 kernel 缺少 autograd | 使用可反向融合排列，保持 predictor 特征及 top-k stop-grad | [sparse_lora](features/sparse_lora.md) |
+| 相同输入恢复后梯度不逐位一致 | FA4 dQ 原子累加顺序变化 | 显式有序 dQ；检查 optimizer/RNG/轨迹完整恢复 | [sparse_lora](features/sparse_lora.md) |
+| FSDP 初始有效 rank 下降 | 各分片独立按相同 seed 生成局部 A | 生成全局 A 后按 shard 行切片 | [sparse_lora](features/sparse_lora.md) |
+| 长片 LoRA 临时量和激活导致 OOM | 全序列 FP32 增量及逐层保存输入 | LoRA 行分块与 GPU 内分组 checkpoint | [sparse_lora](features/sparse_lora.md) |
+| 尾批更新偏大或 collective 错位 | 尾批独立归一化或缺样 rank 跳过反向 | 全窗口有效状态归一化，缺样槽零权重反向 | [sparse_lora](features/sparse_lora.md) |
+| 训练 loss 有限但生成严重噪点 | 全层高 LR 实验中去噪能力退化 | 保存早期 checkpoint，独立推理；不以 loss 有限判断质量 | [sparse_lora](features/sparse_lora.md) |

@@ -17,6 +17,7 @@ Veda student and the tile-search scorer are all AttentionFns.
 from __future__ import annotations
 
 import dataclasses
+import contextlib
 import math
 from collections.abc import Sequence
 from typing import Protocol
@@ -402,6 +403,8 @@ class H3DiT(nn.Module):
                                     for _ in range(config.num_layers))
         self.final_layer = FinalLayer(config)
         self.gradient_checkpointing = False
+        self.checkpoint_inputs_to_cpu = False
+        self.checkpoint_group_size = 1
         self.dense_backend = 'auto'
 
     def set_mlp_chunk_rows(self, rows: int | None) -> None:
@@ -478,17 +481,45 @@ class H3DiT(nn.Module):
             attention_fn = DenseAttention(clip.used, self.dense_backend)
         x = self.embed(clip, video_rows, audio_rows)
         adaln_input = self.adaln_input(timestep.timesteps)
-        for index, block in enumerate(self.blocks):
-            adaln = None if adaln_table is None else adaln_table[index]
-            if self.gradient_checkpointing and torch.is_grad_enabled():
+        if (self.gradient_checkpointing and torch.is_grad_enabled()
+                and self.checkpoint_group_size > 1):
+            for start in range(0, len(self.blocks), self.checkpoint_group_size):
+                stop = min(start + self.checkpoint_group_size, len(self.blocks))
                 x = torch_checkpoint.checkpoint(
-                    block, x, adaln, adaln_input, timestep.adaln_index,
-                    clip.rope, attention_fn, index, use_reentrant=False)
-            else:
-                x = block(x, adaln, adaln_input, timestep.adaln_index,
-                          clip.rope, attention_fn, index)
+                    self._run_blocks, x, adaln_input, timestep.adaln_index,
+                    clip.rope, attention_fn, adaln_table, start, stop,
+                    use_reentrant=False)
+        else:
+            x = self._run_blocks(
+                x, adaln_input, timestep.adaln_index, clip.rope, attention_fn,
+                adaln_table, 0, len(self.blocks))
         return self.final_layer(x, adaln_input, timestep.slot,
                                 clip.target_img_pos, clip.target_audio_pos)
+
+    def _run_blocks(self, x: torch.Tensor, adaln_input: torch.Tensor,
+                    adaln_index: torch.Tensor,
+                    rope: tuple[torch.Tensor, torch.Tensor],
+                    attention_fn: AttentionFn,
+                    adaln_table: Sequence[Sequence[torch.Tensor]] | None,
+                    start: int, stop: int) -> torch.Tensor:
+        """Keeps inner checkpoints to bound a group's recompute workspace."""
+        for index in range(start, stop):
+            block = self.blocks[index]
+            adaln = None if adaln_table is None else adaln_table[index]
+            if self.gradient_checkpointing and torch.is_grad_enabled():
+                # The inner checkpoint hooks discard block intermediates;
+                # this outer context only moves its saved inputs to CPU.
+                saved_inputs = (torch.autograd.graph.save_on_cpu(
+                    pin_memory=True) if self.checkpoint_inputs_to_cpu
+                    else contextlib.nullcontext())
+                with saved_inputs:
+                    x = torch_checkpoint.checkpoint(
+                        block, x, adaln, adaln_input, adaln_index,
+                        rope, attention_fn, index, use_reentrant=False)
+            else:
+                x = block(x, adaln, adaln_input, adaln_index,
+                          rope, attention_fn, index)
+        return x
 
     @torch.no_grad()
     def precompute_adaln(self, timesteps: torch.Tensor

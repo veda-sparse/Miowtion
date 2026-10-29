@@ -1,0 +1,33 @@
+# Random-state recipe. Short SM120 smoke passed; larger runs unverified.
+# One uniformly sampled Turbo8 state per prompt visit.
+run_name: sparse_lora_t2va_r32_l0_1_49_pilot_random
+checkpoint_root: weights/MiniMax-H3
+teacher_adapter: weights/turbo_lora/minimax_h3_turbo_v4_step600_ema.safetensors
+predictor_bundle: weights/veda/Minimax-H3-T2VA-Veda-8NFE-600Step-Preview/minimax_h3_t2va_veda_8nfe_600step_preview_fp8.safetensors
+train_manifest: artifacts/sparse_lora_data/pilot.train.jsonl
+validation_manifest: artifacts/sparse_lora_data/pilot.validation.jsonl
+sample_cache: artifacts/samples/sparse_lora_pilot
+geometries:
+- 16:9@37
+lora_layers:
+- 0
+- 1
+- 49
+lora_rank: 32
+lora_alpha: 32.0
+lora_targets:
+- attn.qkv_proj
+- attn.out_proj
+keep_ratio: 0.05
+steps: 50
+accum: 4
+lr: 0.0001
+warmup: 5
+audio_weight: 1.0
+grad_clip: 1.0
+save_every: 10
+offload_blocks: 0
+mlp_chunk_rows: 8192
+# Fixed-order sparse dQ; FA4 forward and dK/dV retained.
+ordered_dq: true
+timestep_sampling: random

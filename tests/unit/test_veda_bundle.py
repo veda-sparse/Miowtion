@@ -211,3 +211,12 @@ def test_fp8_bundle_without_a_scale_is_rejected(tmp_path):
     save_file(tensors, path, metadata=metadata)
     with pytest.raises(ValueError, match='without a .* scale'):
         veda_bundle.load(path)
+
+
+def test_stream_validation_checks_every_tensor(tmp_path):
+    path, _ = _write(tmp_path, dtype=torch.float8_e4m3fn)
+    report = veda_bundle.validate_contents(path)
+    assert report['decoded_dtype'] == 'bfloat16'
+    assert report['parameter_tensors'] > 0
+    assert report['parameters'] == sum(
+        p.numel() for p in veda_bundle.load(path).predictor.parameters())

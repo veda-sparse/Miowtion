@@ -16,6 +16,7 @@ import os
 import pytest
 
 from miowtion.train import trainer
+from miowtion.train import sparse_lora
 from miowtion.veda import search
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(
@@ -40,6 +41,9 @@ def test_config_parses(path):
     name = os.path.basename(path)
     if name.startswith('search_'):
         _check_search(path)
+    elif name.startswith('sparse_lora_'):
+        config = sparse_lora.SparseLoraConfig.from_yaml(path)
+        assert config.run_name
     elif name.startswith('infer_'):
         generate = _load_script('generate.py')
         args = generate.parse_args(['--config', path])

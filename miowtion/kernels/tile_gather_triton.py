@@ -18,6 +18,7 @@ from __future__ import annotations
 import functools
 
 import torch
+from torch.autograd.function import once_differentiable
 
 from miowtion.veda import tiling
 
@@ -116,6 +117,54 @@ def gather_and_pool(x: torch.Tensor, layout: tiling.TileLayout,
         ([N, H', D] tile-ordered rows, [H', n_tiles, 3D] fp32 features).
     """
     return _gather(x, layout, heads, pool=True)
+
+
+class _DifferentiableGather(torch.autograd.Function):
+    """Inverse permutation backward; pooled mask features stay detached."""
+
+    @staticmethod
+    def forward(ctx, x, layout, heads, pool):
+        heads = _heads(x, heads)
+        ctx.layout = layout
+        ctx.input_shape = x.shape
+        ctx.save_for_backward(heads)
+        rows, features = _gather(x, layout, heads, pool)
+        if features is None:
+            features = x.new_empty(0)
+        ctx.mark_non_differentiable(features)
+        return rows, features
+
+    @staticmethod
+    @once_differentiable
+    def backward(ctx, grad_rows, grad_features):
+        del grad_features
+        if grad_rows is None:
+            return None, None, None, None
+        heads, = ctx.saved_tensors
+        # Valid layout rows are a permutation, so each destination is
+        # written once. Drop padding instead of accumulating it at row 0.
+        grad_input = grad_rows.new_zeros(
+            ctx.input_shape[0] + 1, *ctx.input_shape[1:])
+        scatter_tiles_(grad_input, grad_rows.contiguous(), ctx.layout, heads)
+        return grad_input[:-1], None, None, None
+
+
+def differentiable_gather(
+        x: torch.Tensor, layout: tiling.TileLayout,
+        heads: torch.Tensor | None, pool: bool = False
+        ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Gathers [S,H,D] CUDA rows with exact inverse-permutation gradients.
+
+    Optional [H',tiles,3D] features use the inference pooling arithmetic
+    and are detached, as required by frozen discrete mask selection.
+    Layouts must come from build_tile_layout (unique valid row indices),
+    and heads must be distinct as in TilePlan.head_groups. Only first-order
+    differentiation is supported. The inference APIs remain unchanged.
+    """
+    if not x.is_cuda:
+        raise ValueError('differentiable tile gather requires CUDA')
+    rows, features = _DifferentiableGather.apply(x, layout, heads, pool)
+    return rows, features if pool else None
 
 
 def _gather(x, layout, heads, pool):

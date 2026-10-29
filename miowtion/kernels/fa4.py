@@ -1,13 +1,13 @@
 """FlashAttention-4 (CuTe DSL): the single entry point for FA4 in Miowtion.
 
-Every FA4 import goes through `_modules()`, which on SM8x first installs the
-vendored block-sparse patch (miowtion.kernels.fa4_sm8x; it must precede any
-`flash_attn.cute` import).
+Every FA4 import goes through `_modules()`, which on SM8x / SM120 first
+installs the vendored block-sparse patch (miowtion.kernels.fa4_sm8x; it must
+precede any `flash_attn.cute` import).
 
-The block pattern is given as a dense block mask. On SM8x it goes to the
-kernels as is (`DenseBlockMaskTorch` of the vendored patch: no index lists,
-and backward reads the same mask column-wise). On SM90 / SM100 it is packed
-into full / partial index lists here.
+The block pattern is given as a dense block mask. On SM8x / SM120 it goes to
+the kernels as is (`DenseBlockMaskTorch` of the vendored patch: no index
+lists, and backward reads the same mask column-wise). On SM90 / SM100 it is
+packed into full / partial index lists here.
 
 Block-sparse integration rules (each one silently costs speed or
 correctness if broken):
@@ -21,9 +21,9 @@ correctness if broken):
     (varlen), not the block size; block_size must be passed by keyword.
   * Kernels process q_stage * tile_m query rows per CTA and require the
     sparse Q block to be a multiple of it. SM90 uses tile_m = 128 with
-    q_stage = 1; SM8x (patched) splits 128x128 blocks into sub-tiles. SM100
-    picks q_stage = 2 whenever seqlen_q > 128, so the forward config is
-    overridden to q_stage = 1 there (_force_q_stage_one; pending B200
+    q_stage = 1; SM8x / SM120 (patched) split 128x128 blocks into sub-tiles.
+    SM100 picks q_stage = 2 whenever seqlen_q > 128, so the forward config
+    is overridden to q_stage = 1 there (_force_q_stage_one; pending B200
     validation).
   * SM90/SM100 backward needs Q-direction (transposed) block lists. Without
     them FA4's backward silently computes dense gradients, so they are
@@ -38,6 +38,7 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import functools
+import inspect
 import threading
 
 import torch
@@ -46,10 +47,16 @@ from miowtion.kernels import fa4_sm8x
 from miowtion.veda import tiling
 
 _TILE = tiling.TILE_SIZE
-# Architectures (compute capability major) whose FA4 kernels implement block
-# sparsity; 8 only with the vendored SM8x patch installed.
+# Architectures (compute capability major) whose upstream FA4 kernels implement
+# block sparsity.
 _SPARSE_MAJOR_ARCHS = (9, 10, 11)
-_sm8x_error: str | None = None
+# Architectures that get block sparsity only from the vendored patch. SM120
+# (12) runs the SM80 kernels -- FlashAttentionForward/BackwardSm120 subclass
+# the SM80 classes purely to raise the SMEM bound -- so patching the SM80
+# kernels covers it, and upstream's arch-12 "not supported" asserts are what
+# the patch lifts.
+PATCHED_MAJOR_ARCHS = (8, 12)
+_patch_error: str | None = None
 # FA4 calls are serialized across threads (one thread per GPU in multi-GPU
 # inference): the first call of a signature JIT-compiles through CuTe DSL /
 # MLIR, which is not documented as thread-safe. Only the host-side launch is
@@ -65,26 +72,26 @@ _CALL_LOCK = threading.Lock()
 _IMPORT_LOCK = threading.RLock()
 
 
-def _any_sm8x() -> bool:
-    return any(torch.cuda.get_device_capability(i)[0] == 8
+def _any_patched_arch() -> bool:
+    return any(torch.cuda.get_device_capability(i)[0] in PATCHED_MAJOR_ARCHS
                for i in range(torch.cuda.device_count()))
 
 
 @functools.cache
 def _modules():
-    """Imports FA4 (patched on SM8x); returns None when unavailable."""
+    """Imports FA4 (patched on SM8x / SM120); None when unavailable."""
     with _IMPORT_LOCK:
         return _import_modules()
 
 
 def _import_modules():
     """The body of `_modules`, run under `_IMPORT_LOCK`."""
-    global _sm8x_error
-    if torch.cuda.is_available() and _any_sm8x():
+    global _patch_error
+    if torch.cuda.is_available() and _any_patched_arch():
         try:
             fa4_sm8x.install()
         except (RuntimeError, ImportError) as e:
-            _sm8x_error = str(e)
+            _patch_error = str(e)
     try:
         import cutlass  # pylint: disable=import-outside-toplevel
         import cutlass.cute as cute  # pylint: disable=import-outside-toplevel
@@ -108,10 +115,12 @@ def dense_available(device: torch.device) -> bool:
 
 def available(device: torch.device | None = None) -> bool:
     """FA4 is importable and implements block sparsity on `device`."""
+    if device is not None and torch.device(device).type != 'cuda':
+        return False
     if not torch.cuda.is_available() or _modules() is None:
         return False
     major = torch.cuda.get_device_capability(device)[0]
-    if major == 8:
+    if major in PATCHED_MAJOR_ARCHS:
         return fa4_sm8x.installed()
     return major in _SPARSE_MAJOR_ARCHS
 
@@ -175,7 +184,9 @@ def _install_q_stage_hook() -> None:
 
 @contextlib.contextmanager
 def _force_q_stage_one(device: torch.device):
-    if torch.cuda.get_device_capability(device)[0] < 10:
+    # Only SM100/SM101 ever pick q_stage=2 (interface: arch // 10 in [10, 11]).
+    # SM120 is already q_stage=1, so leave FA4's internals alone there.
+    if torch.cuda.get_device_capability(device)[0] not in (10, 11):
         yield
         return
     _install_q_stage_hook()
@@ -219,9 +230,52 @@ def index_lists(block_mask: torch.Tensor, layout: tiling.TileLayout,
     return part_cnt, part_idx, full_cnt, full_idx
 
 
+@functools.cache
+def _ordered_backward():
+    """Refuses incompatible FA4 internals instead of guessing a signature."""
+    function = getattr(interface(), '_flash_attn_bwd', None)
+    required = {'q', 'k', 'v', 'out', 'dout', 'lse', 'softmax_scale',
+                'causal', 'softcap', 'mask_mod', 'aux_tensors',
+                'block_sparse_tensors'}
+    if (not callable(function)
+            or not required <= inspect.signature(function).parameters.keys()):
+        raise RuntimeError('FA4 _flash_attn_bwd signature changed; '
+                           'ordered dQ must be revalidated')
+    return function
+
+
+class _OrderedQueryGradient(torch.autograd.Function):
+    """Keep FA4 forward/dK/dV; replace the atomic dQ reduction only."""
+
+    @staticmethod
+    def forward(ctx, q, k, v, block_mask, slot_valid, sparse_tensors):
+        out, lse = interface().flash_attn_func(
+            q[None], k[None], v[None], softmax_scale=q.shape[-1]**-0.5,
+            mask_mod=_valid_key_mask_mod(), aux_tensors=[slot_valid],
+            block_sparse_tensors=sparse_tensors, return_lse=True)
+        ctx.save_for_backward(q, k, v, out, lse, block_mask, slot_valid)
+        ctx.sparse_tensors = sparse_tensors
+        return out[0]
+
+    @staticmethod
+    def backward(ctx, dout):
+        from miowtion.kernels import sparse_dq_triton
+        q, k, v, out, lse, block_mask, slot_valid = ctx.saved_tensors
+        with _CALL_LOCK:
+            _, dk, dv = _ordered_backward()(
+                q[None], k[None], v[None], out, dout[None], lse,
+                q.shape[-1]**-0.5, False, 0.,
+                mask_mod=_valid_key_mask_mod(), aux_tensors=[slot_valid],
+                block_sparse_tensors=ctx.sparse_tensors)
+        dq = sparse_dq_triton.query_gradient(
+            q, k, v, out[0], dout, lse[0], block_mask, slot_valid)
+        return dq, dk[0], dv[0], None, None, None
+
+
 def block_sparse_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
                            block_mask: torch.Tensor,
-                           layout: tiling.TileLayout) -> torch.Tensor:
+                           layout: tiling.TileLayout,
+                           ordered_dq: bool = False) -> torch.Tensor:
     """FA4 block-sparse attention on tile-ordered tensors.
 
     Args:
@@ -232,6 +286,8 @@ def block_sparse_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
         block_mask: [H', R, n_tiles] bool, row r = query tile r of `q`
             (mask.dense_block_mask). Empty key tiles are skipped.
         layout: Tile layout (slot validity for the mask_mod).
+        ordered_dq: Replace SM8x/SM120's atomic dQ with a fixed-order
+            sparse Triton reduction. Forward and dK/dV remain FA4.
 
     Returns:
         [R * 128, H', D] bf16.
@@ -241,7 +297,7 @@ def block_sparse_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
         ValueError: If gradients are required for a subset of query tiles.
     """
     if not available(q.device):
-        reason = f' ({_sm8x_error})' if _sm8x_error else ''
+        reason = f' ({_patch_error})' if _patch_error else ''
         raise NotImplementedError(
             'FA4 block sparsity unavailable on sm'
             f'{"".join(map(str, torch.cuda.get_device_capability(q.device)))}'
@@ -251,8 +307,14 @@ def block_sparse_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
         t.requires_grad for t in (q, k, v))
     if needs_grad and block_mask.shape[1] != layout.n_tiles:
         raise ValueError('backward needs the block mask of all query tiles')
+    major = torch.cuda.get_device_capability(q.device)[0]
+    if ordered_dq and (major not in PATCHED_MAJOR_ARCHS
+                       or q.dtype != torch.bfloat16 or q.shape[-1] != 128):
+        raise ValueError('ordered dQ supports SM8x/SM120 BF16 MHA D128')
+    if ordered_dq and needs_grad:
+        _ordered_backward()
     tensors_bwd = None
-    if torch.cuda.get_device_capability(q.device)[0] == 8:
+    if torch.cuda.get_device_capability(q.device)[0] in PATCHED_MAJOR_ARCHS:
         tensors = block_sparsity.DenseBlockMaskTorch(
             block_mask=(block_mask & layout.kv_ok)[None],
             partial_kv_blocks=~layout.full_tile, block_size=(_TILE, _TILE))
@@ -271,6 +333,10 @@ def block_sparse_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
                 full_block_cnt=full_cnt, full_block_idx=full_idx,
                 block_size=(_TILE, _TILE))
     with _CALL_LOCK, _force_q_stage_one(q.device):
+        if ordered_dq and needs_grad:
+            return _OrderedQueryGradient.apply(
+                q, k, v, block_mask & layout.kv_ok,
+                layout.slot_valid, tensors)
         out = iface.flash_attn_func(
             q[None], k[None], v[None],
             softmax_scale=q.shape[-1]**-0.5,

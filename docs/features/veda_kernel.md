@@ -134,3 +134,39 @@ flash-attn-4 4.0.0b32 @ d15f153：
   本来就会算。需要让稠密 pass 按 tile 顺序（每个头组一次）运行。4090 上全部 query tile 的 Triton
   热力图（~212 ms/层）与稠密 attention（267 ms/层）是同一量级，合并后阶段 1 的教师 attention 预计
   少 ~40%。
+
+
+## Sparse LoRA 验证所需的 SM120 适配
+
+本隔离候选纳入已有 75d6629/9fa48c9 的 SM120 前向/反向支持，继续锁定
+上游 d15f153。SM120 继承 SM80 kernel，需要补丁 0006/0007 的 interface
+门禁、KV 子块传参和 backward 后处理线程数适配；只改白名单不能得到正确反向。
+补丁安装还校验未替换的 SM120 两个继承模块的源文件 hash。
+
+2026-10-15，1×RTX PRO 6000 Blackwell Server Edition，Torch 2.8.0+cu128，
+Cutlass DSL 4.8.0：kernel/streamer GPU 测试 13 passed；另外两项50层小模型
+LoRA GPU 检查及真实 H3 的一次零更新 backward 通过，详见
+[sparse_lora](sparse_lora.md)。真实模型的 Sparse 基线/零初始化输出逐位一致，
+但该检查不建立跨 backend 所有数值路径的位级等价，也没有做人工视频质量确认。
+未在其他架构重新验证这些导入分支；本分支保存实验实现，未合入 main。
+
+## 有序稀疏 dQ（SM8x / SM120）
+
+`sparse_dq_triton.query_gradient` 提供 BF16 MHA D128 的固定顺序 dQ，
+由 `fa4.block_sparse_attention(..., ordered_dq=True)` 显式启用。
+原 FA4 forward/LSE、DenseBlockMask 和 dK/dV 不变；其原子 dQ 被丢弃，
+另按 query subtile 独占 CTA、有序 key tile 遍历计算 dQ，没有 Dense fallback。
+需要梯度时调用锁定 FA4 的私有 `_flash_attn_bwd`，先检查签名；未支持的
+架构/布局直接拒绝。默认 false，不改变已有调用。
+
+重复 native backward 的 dQ 可不同，SM8x/SM120 的 `deterministic=True`
+当前明确拒绝；不能依赖该开关获得严格重放。新模式 kernel 对照2项与
+50层LoRA GPU检查3项通过，详见 [Sparse LoRA](sparse_lora.md)。
+它固定的是跨 KV CTA 的归约顺序，与某次原子归约不逐位一致：BF16小型
+fixture 对原FA4 dQ max abs0.001953125、relative L2约4.0e-5；
+dK/dV与原FA4逐位一致。数值范围、dtype、稀疏reference误差和额外反向
+开销须随验证记录报告，不能用重复性代替正确性或视频质量。
+
+2026-10-15，1×RTX PRO 6000 Blackwell SM120：原生H3三次更新加一次
+恢复重放，完整checkpoint及状态记录/更新统计逐位或逐项相同，相关GPU
+回归14 passed；峰值74.98GiB。其他架构及质量未验证。

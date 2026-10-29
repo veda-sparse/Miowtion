@@ -49,6 +49,7 @@ class VedaConfig:
     teacher_q_tiles: float = 1.0
     recall_every: int = 1
     dense_layers: frozenset[int] = frozenset()
+    ordered_dq: bool = False
 
 
 class ClipTiling:
@@ -116,11 +117,18 @@ def _chunk_heads(tile_layout: tiling.TileLayout) -> int:
 
 
 def _fused(x: torch.Tensor) -> bool:
-    return x.is_cuda and tile_gather_triton.available()
+    # These inference Triton permutations have no autograd registration.
+    # Frozen weights still need input gradients to reach earlier LoRA layers.
+    return (x.is_cuda and tile_gather_triton.available()
+            and not (torch.is_grad_enabled() and x.requires_grad))
 
 
 def _gather(x: torch.Tensor, tile_layout: tiling.TileLayout,
             heads: torch.Tensor) -> torch.Tensor:
+    if (x.is_cuda and tile_gather_triton.available()
+            and torch.is_grad_enabled() and x.requires_grad):
+        return tile_gather_triton.differentiable_gather(
+            x, tile_layout, heads)[0]
     if _fused(x):
         return tile_gather_triton.gather_tiles(x, tile_layout, heads)
     return tiling.gather_tiles(x, tile_layout, heads)
@@ -132,13 +140,17 @@ def _gather_and_pool(x: torch.Tensor, tile_layout: tiling.TileLayout,
     """Tile-ordered rows and predictor features (one fused pass on CUDA)."""
     if _fused(x):
         return tile_gather_triton.gather_and_pool(x, tile_layout, heads)
+    if x.is_cuda and tile_gather_triton.available():
+        return tile_gather_triton.differentiable_gather(
+            x, tile_layout, heads, pool=True)
     tiles = tiling.gather_tiles(x, tile_layout, heads)
     return tiles, veda_predictor.pool_tiles(tiles, tile_layout)
 
 
 def _scatter_(out: torch.Tensor, tiled: torch.Tensor,
               tile_layout: tiling.TileLayout, heads: torch.Tensor) -> None:
-    if _fused(out):
+    if (_fused(out) and not
+            (torch.is_grad_enabled() and tiled.requires_grad)):
         tile_gather_triton.scatter_tiles_(out, tiled, tile_layout, heads)
     else:
         tiling.scatter_tiles_(out, tiled, tile_layout, heads)
@@ -306,13 +318,13 @@ class SparseStudent:
             RuntimeError: If FA4 is unavailable and the reference kernel is
                 not explicitly allowed.
         """
-        if not fa4.available() and not allow_reference_kernel:
+        if not fa4.available(clip.device) and not allow_reference_kernel:
             raise RuntimeError('SparseStudent needs the FA4 block-sparse '
                                'kernel; refusing to fall back silently')
         self.clip = clip
         self.plan = plan
         self.predictor = predictor
-        self.use_fa4 = fa4.available()
+        self.use_fa4 = fa4.available(clip.device)
         self.calls = {'sparse': 0, 'dense': 0}
 
     def __call__(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
@@ -351,8 +363,9 @@ class SparseStudent:
                 self.clip.blocks(tile_layout))
             block_mask = veda_mask.dense_block_mask(selection, tile_layout)
         if self.use_fa4:
-            o_tiles = fa4.block_sparse_attention(q_tiles, k_tiles, v_tiles,
-                                                 block_mask, tile_layout)
+            o_tiles = fa4.block_sparse_attention(
+                q_tiles, k_tiles, v_tiles, block_mask, tile_layout,
+                ordered_dq=self.clip.config.ordered_dq)
         else:
             o_tiles = reference.block_sparse_attention(
                 q_tiles, k_tiles, v_tiles, block_mask,

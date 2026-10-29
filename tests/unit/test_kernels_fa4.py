@@ -2,12 +2,34 @@
 
 import threading
 import time
+import types
 
+import pytest
 import torch
 
 from miowtion.kernels import fa4
 from miowtion.veda import mask as veda_mask
 from miowtion.veda import tiling
+
+
+def test_ordered_backward_rejects_changed_private_api(monkeypatch):
+    monkeypatch.setattr(fa4, 'interface', lambda: types.SimpleNamespace())
+    with pytest.raises(RuntimeError, match='signature changed'):
+        fa4._ordered_backward.__wrapped__()
+    monkeypatch.setattr(fa4, 'interface', lambda: types.SimpleNamespace(
+        _flash_attn_bwd=lambda q, k, v: None))
+    with pytest.raises(RuntimeError, match='signature changed'):
+        fa4._ordered_backward.__wrapped__()
+
+
+def test_cpu_device_does_not_select_cuda_kernel(monkeypatch):
+    monkeypatch.setattr(torch.cuda, 'is_available', lambda: True)
+
+    def unexpected_import():
+        raise AssertionError('CPU should not import a CUDA kernel')
+
+    monkeypatch.setattr(fa4, '_modules', unexpected_import)
+    assert not fa4.available(torch.device('cpu'))
 
 
 def _selection_mask(heads=3, seed=0):

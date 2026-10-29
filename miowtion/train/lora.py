@@ -24,31 +24,72 @@ from torch.distributed import tensor as dtensor
 from torch.distributed.tensor import _utils as dtensor_utils
 
 DEFAULT_TARGETS = ('attn.qkv_proj', 'attn.out_proj')
+# Explicit opt-in; existing Stage-2 and sparse configs keep their defaults.
+TRUNK_TARGETS = DEFAULT_TARGETS + ('mlp.fc1', 'mlp.fc2')
 
 
 def _hook(module: nn.Linear, inputs, output):
     if not module.lora_enabled:
         return output
     x = inputs[0]
+    chunk_rows = module.lora_chunk_rows
+    if chunk_rows is not None and x.numel() // x.shape[-1] > chunk_rows:
+        flat = x.reshape(-1, x.shape[-1])
+        updates = []
+        for chunk in flat.split(chunk_rows):
+            delta = ((chunk.to(module.lora_a.dtype) @ module.lora_a.t())
+                     @ module.lora_b.t())
+            # Scaling out of place would create another full FP32 delta.
+            delta.mul_(module.lora_scale)
+            updates.append(delta.to(output.dtype))
+        return output + torch.cat(updates).reshape(output.shape)
     delta = (x.to(module.lora_a.dtype) @ module.lora_a.t()) @ module.lora_b.t()
     return output + (delta * module.lora_scale).to(output.dtype)
 
 
 def add_lora(model: nn.Module, rank: int, alpha: float | None = None,
              targets: Sequence[str] = DEFAULT_TARGETS,
-             prefix: str = 'blocks.') -> list[str]:
+             prefix: str = 'blocks.',
+             layers: Sequence[int] | None = None,
+             chunk_rows: int | None = None) -> list[str]:
     """Adds LoRA to every Linear named `<prefix>*.<target>`.
 
     A is Kaiming-initialized, B is zero, so the model is unchanged at init.
+    With layers set, every exact layer/target pair must exist before any
+    module is modified. None retains the legacy all-blocks behavior.
+    chunk_rows bounds FP32 temporary rows; None retains the full GEMMs.
 
     Returns:
         Names of the wrapped modules.
     """
+    if (type(rank) is not int or rank <= 0 or (alpha is not None and
+            (not math.isfinite(alpha) or alpha <= 0))):
+        raise ValueError('rank and alpha must be positive')
+    if not targets or len(set(targets)) != len(targets):
+        raise ValueError('targets must be nonempty and unique')
+    if chunk_rows is not None and (type(chunk_rows) is not int
+                                   or chunk_rows < 1):
+        raise ValueError('chunk_rows must be a positive integer or None')
+    if layers is not None:
+        if (not layers or len(set(layers)) != len(layers)
+                or any(type(i) is not int or i < 0 for i in layers)):
+            raise ValueError('layers must be unique nonnegative integers')
+        expected = {f'{prefix}{i}.{t}' for i in layers for t in targets}
+    else:
+        expected = None
+    candidates = [(name, module) for name, module in model.named_modules()
+                  if name.startswith(prefix)
+                  and name.endswith(tuple(targets))
+                  and isinstance(module, nn.Linear)
+                  and (expected is None or name in expected)]
+    missing = expected - {n for n, _ in candidates} if expected else set()
+    if missing or not candidates:
+        raise ValueError(f'LoRA modules missing: {sorted(missing)}; '
+                         f'targets={targets}')
+    if any(hasattr(m, 'lora_a') for _, m in candidates):
+        raise ValueError('LoRA already installed; refusing duplicate hooks')
     wrapped = []
-    for name, module in model.named_modules():
-        if not (name.startswith(prefix) and name.endswith(tuple(targets))
-                and isinstance(module, nn.Linear)):
-            continue
+    for name, module in candidates:
         a = torch.empty(rank, module.in_features, dtype=torch.float32,
                         device=module.weight.device)
         nn.init.kaiming_uniform_(a, a=math.sqrt(5))
@@ -56,8 +97,9 @@ def add_lora(model: nn.Module, rank: int, alpha: float | None = None,
         module.lora_b = nn.Parameter(torch.zeros(
             module.out_features, rank, dtype=torch.float32,
             device=module.weight.device))
-        module.lora_scale = (alpha or rank) / rank
+        module.lora_scale = (rank if alpha is None else alpha) / rank
         module.lora_enabled = True
+        module.lora_chunk_rows = chunk_rows
         module.register_forward_hook(_hook)
         wrapped.append(name)
     if not wrapped:
@@ -79,8 +121,17 @@ def reset_parameters(model: nn.Module, seed: int) -> None:
         a = module.lora_a
         a_local = a.to_local() if isinstance(a, dtensor.DTensor) else a
         bound = 1.0 / math.sqrt(module.in_features)
-        a_local.copy_((torch.rand(a_local.shape, generator=gen) * 2 - 1)
-                      * bound)
+        # Draw the global A before slicing. Identically seeded draws of
+        # each rank's local shape would repeat A rows across shards and
+        # collapse the initial rank. A is small even on the full model.
+        values = (torch.rand(a.shape, generator=gen) * 2 - 1) * bound
+        if isinstance(a, dtensor.DTensor):
+            if any(p.is_shard() and p.dim != 0 for p in a.placements):
+                raise ValueError('LoRA initialization supports dim-0 shards')
+            shape, offset = dtensor_utils.compute_local_shape_and_global_offset(
+                a.shape, a.device_mesh, a.placements)
+            values = values[offset[0]:offset[0] + shape[0]]
+        a_local.copy_(values)
         b = module.lora_b
         (b.to_local() if isinstance(b, dtensor.DTensor) else b).zero_()
 

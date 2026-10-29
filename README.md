@@ -131,6 +131,8 @@ Set up Miowtion (this repository) for training on this machine.
 | 5. Stage-1 training | `torchrun --nproc_per_node N scripts/train.py --config configs/stage1_turbo8_4090.yaml` | predictor checkpoints |
 | 6. Generate (dense vs Veda) | `torchrun --nproc_per_node 1 scripts/generate.py ... --attention dense veda` | videos, titled side by side, timing |
 
+The frozen-predictor Sparse LoRA experiments have a separate [training guide](docs/features/sparse_lora.md), including the full-trunk rank32 configs, data preparation and checkpoint resume commands.
+
 Teacher configurations (`schedule` / `num_steps` / `teacher_adapter` in the configs):
 
 | Teacher | Schedule | Configs |

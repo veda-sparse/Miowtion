@@ -5,6 +5,7 @@
 
 | 文档 | 内容 | 状态 |
 |---|---|---|
+| [features/sparse_lora.md](features/sparse_lora.md) | 固定 Dense Turbo/predictor 的 Sparse LoRA 训练；全层 Attn/MLP 与历史 100-step 配置 | 原生四卡训练与周期推理已运行；部分闪光减弱，高 LR 存在退化 |
 | [features/h3_model.md](features/h3_model.md) | H3 DiT 训练侧实现：请求几何、打包布局、调度、噪声、模型、权重加载 | 真实权重前向已验证；视频可视化检查待做 |
 | [features/veda_tiling.md](features/veda_tiling.md) | tile 排列（按头动态 tile 形状 + 按 tile 变长）、方案表 | CPU 测试通过 |
 | [features/veda_predictor_mask.md](features/veda_predictor_mask.md) | 打分器、预算与掩码规则、教师热力图、KL、recall | CPU 测试通过 |
