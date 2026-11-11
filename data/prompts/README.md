@@ -46,3 +46,30 @@ The source prompts are licensed under
 (MovieGen Bench). This file contains them together with expansions derived from
 them, and is distributed under the same CC BY-NC 4.0 license (non-commercial
 use only), not under the repository's MIT license.
+
+## `minimax_h3_vbench_pe.jsonl`
+
+The 251 unique source prompts used by the VEDA2 six-dimension VBench v1
+protocol, expanded once per source prompt for MiniMax-H3 T2VA. Each row is
+reused for all five generation seeds and attention backends, covering 1,255
+prompt/seed pairs. Use `source_prompt` to join the VBench sampling manifest
+and name videos. Use `prompt` as the model input.
+
+- Source: [VBench v1 prompt metadata][vbench-source] at commit
+  `fd18b3d055cb0fc6f066ca90fe2c3c8cbb698490`. The subset covers subject
+  consistency, background consistency, motion smoothness, aesthetic quality,
+  imaging quality, and dynamic degree.
+- Generation: DeepSeek `deepseek-flash` with the official [H3 prompt-writing
+  skill][h3-skill], followed by format validation and semantic review. All
+  captions use 16:9, 14.375 seconds, 345 frames at 24 fps, and `latent_t=102`.
+  The three H3 sections are kept in order and the descriptions use one shot.
+- Fields: `id`, `task`, `source_prompt`, `prompt`, geometry, model and template
+  provenance, prompt SHA-256, and review metadata. The manifest is readable by
+  `scripts/encode_samples.py`.
+
+The JSONL includes unmodified source captions and H3 adaptations derived from
+them. The VBench data in this file is distributed under
+[Apache License 2.0](LICENSE.VBench).
+
+[vbench-source]: https://github.com/Vchitect/VBench/blob/fd18b3d055cb0fc6f066ca90fe2c3c8cbb698490/vbench/VBench_full_info.json
+[h3-skill]: https://github.com/MiniMax-AI/MiniMax-H3/tree/d21241f0a4b3acbb34c97dae47fa417b7065e438/skills/h3-prompt-writing

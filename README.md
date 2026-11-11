@@ -224,3 +224,5 @@ MIT (see [LICENSE](LICENSE)). MiniMax-H3 weights and code are subject to their o
 licenses. `miowtion/kernels/fa4_sm8x` contains patched FlashAttention files under
 their BSD-3-Clause license. `data/prompts/moviegen_video_bench_h3.jsonl` contains
 the MovieGen Video Bench prompts and is licensed CC BY-NC 4.0 (non-commercial).
+`data/prompts/minimax_h3_vbench_pe.jsonl` contains VBench source captions and
+their H3 adaptations under [Apache 2.0](data/prompts/LICENSE.VBench).
